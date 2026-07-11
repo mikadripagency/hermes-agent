@@ -327,6 +327,8 @@ class GatewayKanbanWatchersMixin:
                         continue
                     title = (task.title if task else sub["task_id"])[:120]
                     board_tag = f"[{board_slug}] " if board_slug else ""
+                    receipt_id = None
+                    receipt_event_id = None
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
@@ -402,6 +404,11 @@ class GatewayKanbanWatchersMixin:
                             )
                             if getattr(send_result, "success", True) is False:
                                 raise RuntimeError(getattr(send_result, "error", None) or "notification send failed")
+                            message_id = getattr(send_result, "message_id", None)
+                            if platform_str == "slack" and kind == "completed" and not message_id:
+                                raise RuntimeError("Slack completion send returned no message receipt")
+                            if message_id:
+                                receipt_id, receipt_event_id = str(message_id), ev.id
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
@@ -443,11 +450,11 @@ class GatewayKanbanWatchersMixin:
                             )
                             break
                     else:
-                        # All events delivered; advance cursor. The cursor
-                        # is the dedup mechanism — it prevents re-delivery
-                        # of the same event on subsequent ticks.
+                        # All events delivered; advance cursor and retain the
+                        # platform receipt for completion acknowledgement.
                         await asyncio.to_thread(
                             self._kanban_advance, sub, d["cursor"], board_slug,
+                            receipt_id, receipt_event_id,
                         )
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
@@ -531,6 +538,7 @@ class GatewayKanbanWatchersMixin:
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,
+        message_id: Optional[str] = None, message_event_id: Optional[int] = None,
     ) -> None:
         """Sync helper: advance a subscription's cursor. Runs in to_thread.
 
@@ -547,6 +555,8 @@ class GatewayKanbanWatchersMixin:
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
                 new_cursor=cursor,
+                message_id=message_id,
+                message_event_id=message_event_id,
             )
         finally:
             conn.close()

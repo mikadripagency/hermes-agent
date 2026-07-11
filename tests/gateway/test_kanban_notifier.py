@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 
 from gateway.config import Platform
@@ -14,6 +15,7 @@ class RecordingAdapter:
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+        return SimpleNamespace(success=True, message_id="1783796000.123456")
 
 
 def test_completed_message_is_concise_and_omits_technical_ids():
@@ -52,10 +54,10 @@ async def _run_one_notifier_tick(monkeypatch, runner):
     await runner._kanban_notifier_watcher(interval=1)
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, platform=Platform.TELEGRAM):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
-    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner.adapters = {platform: adapter}
     runner._kanban_sub_fail_counts = {}
     return runner
 
@@ -119,6 +121,69 @@ def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatc
 
     assert len(adapter1.sent) == 1
     assert adapter2.sent == []
+
+
+def test_late_subscription_delivers_completion_and_records_receipt(tmp_path, monkeypatch):
+    db_path = tmp_path / "late-subscription.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="late", assignee="worker")
+        kb.complete_task(conn, tid, summary="done")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    conn = kb.connect()
+    try:
+        sub = kb.list_notify_subs(conn, tid)[0]
+    finally:
+        conn.close()
+    assert len(adapter.sent) == 1
+    assert sub["last_message_id"] == "1783796000.123456"
+    assert sub["last_message_event_id"] == sub["last_event_id"]
+
+
+def test_slack_completion_without_receipt_stays_retryable(tmp_path, monkeypatch):
+    db_path = tmp_path / "missing-receipt.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="missing receipt", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C123")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    adapter.send = lambda *args, **kwargs: asyncio.sleep(0, result=SimpleNamespace(success=True, message_id=None))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter, Platform.SLACK)))
+
+    conn = kb.connect()
+    try:
+        sub = kb.list_notify_subs(conn, tid)[0]
+    finally:
+        conn.close()
+    assert sub["last_event_id"] == 0
+    assert sub["last_message_id"] is None
+    assert [ev.kind for ev in _unseen_events_at(tid, "slack", "C123")] == ["completed"]
+
+
+def _unseen_events_at(tid, platform, chat_id):
+    conn = kb.connect()
+    try:
+        _, events = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform=platform, chat_id=chat_id,
+            kinds=["completed", "blocked", "gave_up", "crashed", "timed_out"],
+        )
+        return events
+    finally:
+        conn.close()
 
 
 def test_notification_idempotency_key_is_thread_scoped(tmp_path, monkeypatch):
