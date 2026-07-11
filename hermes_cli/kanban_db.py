@@ -1263,6 +1263,8 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     pending_event_id INTEGER,
     pending_previous_event_id INTEGER,
     pending_claimed_at INTEGER,
+    last_message_id TEXT,
+    last_message_event_id INTEGER,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -2029,11 +2031,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
-        for column in ("pending_event_id", "pending_previous_event_id", "pending_claimed_at"):
+        for column in ("pending_event_id", "pending_previous_event_id", "pending_claimed_at", "last_message_event_id"):
             if column not in notify_cols:
                 _add_column_if_missing(
                     conn, "kanban_notify_subs", column, f"{column} INTEGER"
                 )
+        if "last_message_id" not in notify_cols:
+            _add_column_if_missing(conn, "kanban_notify_subs", "last_message_id", "last_message_id TEXT")
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2160,7 +2164,7 @@ _REBUILD_SPECS = {
         " notifier_profile TEXT, created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
         " pending_event_id INTEGER, pending_previous_event_id INTEGER,"
-        " pending_claimed_at INTEGER,"
+        " pending_claimed_at INTEGER, last_message_id TEXT, last_message_event_id INTEGER,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -8524,14 +8528,18 @@ def advance_notify_cursor(
     chat_id: str,
     thread_id: Optional[str] = None,
     new_cursor: int,
+    message_id: Optional[str] = None,
+    message_event_id: Optional[int] = None,
 ) -> None:
     with write_txn(conn):
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ?, "
-            "pending_event_id = NULL, pending_previous_event_id = NULL, pending_claimed_at = NULL "
+            "pending_event_id = NULL, pending_previous_event_id = NULL, pending_claimed_at = NULL, "
+            "last_message_id = COALESCE(?, last_message_id), "
+            "last_message_event_id = COALESCE(?, last_message_event_id) "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
             "AND (pending_event_id IS NULL OR pending_event_id = ?)",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(new_cursor)),
+            (int(new_cursor), message_id, message_event_id, task_id, platform, chat_id, thread_id or "", int(new_cursor)),
         )
 
 
