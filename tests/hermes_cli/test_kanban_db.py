@@ -449,7 +449,7 @@ def test_stale_claim_reclaimed(kanban_home, monkeypatch):
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
         reclaimed = kb.release_stale_claims(conn, signal_fn=_signal)
         assert reclaimed == 1
-        assert kb.get_task(conn, t).status == "ready"
+        assert kb.get_task(conn, t).status == "running"
         assert killed == [signal.SIGTERM]
 
 
@@ -607,7 +607,7 @@ def test_stale_claim_reclaimed_when_termination_succeeds(
         )
         reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
         assert reclaimed == 1
-        assert kb.get_task(conn, t).status == "ready"
+        assert kb.get_task(conn, t).status == "running"
 
 
 def test_stale_claim_released_when_worker_not_host_local(
@@ -641,7 +641,7 @@ def test_stale_claim_released_when_worker_not_host_local(
         )
         reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
         assert reclaimed == 1
-        assert kb.get_task(conn, t).status == "ready"
+        assert kb.get_task(conn, t).status == "running"
 
 
 def test_detect_stale_defers_when_live_worker_survives(kanban_home, monkeypatch):
@@ -783,8 +783,8 @@ def test_detect_crashed_workers_isolated_failure_normal_retry(
 
         for tid in task_ids:
             task = kb.get_task(conn, tid)
-            assert task.status == "ready", (
-                f"task {tid} should stay ready (isolated), got {task.status}"
+            assert task.status == "running", (
+                f"task {tid} should stay in progress (isolated), got {task.status}"
             )
 
 
@@ -930,8 +930,8 @@ def test_rate_limit_exit_requeues_without_counting_failure(
             assert tid in rl
 
             task = kb.get_task(conn, tid)
-            assert task.status == "ready", (
-                f"hit {i}: should requeue ready, got {task.status}"
+            assert task.status == "running", (
+                f"hit {i}: should stay in progress, got {task.status}"
             )
             assert task.consecutive_failures == 0, (
                 f"hit {i}: rate-limit must not count a failure, "
@@ -1093,7 +1093,7 @@ def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch
 
         timed_out = kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None)
         assert timed_out == [t]
-        assert kb.get_task(conn, t).status == "ready"
+        assert kb.get_task(conn, t).status == "running"
 
         kb.claim_task(conn, t, claimer=f"{host}:retry")
         retry_run = kb.latest_run(conn, t)
@@ -1177,7 +1177,7 @@ def test_block_then_unblock(kanban_home):
         assert kb.block_task(conn, t, reason="need input")
         assert kb.get_task(conn, t).status == "blocked"
         assert kb.unblock_task(conn, t)
-        assert kb.get_task(conn, t).status == "ready"
+        assert kb.get_task(conn, t).status == "running"
 
 
 def test_unblock_resets_failure_counters(kanban_home):
@@ -1195,7 +1195,7 @@ def test_unblock_resets_failure_counters(kanban_home):
         conn.commit()
         assert kb.unblock_task(conn, t)
         task = kb.get_task(conn, t)
-        assert task.status == "ready"
+        assert task.status == "running"
         assert task.consecutive_failures == 0
         assert task.last_failure_error is None
 
@@ -1242,7 +1242,7 @@ def test_recompute_ready_skips_tasks_at_failure_limit(kanban_home):
         # Explicit unblock should still work and reset the counter.
         assert kb.unblock_task(conn, child)
         task = kb.get_task(conn, child)
-        assert task.status == "ready"
+        assert task.status == "running"
         assert task.consecutive_failures == 0
 
 
@@ -1259,7 +1259,7 @@ def test_recompute_ready_recovers_below_limit(kanban_home):
             failure_limit=2,
         )
         task = kb.get_task(conn, t)
-        assert task.status == "ready"
+        assert task.status == "running"
         assert task.consecutive_failures == 1
 
         # Simulate being blocked by something else (not circuit breaker).
@@ -1271,7 +1271,7 @@ def test_recompute_ready_recovers_below_limit(kanban_home):
         promoted = kb.recompute_ready(conn)
         assert promoted == 1
         task = kb.get_task(conn, t)
-        assert task.status == "ready"
+        assert task.status == "running"
         # Counter must be preserved, not reset.
         assert task.consecutive_failures == 1
 
@@ -1449,14 +1449,14 @@ def test_unblock_with_pending_parents_goes_to_todo(kanban_home):
         assert kb.get_task(conn, child).status == "ready"
 
 
-def test_unblock_without_parents_goes_to_ready(kanban_home):
-    """Parent-free unblock still produces 'ready' (behavior preserved)."""
+def test_unblock_without_parents_stays_in_progress(kanban_home):
+    """A claimed task never returns to Backlog after unblock."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="lone", assignee="a")
         kb.claim_task(conn, t)
         assert kb.block_task(conn, t, reason="need input")
         assert kb.unblock_task(conn, t)
-        assert kb.get_task(conn, t).status == "ready"
+        assert kb.get_task(conn, t).status == "running"
 
 
 def test_assign_refuses_while_running(kanban_home):
@@ -1737,8 +1737,8 @@ def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawna
     with kb.connect() as conn:
         t = kb.create_task(conn, title="boom", assignee="alice")
         kb.dispatch_once(conn, spawn_fn=boom)
-        # Must return to ready so the next tick can retry.
-        assert kb.get_task(conn, t).status == "ready"
+        # Must remain unclaimed In Progress so the next tick can retry.
+        assert kb.get_task(conn, t).status == "running"
         assert kb.get_task(conn, t).claim_lock is None
 
 
@@ -1917,28 +1917,13 @@ def test_respawn_guard_stale_success_not_guarded(kanban_home):
     assert reason is None
 
 
-def test_respawn_guard_active_pr_in_comment(kanban_home):
-    """A GitHub PR URL in a recent comment triggers active_pr."""
+def test_respawn_guard_does_not_guess_pr_state_from_comments(kanban_home):
+    """PR lifecycle belongs to review state, not comment parsing."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         kb.add_comment(
             conn, t, "worker",
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
-        )
-        reason = kb.check_respawn_guard(conn, t)
-    assert reason == "active_pr"
-
-
-def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
-    """A GitHub PR URL in a comment older than the PR window does not block."""
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="old-pr", assignee="alice")
-        old_ts = int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW - 60
-        conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, 'worker', "
-            "'PR: https://github.com/totemx-AI/subsidysmart/pull/10', ?)",
-            (t, old_ts),
         )
         reason = kb.check_respawn_guard(conn, t)
     assert reason is None
@@ -2015,10 +2000,10 @@ def test_dispatch_respawn_guard_skips_recent_success(
         assert kb.get_task(conn, t).status == "ready"  # not blocked, just skipped
 
 
-def test_dispatch_respawn_guard_skips_active_pr(
+def test_dispatch_respawn_guard_does_not_infer_pr_state_from_comment(
     kanban_home, all_assignees_spawnable
 ):
-    """dispatch_once skips (but does not block) a task with an active PR comment."""
+    """PR URLs are lifecycle evidence, not a dispatcher lock."""
     spawned_ids = []
 
     def fake_spawn(task, workspace):
@@ -2032,11 +2017,69 @@ def test_dispatch_respawn_guard_skips_active_pr(
         )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
 
-    assert (t, "active_pr") in res.respawn_guarded
-    assert t not in spawned_ids
+    assert t in spawned_ids
+    assert not res.respawn_guarded
     assert t not in res.auto_blocked
     with kb.connect() as conn:
-        assert kb.get_task(conn, t).status == "ready"
+        assert kb.get_task(conn, t).status == "running"
+
+
+def test_claimed_task_recovery_stays_in_progress_and_ignores_pr_comments(
+    kanban_home, all_assignees_spawnable
+):
+    spawned_ids = []
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="resume merged PR", assignee="alice")
+        assert kb.claim_task(conn, t, claimer="test:claim") is not None
+        kb.add_comment(conn, t, "worker", "Merged https://github.com/acme/app/pull/99")
+        assert kb.reclaim_task(conn, t, reason="continue after review", signal_fn=lambda *_: None)
+        assert kb.get_task(conn, t).status == "running"
+
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned_ids.append(task.id),
+        )
+
+    assert t in spawned_ids
+    assert not res.respawn_guarded
+
+
+def test_review_required_and_changes_requested_follow_main_path(
+    kanban_home, all_assignees_spawnable
+):
+    spawned_ids = []
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review flow", assignee="alice")
+        claimed = kb.claim_task(conn, t, claimer="test:owner")
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            t,
+            reason="review-required: verify change",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.get_task(conn, t).status == "review"
+
+        review = kb.claim_review_task(conn, t, claimer="test:review")
+        assert review is not None
+        assert kb.block_task(
+            conn,
+            t,
+            reason="changes-requested: add regression coverage",
+            expected_run_id=review.current_run_id,
+        )
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+        assert task.claim_lock is None
+
+        kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned_ids.append(task.id),
+        )
+
+    assert spawned_ids == [t]
 
 
 def test_dispatch_respawn_guard_dry_run_no_auto_block(
@@ -3894,7 +3937,7 @@ def test_detect_stale_returns_running_task_with_no_heartbeat(kanban_home, monkey
         )
         assert t in stale, "Task with no heartbeat for >4h should be reclaimed"
         task = kb.get_task(conn, t)
-        assert task.status == "ready"
+        assert task.status == "running"
 
 
 def test_repeated_stall_escalates_to_hermes_once(kanban_home, monkeypatch):
@@ -3932,7 +3975,7 @@ def test_repeated_stall_escalates_to_hermes_once(kanban_home, monkeypatch):
             )
             task = kb.get_task(conn, task_id)
             assert task is not None
-            assert task.status == ("ready" if attempt == 0 else "blocked")
+            assert task.status == ("running" if attempt == 0 else "blocked")
 
         assert conn.execute(
             "SELECT count(*) FROM tasks WHERE created_by = 'kanban-stall-escalation'"
@@ -3979,7 +4022,7 @@ def test_detect_stale_returns_task_with_stale_heartbeat(kanban_home, monkeypatch
         assert t in stale, (
             "Task with heartbeat >1h old and started >4h ago should be stale"
         )
-        assert kb.get_task(conn, t).status == "ready"
+        assert kb.get_task(conn, t).status == "running"
 
 
 def test_detect_stale_skips_task_with_recent_heartbeat(kanban_home, monkeypatch):

@@ -703,7 +703,7 @@ hermes kanban create "nightly backup audit" \
 
 ### Respawn guard
 
-The dispatcher refuses to re-spawn a ready task when it hit a quota/auth/429 error on the previous run (`blocker_auth`), or completed a run successfully within the guard window (`recent_success`), or a recent task comment links to a GitHub PR (`active_pr`). This prevents repeat worker storms on the same bug or task while a human catches up. See the `respawn_guarded` row in the [event reference](#event-reference).
+The dispatcher refuses to re-spawn a task when it hit a quota/auth/429 error on the previous run (`blocker_auth`) or completed a run successfully within the guard window (`recent_success`). PR state is represented by the task's `review` status, not inferred from comment URLs. See the `respawn_guarded` row in the [event reference](#event-reference).
 
 ### Drag-to-delete and bulk delete (dashboard)
 

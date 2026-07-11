@@ -3361,7 +3361,7 @@ def recompute_ready(
                     if failures >= effective_limit:
                         continue
                     conn.execute(
-                        "UPDATE tasks SET status = 'ready' "
+                        "UPDATE tasks SET status = CASE WHEN started_at IS NULL THEN 'ready' ELSE 'running' END "
                         "WHERE id = ? AND status = 'blocked'",
                         (task_id,),
                     )
@@ -3386,7 +3386,7 @@ def claim_task(
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> Optional[Task]:
-    """Atomically transition ``ready -> running``.
+    """Atomically claim Backlog or an unclaimed In Progress recovery.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
@@ -3425,7 +3425,7 @@ def claim_task(
         # it when the CAS resets the pointer below. No-op when the invariant
         # holds (the common case).
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'ready'",
+            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('ready', 'running') AND claim_lock IS NULL",
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
@@ -3448,7 +3448,7 @@ def claim_task(
                    claim_expires = ?,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
-               AND status = 'ready'
+               AND status IN ('ready', 'running')
                AND claim_lock IS NULL
             """,
             (lock, expires, now, task_id),
@@ -3714,7 +3714,7 @@ def release_stale_claims(
             continue
         with write_txn(conn):
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = 'running', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
@@ -3760,7 +3760,7 @@ def reclaim_task(
     reason: Optional[str] = None,
     signal_fn=None,
 ) -> bool:
-    """Operator-driven reclaim: release the claim and reset to ``ready``.
+    """Operator-driven reclaim: release the claim without leaving In Progress.
 
     Unlike :func:`release_stale_claims` which only acts on tasks whose
     ``claim_expires`` has passed, this function reclaims immediately
@@ -3786,7 +3786,7 @@ def reclaim_task(
     )
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "UPDATE tasks SET status = 'running', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?",
@@ -4596,6 +4596,40 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
+
+        handoff_status = (
+            "review" if (reason or "").lower().startswith("review-required:")
+            else "running" if (reason or "").lower().startswith("changes-requested:")
+            else None
+        )
+        if handoff_status:
+            params: list[Any] = [handoff_status, task_id]
+            sql = (
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status IN ('running', 'ready')"
+            )
+            if expected_run_id is not None:
+                sql += " AND current_run_id = ?"
+                params.append(int(expected_run_id))
+            cur = conn.execute(sql, params)
+            if cur.rowcount != 1:
+                return False
+            run_id = _end_run(
+                conn, task_id,
+                outcome="review_required" if handoff_status == "review" else "changes_requested",
+                status="review" if handoff_status == "review" else "changes_requested",
+                summary=reason,
+            )
+            _append_event(
+                conn,
+                task_id,
+                "review_requested" if handoff_status == "review" else "changes_requested",
+                {"reason": reason},
+                run_id=run_id,
+            )
+            return True
+
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
             int(cur_row["block_recurrences"])
@@ -4874,7 +4908,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
             (task_id,),
         ).fetchone()
-        new_status = "todo" if undone_parents else "ready"
+        started = conn.execute(
+            "SELECT started_at FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        new_status = "todo" if undone_parents else (
+            "running" if started and started["started_at"] is not None else "ready"
+        )
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
@@ -5686,16 +5725,6 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Within this window a GitHub PR URL in a comment blocks re-spawn.
-_RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
-
-# Pattern matching a GitHub PR URL in task comments.
-_RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
-    re.IGNORECASE,
-)
-
-
 @dataclass
 class DispatchResult:
     """Outcome of a single ``dispatch`` pass."""
@@ -6165,7 +6194,7 @@ def enforce_max_runtime(
 
         with write_txn(conn):
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = 'running', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
@@ -6336,7 +6365,7 @@ def detect_stale_running(
 
         with write_txn(conn):
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = 'running', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
@@ -6511,7 +6540,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_code"] = code
 
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = 'running', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
@@ -6716,9 +6745,9 @@ def _record_task_failure(
         else:
             # Below threshold.
             if release_claim:
-                # Spawn path: transition running → ready + clear claim.
+                # Spawn path: release the claim without returning to Backlog.
                 conn.execute(
-                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "UPDATE tasks SET status = 'running', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
@@ -6848,10 +6877,6 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         explicit re-queue event (status change, promote, unblock, reclaim)
         arrives AFTER that completion — that's a deliberate re-run request.
 
-    ``"active_pr"``
-        A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -6933,20 +6958,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
-
     return None
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one ready+assigned+unclaimed task
+    """Return True iff there is at least one dispatchable assigned task
     whose assignee maps to a real Hermes profile.
 
     Used by the gateway- and CLI-embedded dispatchers' health telemetry to
@@ -6961,7 +6977,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'ready' AND assignee IS NOT NULL "
+        "WHERE status IN ('ready', 'running') AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
     if not rows:
@@ -7150,13 +7166,13 @@ def _dispatch_once_locked(
     if max_spawn is not None:
         running_count = int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running' AND claim_lock IS NOT NULL"
             ).fetchone()[0]
         )
 
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
+        "WHERE status IN ('ready', 'running') AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
@@ -7165,7 +7181,7 @@ def _dispatch_once_locked(
     # pile up and time out.
     if max_in_progress is not None and ready_rows:
         in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+            "SELECT COUNT(*) FROM tasks WHERE status = 'running' AND claim_lock IS NOT NULL"
         ).fetchone()[0]
         if in_progress >= max_in_progress:
             return result
@@ -7190,7 +7206,7 @@ def _dispatch_once_locked(
     if _per_profile_cap is not None:
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "WHERE status = 'running' AND claim_lock IS NOT NULL AND assignee IS NOT NULL "
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
