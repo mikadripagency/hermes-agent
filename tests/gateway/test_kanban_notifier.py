@@ -351,6 +351,36 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
     assert [ev.kind for ev in _unseen_terminal_events_for(tid, "chat-beta")] == ["completed"]
 
 
+def test_notifier_uses_active_profile_adapter_for_matching_owner(tmp_path, monkeypatch):
+    """A stamped subscription owned by the active profile uses self.adapters."""
+    db_path = tmp_path / "active-profile.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="active profile", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-active",
+            notifier_profile="developer",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._profile_adapters = {}
+    runner._kanban_notifier_profile = "developer"
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert [item["text"] for item in adapter.sent] == ["active profile fertig."]
+
+
 def _unseen_terminal_events_for(tid, chat_id):
     conn = kb.connect()
     try:
