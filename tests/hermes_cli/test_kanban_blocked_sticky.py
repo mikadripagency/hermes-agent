@@ -2,7 +2,7 @@
 worker-initiated ``kanban_block`` (sticky blocks), but must keep
 auto-recovering circuit-breaker blocks.
 
-The bug: when a worker called ``kanban_block(reason="review-required:
+The bug: when a worker called ``kanban_block(reason="manual-review:
 ...")`` to hand off to a human, the dispatcher's ``recompute_ready``
 would promote the task back to ``ready`` on the next tick.  The fresh
 worker found nothing to do (work already applied), exited cleanly, and
@@ -63,7 +63,7 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
         kb.claim_task(conn, tid)
         assert kb.block_task(
             conn, tid,
-            reason="review-required: please verify ACL change",
+            reason="manual-review: please verify ACL change",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
         assert kb.get_task(conn, tid).status == "blocked"
@@ -89,7 +89,7 @@ def test_worker_block_on_child_with_done_parents_is_still_sticky(kanban_home: Pa
         kb.claim_task(conn, child)
         kb.block_task(
             conn, child,
-            reason="review-required: child needs sign-off",
+            reason="manual-review: child needs sign-off",
             expected_run_id=kb.get_task(conn, child).current_run_id,
         )
         assert kb.get_task(conn, child).status == "blocked"
@@ -185,12 +185,12 @@ def test_unblock_clears_sticky_state_and_lets_block_recover(kanban_home: Path) -
         kb.claim_task(conn, tid)
         kb.block_task(
             conn, tid,
-            reason="review-required: ...",
+            reason="manual-review: ...",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
         assert kb.unblock_task(conn, tid)
-        # After unblock the task is no longer blocked at all.
-        assert kb.get_task(conn, tid).status == "ready"
+        # After unblock the task stays In Progress and is dispatchable.
+        assert kb.get_task(conn, tid).status == "running"
 
         # Now simulate a *later* circuit-breaker block (no new
         # ``blocked`` event, just status flip).  The most recent
@@ -203,7 +203,7 @@ def test_unblock_clears_sticky_state_and_lets_block_recover(kanban_home: Path) -
 
         promoted = kb.recompute_ready(conn)
         assert promoted == 1
-        assert kb.get_task(conn, tid).status == "ready"
+        assert kb.get_task(conn, tid).status == "running"
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +236,7 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
         kb.claim_task(conn, tid)
         kb.block_task(
             conn, tid,
-            reason="review-required: human eyes please",
+            reason="manual-review: human eyes please",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
         assert kb.get_task(conn, tid).status == "blocked"
