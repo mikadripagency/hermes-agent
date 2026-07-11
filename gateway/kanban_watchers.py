@@ -306,7 +306,12 @@ class GatewayKanbanWatchersMixin:
                     # wrong bot (the cross-profile mis-delivery this whole change
                     # exists to fix). The helper returns None only when the profile
                     # (or default) genuinely has no adapter for the platform.
-                    adapter = self._authorization_adapter(plat, sub_profile or None)
+                    adapter_profile = (
+                        sub_profile
+                        if sub_profile and sub_profile != notifier_profile
+                        else None
+                    )
+                    adapter = self._authorization_adapter(plat, adapter_profile)
                     if adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
