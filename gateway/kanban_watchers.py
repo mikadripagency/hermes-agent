@@ -26,6 +26,24 @@ from agent.i18n import t
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
 
+# Slack error codes that will never succeed on retry for a given subscription:
+# the channel is gone/archived, the workspace token is dead, or the target user
+# is deactivated. After a few consecutive failures with one of these, the
+# subscription is dropped rather than retried forever.
+_PERMANENT_SLACK_ERRORS = (
+    "channel_not_found",
+    "is_archived",
+    "account_inactive",
+    "invalid_auth",
+)
+_NOTIFY_PERMANENT_FAILURE_LIMIT = 3
+
+
+def _is_permanent_slack_error(err: str) -> bool:
+    """True if ``err`` names a Slack error that a retry can never fix."""
+    low = (err or "").lower()
+    return any(code in low for code in _PERMANENT_SLACK_ERRORS)
+
 
 def _format_completed_message(title: str, summary: str = "") -> str:
     """Render at most two short lines without internal task/commit identifiers."""
@@ -254,6 +272,17 @@ class GatewayKanbanWatchersMixin:
                                         sub.get("task_id"), platform or "<missing>",
                                     )
                                     continue
+                                # Circuit breaker: a subscription that keeps
+                                # failing to deliver backs off (next_retry_at),
+                                # so a broken channel can't re-attempt every
+                                # tick and spam the log.
+                                retry_at = sub.get("next_retry_at")
+                                if retry_at and int(retry_at) > int(time.time()):
+                                    logger.debug(
+                                        "kanban notifier: subscription for %s backing off until %s (failures=%s)",
+                                        sub.get("task_id"), retry_at, sub.get("consecutive_failures"),
+                                    )
+                                    continue
                                 old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                     conn,
                                     task_id=sub["task_id"],
@@ -450,17 +479,33 @@ class GatewayKanbanWatchersMixin:
                                         sub["task_id"], art_exc,
                                     )
                         except Exception as exc:
-                            logger.warning(
-                                "kanban notifier: send failed for %s on %s; retaining subscription: %s",
-                                sub["task_id"], platform_str, exc,
-                            )
-                            await asyncio.to_thread(
-                                self._kanban_rewind,
+                            permanent = _is_permanent_slack_error(str(exc))
+                            fail_count = await asyncio.to_thread(
+                                self._kanban_record_failure,
                                 sub,
                                 d["cursor"],
                                 d.get("old_cursor", 0),
                                 board_slug,
                             )
+                            if permanent and fail_count >= _NOTIFY_PERMANENT_FAILURE_LIMIT:
+                                # A channel that no longer exists / is archived /
+                                # bad auth will never succeed. Drop the sub after
+                                # a few consecutive failures and log ONCE, instead
+                                # of retrying it forever (issue: 85k retries).
+                                logger.warning(
+                                    "kanban notifier: dropping subscription for task %s "
+                                    "(chat %s on %s) after %d consecutive permanent failures: %s",
+                                    sub["task_id"], sub["chat_id"], platform_str, fail_count, exc,
+                                )
+                                await asyncio.to_thread(
+                                    self._kanban_unsub, sub, board_slug,
+                                )
+                            else:
+                                logger.warning(
+                                    "kanban notifier: send failed for %s on %s "
+                                    "(attempt %d, permanent=%s); backing off: %s",
+                                    sub["task_id"], platform_str, fail_count, permanent, exc,
+                                )
                             break
                     else:
                         # All events delivered; advance cursor and retain the
@@ -607,6 +652,33 @@ class GatewayKanbanWatchersMixin:
         conn = _kb.connect(board=board)
         try:
             _kb.rewind_notify_cursor(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                claimed_cursor=claimed_cursor,
+                old_cursor=old_cursor,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_record_failure(
+        self,
+        sub: dict,
+        claimed_cursor: int,
+        old_cursor: int,
+        board: Optional[str] = None,
+    ) -> int:
+        """Sync helper: rewind the claim and bump the failure circuit breaker.
+
+        Returns the new consecutive-failure count so the caller can decide
+        whether a permanent error has failed often enough to drop the sub.
+        """
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            return _kb.record_notify_failure(
                 conn,
                 task_id=sub["task_id"],
                 platform=sub["platform"],

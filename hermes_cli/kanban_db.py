@@ -1265,6 +1265,12 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     pending_claimed_at INTEGER,
     last_message_id TEXT,
     last_message_event_id INTEGER,
+    -- Delivery-failure circuit breaker: consecutive send failures for this
+    -- subscription and the earliest time the notifier may retry it. Lets a
+    -- failing sub back off (so it can't spam every tick) and, on a permanent
+    -- error, be dropped after a few consecutive failures.
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    next_retry_at INTEGER,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -2031,13 +2037,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
-        for column in ("pending_event_id", "pending_previous_event_id", "pending_claimed_at", "last_message_event_id"):
+        for column in ("pending_event_id", "pending_previous_event_id", "pending_claimed_at", "last_message_event_id", "next_retry_at"):
             if column not in notify_cols:
                 _add_column_if_missing(
                     conn, "kanban_notify_subs", column, f"{column} INTEGER"
                 )
         if "last_message_id" not in notify_cols:
             _add_column_if_missing(conn, "kanban_notify_subs", "last_message_id", "last_message_id TEXT")
+        if "consecutive_failures" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "consecutive_failures",
+                "consecutive_failures INTEGER NOT NULL DEFAULT 0",
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2165,6 +2176,7 @@ _REBUILD_SPECS = {
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
         " pending_event_id INTEGER, pending_previous_event_id INTEGER,"
         " pending_claimed_at INTEGER, last_message_id TEXT, last_message_event_id INTEGER,"
+        " consecutive_failures INTEGER NOT NULL DEFAULT 0, next_retry_at INTEGER,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -8536,7 +8548,9 @@ def advance_notify_cursor(
             "UPDATE kanban_notify_subs SET last_event_id = ?, "
             "pending_event_id = NULL, pending_previous_event_id = NULL, pending_claimed_at = NULL, "
             "last_message_id = COALESCE(?, last_message_id), "
-            "last_message_event_id = COALESCE(?, last_message_event_id) "
+            "last_message_event_id = COALESCE(?, last_message_event_id), "
+            # Successful delivery clears the failure circuit breaker.
+            "consecutive_failures = 0, next_retry_at = NULL "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
             "AND (pending_event_id IS NULL OR pending_event_id = ?)",
             (int(new_cursor), message_id, message_event_id, task_id, platform, chat_id, thread_id or "", int(new_cursor)),
@@ -8571,6 +8585,66 @@ def rewind_notify_cursor(
             ),
         )
     return cur.rowcount > 0
+
+
+# Exponential backoff for a repeatedly-failing subscription. Caps at 10 min so
+# a broken sub retries at most a handful of times per hour instead of spamming
+# every notifier tick.
+NOTIFY_RETRY_BACKOFF_BASE = 5     # seconds
+NOTIFY_RETRY_BACKOFF_CAP = 600    # 10 minutes
+
+
+def notify_retry_delay(consecutive_failures: int) -> int:
+    """Seconds to wait before the next retry given ``consecutive_failures``."""
+    n = max(1, int(consecutive_failures))
+    return min(NOTIFY_RETRY_BACKOFF_CAP, NOTIFY_RETRY_BACKOFF_BASE * (2 ** min(n - 1, 12)))
+
+
+def record_notify_failure(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    claimed_cursor: int,
+    old_cursor: int,
+    now: Optional[int] = None,
+) -> int:
+    """Record a delivery failure and rewind the claim for one subscription.
+
+    Rewinds ``last_event_id`` to ``old_cursor`` (so the events are re-claimed
+    next time), increments ``consecutive_failures``, and sets ``next_retry_at``
+    to an exponentially-backed-off time so a persistently-failing subscription
+    cannot re-attempt on every tick. Returns the new consecutive-failure count,
+    or ``0`` when the row is gone or a concurrent notifier already advanced past
+    this claim (in which case no failure is recorded).
+    """
+    now = int(now if now is not None else time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT consecutive_failures FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND last_event_id = ? AND pending_event_id = ?",
+            (task_id, platform, chat_id, thread_id or "", int(claimed_cursor), int(claimed_cursor)),
+        ).fetchone()
+        if row is None:
+            return 0
+        new_count = int(row["consecutive_failures"] or 0) + 1
+        next_retry_at = now + notify_retry_delay(new_count)
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = ?, "
+            "pending_event_id = NULL, pending_previous_event_id = NULL, pending_claimed_at = NULL, "
+            "consecutive_failures = ?, next_retry_at = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND last_event_id = ? AND pending_event_id = ?",
+            (
+                int(old_cursor), new_count, next_retry_at,
+                task_id, platform, chat_id, thread_id or "",
+                int(claimed_cursor), int(claimed_cursor),
+            ),
+        )
+    return new_count
 
 
 # ---------------------------------------------------------------------------

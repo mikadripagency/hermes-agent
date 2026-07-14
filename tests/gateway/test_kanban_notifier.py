@@ -459,3 +459,175 @@ def _unseen_terminal_events_for(tid, chat_id):
         return events
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Permanent-failure handling + backoff circuit breaker
+# ---------------------------------------------------------------------------
+
+
+class PermanentFailingAdapter:
+    """Adapter whose send() raises a permanent Slack error (channel gone)."""
+
+    def __init__(self, error="channel_not_found"):
+        self.error = error
+        self.attempts = 0
+
+    async def send(self, chat_id, text, metadata=None):
+        self.attempts += 1
+        raise RuntimeError(self.error)
+
+
+def _seed_sub_failure_state(tid, *, platform="slack", chat_id="C1",
+                            consecutive_failures=0, next_retry_at=None):
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_notify_subs SET consecutive_failures = ?, next_retry_at = ? "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ?",
+                (consecutive_failures, next_retry_at, tid, platform, chat_id),
+            )
+    finally:
+        conn.close()
+
+
+def _read_sub(tid, *, platform="slack", chat_id="C1"):
+    conn = kb.connect()
+    try:
+        for s in kb.list_notify_subs(conn, tid):
+            if s["platform"] == platform and s["chat_id"] == chat_id:
+                return s
+        return None
+    finally:
+        conn.close()
+
+
+def test_notify_retry_delay_backoff_is_capped():
+    # Monotonic non-decreasing and capped at the 10-minute ceiling.
+    delays = [kb.notify_retry_delay(n) for n in range(1, 20)]
+    assert delays == sorted(delays)
+    assert max(delays) == kb.NOTIFY_RETRY_BACKOFF_CAP
+    assert delays[0] == kb.NOTIFY_RETRY_BACKOFF_BASE
+
+
+def test_record_notify_failure_increments_and_sets_backoff(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "rec-fail.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C1")
+        kb.complete_task(conn, tid, summary="done")
+        old, new, events = kb.claim_unseen_events_for_sub(
+            conn, task_id=tid, platform="slack", chat_id="C1", kinds=["completed"],
+        )
+        assert events
+        n1 = kb.record_notify_failure(
+            conn, task_id=tid, platform="slack", chat_id="C1",
+            claimed_cursor=new, old_cursor=old, now=1000,
+        )
+        assert n1 == 1
+        sub = kb.list_notify_subs(conn, tid)[0]
+        assert sub["consecutive_failures"] == 1
+        assert sub["next_retry_at"] == 1000 + kb.notify_retry_delay(1)
+        # cursor rewound so the event is re-claimable
+        assert sub["last_event_id"] == old
+    finally:
+        conn.close()
+
+
+def test_advance_notify_cursor_resets_failure_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "reset.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C1")
+        kb.complete_task(conn, tid, summary="done")
+        old, new, _ = kb.claim_unseen_events_for_sub(
+            conn, task_id=tid, platform="slack", chat_id="C1", kinds=["completed"],
+        )
+        # Simulate a prior failure state, then a successful advance.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_notify_subs SET consecutive_failures = 4, next_retry_at = 999999999",
+            )
+        kb.advance_notify_cursor(
+            conn, task_id=tid, platform="slack", chat_id="C1", new_cursor=new,
+        )
+        sub = kb.list_notify_subs(conn, tid)[0]
+        assert sub["consecutive_failures"] == 0
+        assert sub["next_retry_at"] is None
+    finally:
+        conn.close()
+
+
+def test_notifier_drops_sub_after_consecutive_permanent_failures(tmp_path, monkeypatch):
+    """A channel_not_found sub is dropped after the failure threshold instead
+    of being retried forever (regression: 85k retries over days)."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "perm-drop.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="dead channel", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C1")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    # One failure short of the drop threshold; next_retry in the past so the
+    # gate does not skip this tick.
+    _seed_sub_failure_state(tid, consecutive_failures=2, next_retry_at=None)
+
+    adapter = PermanentFailingAdapter("channel_not_found")
+    runner = _make_runner(adapter, Platform.SLACK)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.attempts == 1
+    assert _read_sub(tid) is None, "permanent-failure sub should be dropped"
+
+
+def test_notifier_backoff_gate_skips_subscription_not_yet_due(tmp_path, monkeypatch):
+    """A sub whose next_retry_at is in the future is not even attempted."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "backoff-skip.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="backing off", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C1")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    import time as _t
+    _seed_sub_failure_state(tid, consecutive_failures=5, next_retry_at=int(_t.time()) + 3600)
+
+    adapter = PermanentFailingAdapter("channel_not_found")
+    runner = _make_runner(adapter, Platform.SLACK)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.attempts == 0, "backoff gate must skip a not-yet-due sub"
+    assert _read_sub(tid) is not None, "sub must survive while backing off"
+
+
+def test_notifier_transient_failure_retained_with_backoff(tmp_path, monkeypatch):
+    """A transient error keeps the sub but records a backoff so it can't spam."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "transient.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="rate limited", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C1")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = PermanentFailingAdapter("ratelimited")  # transient error string
+    runner = _make_runner(adapter, Platform.SLACK)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    sub = _read_sub(tid)
+    assert sub is not None, "transient failure must not drop the sub"
+    assert sub["consecutive_failures"] == 1
+    assert sub["next_retry_at"] is not None
