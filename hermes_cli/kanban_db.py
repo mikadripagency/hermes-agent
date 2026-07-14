@@ -7379,7 +7379,7 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        _spawn = spawn_fn if spawn_fn is not None else _resolve_default_spawn()
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
@@ -7477,7 +7477,7 @@ def _dispatch_once_locked(
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
         claimed.skills = ["sdlc-review"]
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        _spawn = spawn_fn if spawn_fn is not None else _resolve_default_spawn()
         try:
             import inspect
             try:
@@ -7764,25 +7764,28 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
-def _default_spawn(
+def _build_worker_env(
     task: Task,
     workspace: str,
     *,
     board: Optional[str] = None,
-) -> Optional[int]:
-    """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
+) -> dict:
+    """Build the ``HERMES_KANBAN_*`` env contract shared by all worker launchers.
 
-    Returns the spawned child's PID so the dispatcher can detect crashes
-    before the claim TTL expires. The child's completion is still observed
-    via the ``complete`` / ``block`` transitions the worker writes itself;
-    the PID check is a safety net for crashes, OOM kills, and Ctrl+C.
+    Extracted verbatim from :func:`_default_spawn` so every launcher — the
+    fire-and-forget ``hermes chat`` subprocess and the Paseo-agent launcher in
+    :mod:`hermes_cli.paseo_spawn` — injects the *identical* env contract
+    (HERMES_KANBAN_TASK/RUN_ID/CLAIM_LOCK/BRANCH/WORKSPACE/DB/BOARD, HERMES_HOME,
+    HERMES_PROFILE, TERMINAL_CWD/TIMEOUT, goal-loop vars, …). The returned dict
+    carries the normalized assignee profile in ``env['HERMES_PROFILE']`` so
+    callers that need the ``-p <profile>`` arg can read it back without
+    re-deriving it.
 
-    ``board`` pins the child's kanban context to that board: the child's
-    ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
-    vars all resolve to the same board the dispatcher claimed the task
-    from. Workers cannot accidentally see other boards.
+    ``board`` pins the worker's kanban context to that board: the worker's
+    ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env vars all
+    resolve to the same board the dispatcher claimed the task from. Workers
+    cannot accidentally see other boards.
     """
-    import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
@@ -7790,7 +7793,6 @@ def _default_spawn(
 
     profile_arg = normalize_profile_name(task.assignee)
 
-    prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
@@ -7881,6 +7883,33 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
+    return env
+
+
+def _default_spawn(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[int]:
+    """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
+
+    Returns the spawned child's PID so the dispatcher can detect crashes
+    before the claim TTL expires. The child's completion is still observed
+    via the ``complete`` / ``block`` transitions the worker writes itself;
+    the PID check is a safety net for crashes, OOM kills, and Ctrl+C.
+
+    ``board`` pins the child's kanban context to that board: the child's
+    ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
+    vars all resolve to the same board the dispatcher claimed the task
+    from. Workers cannot accidentally see other boards.
+    """
+    import subprocess
+
+    env = _build_worker_env(task, workspace, board=board)
+    profile_arg = env["HERMES_PROFILE"]
+    prompt = f"work kanban task {task.id}"
+
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
@@ -7944,6 +7973,31 @@ def _default_spawn(
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
     return proc.pid
+
+
+def _resolve_default_spawn():
+    """Pick the dispatcher's default spawn function based on config.
+
+    When ``kanban.paseo_spawn.enabled`` is true, kanban workers are launched as
+    Paseo agents (:func:`hermes_cli.paseo_spawn.spawn_via_paseo`) so every dev
+    task gets exactly one linked Paseo chat. Otherwise the historical
+    fire-and-forget ``hermes chat`` launcher (:func:`_default_spawn`) is used.
+
+    An explicit ``spawn_fn`` passed to :func:`dispatch_once` always wins over
+    this default (see the call sites). Any error resolving the Paseo launcher
+    degrades to ``_default_spawn`` so a misconfiguration never stalls dispatch.
+    """
+    try:
+        from hermes_cli.paseo_spawn import paseo_spawn_enabled, spawn_via_paseo
+
+        if paseo_spawn_enabled():
+            return spawn_via_paseo
+    except Exception as exc:  # pragma: no cover - import/config guard
+        _log.warning(
+            "kanban: could not resolve Paseo spawn launcher, using _default_spawn (%s)",
+            exc,
+        )
+    return _default_spawn
 
 
 # ---------------------------------------------------------------------------
