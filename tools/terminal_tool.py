@@ -2270,6 +2270,24 @@ def terminal_tool(
                     "status": "error",
                 }, ensure_ascii=False)
 
+        # Hard-block: destructive raw sqlite3 against a live Hermes DB. A direct
+        # REINDEX/VACUUM/DROP/... (or an interactive session) on ~/.hermes/*.db
+        # bypasses Hermes' WAL-aware, serialized DB access and re-corrupted the
+        # kanban DB on 2026-07-12. Read-only inspection (file:...?mode=ro) stays
+        # allowed. Applies unconditionally — force=True cannot bypass it, since
+        # the corruption is silent and irreversible.
+        from tools.sqlite_guard import (
+            BLOCKED_MESSAGE as _SQLITE_BLOCKED_MESSAGE,
+            contains_destructive_sqlite_command,
+        )
+        if contains_destructive_sqlite_command(command):
+            return json.dumps({
+                "output": "",
+                "exit_code": 1,
+                "error": _SQLITE_BLOCKED_MESSAGE,
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
