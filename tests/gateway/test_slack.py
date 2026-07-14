@@ -1665,13 +1665,38 @@ class TestIncomingDocumentHandling:
         assert "_Notion_" in msg_event.text
 
     @pytest.mark.asyncio
-    async def test_message_unfurl_attachments_are_skipped(self, adapter):
-        """Message unfurls should be skipped to avoid echoing Slack message copies."""
+    async def test_forwarded_message_unfurl_attachments_are_appended(self, adapter):
+        """Forwarded/shared Slack messages arrive as is_msg_unfurl attachments;
+        their text is the payload the user expects the agent to see.
+        """
+        event = self._make_event(
+            text="Bitte als Task ich muss das im RH fixen",
+            attachments=[
+                {
+                    "is_msg_unfurl": True,
+                    "author_name": "Klaudia",
+                    "channel_id": "C123",
+                    "text": "<@U_USER> bei der Market Source analyse ist es bisschen buggy in der Anzeige",
+                }
+            ],
+        )
+
+        await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert "Bitte als Task ich muss das im RH fixen" in msg_event.text
+        assert "Forwarded Slack message from Klaudia in <#C123>" in msg_event.text
+        assert "Market Source analyse" in msg_event.text
+
+    @pytest.mark.asyncio
+    async def test_own_bot_message_unfurl_attachments_are_skipped(self, adapter):
+        """A forwarded copy of Hermes' own message is still skipped to avoid echoes."""
         event = self._make_event(
             text="https://example.com/thread",
             attachments=[
                 {
                     "is_msg_unfurl": True,
+                    "author_id": "U_BOT",
                     "title": "Thread copy",
                     "text": "This should not be appended",
                 }
@@ -1682,6 +1707,40 @@ class TestIncomingDocumentHandling:
 
         msg_event = adapter.handle_message.call_args[0][0]
         assert msg_event.text == "https://example.com/thread"
+
+    @pytest.mark.asyncio
+    async def test_forwarded_message_nested_files_are_handled(self, adapter):
+        """Forwarded Slack messages put attached screenshots under attachment.files."""
+        with patch.object(
+            adapter, "_download_slack_file", new_callable=AsyncMock
+        ) as dl:
+            dl.return_value = "/tmp/forwarded_screenshot.png"
+            event = self._make_event(
+                text="please inspect this forward",
+                attachments=[
+                    {
+                        "is_msg_unfurl": True,
+                        "author_name": "Klaudia",
+                        "text": "Screenshot context",
+                        "files": [
+                            {
+                                "id": "F123",
+                                "mimetype": "image/png",
+                                "name": "screenshot.png",
+                                "url_private_download": "https://files.slack.com/screenshot.png",
+                                "size": 1024,
+                            }
+                        ],
+                    }
+                ],
+            )
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.PHOTO
+        assert msg_event.media_urls == ["/tmp/forwarded_screenshot.png"]
+        assert msg_event.media_types == ["image/png"]
+        assert "Screenshot context" in msg_event.text
 
     @pytest.mark.asyncio
     async def test_channel_routing_ignores_bot_mentions_inside_block_text(
