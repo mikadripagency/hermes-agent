@@ -6,7 +6,9 @@ default spawn resolution (:func:`hermes_cli.kanban_db._resolve_default_spawn`).
 The paseo CLI is mocked entirely at the ``subprocess`` boundary — no real
 daemon, no real agents. Each test installs a fake ``subprocess.run`` that
 dispatches on the paseo subcommand (``status`` / ``ls`` / ``run``) and a fake
-``subprocess.Popen`` that stands in for the ``paseo wait`` watcher.
+``subprocess.Popen`` that stands in for the tracked watch-loop child. The
+watch loop itself (``watch_worker``) is tested with scripted state sequences
+plus one real-subprocess end-to-end run against a real kanban DB.
 """
 
 from __future__ import annotations
@@ -138,12 +140,21 @@ def test_enabled_healthy_launches_agent_with_contract(monkeypatch, tmp_path):
     assert "HERMES_KANBAN_RUN_ID=7" in env_pairs
     # Prompt is the final positional arg.
     assert run_cmd[-1] == "work kanban task t_paseo"
-    # Watcher: `paseo wait <id> --json --timeout <max_runtime + slack>`.
+    # Watcher: the tracked child is the task-state watch loop, NOT `paseo wait`
+    # (ACP agents flap to idle between turns; only the kanban DB decides).
+    import sys as _sys
+    import time as _time
+
     assert len(calls["popen"]) == 1
-    wait_cmd = calls["popen"][0]
-    assert wait_cmd[:3] == ["paseo", "wait", "ag_1234567"]
-    assert "--timeout" in wait_cmd
-    assert wait_cmd[wait_cmd.index("--timeout") + 1] == str(1800 + 300)
+    watch_cmd = calls["popen"][0]
+    assert watch_cmd[:4] == [_sys.executable, "-m", "hermes_cli.paseo_spawn", "--watch"]
+    assert watch_cmd[watch_cmd.index("--task") + 1] == "t_paseo"
+    assert watch_cmd[watch_cmd.index("--agent") + 1] == "ag_1234567"
+    assert "--db" in watch_cmd
+    assert watch_cmd[watch_cmd.index("--run") + 1] == "7"
+    # Deadline ≈ now + max_runtime + slack.
+    deadline = float(watch_cmd[watch_cmd.index("--deadline") + 1])
+    assert abs(deadline - (_time.time() + 1800 + 300)) < 60
 
 
 def test_daemon_down_falls_back_to_default_spawn(monkeypatch, tmp_path):
@@ -187,7 +198,9 @@ def test_existing_agent_reattaches_without_second_run(monkeypatch, tmp_path):
 
     assert calls["run"] == []  # double-spawn guard fired
     assert len(calls["popen"]) == 1
-    assert calls["popen"][0][:3] == ["paseo", "wait", "ag_existing1"]
+    watch_cmd = calls["popen"][0]
+    assert "--watch" in watch_cmd
+    assert watch_cmd[watch_cmd.index("--agent") + 1] == "ag_existing1"
     assert pid == 9999
 
 
@@ -207,7 +220,8 @@ def test_idle_agent_is_reattachable(monkeypatch, tmp_path):
 
     paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
     assert calls["run"] == []
-    assert calls["popen"][0][2] == "ag_idle"
+    watch_cmd = calls["popen"][0]
+    assert watch_cmd[watch_cmd.index("--agent") + 1] == "ag_idle"
 
 
 def test_errored_agent_not_reattached(monkeypatch, tmp_path):
@@ -286,3 +300,271 @@ def test_run_failure_raises(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError):
         paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
+
+
+# ---------------------------------------------------------------------------
+# Watch loop (the tracked worker PID)
+# ---------------------------------------------------------------------------
+
+
+def _watch(paseo_spawn, monkeypatch, *, task_states, inspect_results, deadline=None, run_id=1,
+           gone_threshold=3):
+    """Run watch_worker with scripted task-state and inspect sequences.
+
+    ``task_states`` / ``inspect_results`` are lists consumed one entry per
+    poll; the final entry repeats forever. ``time.sleep`` is a no-op.
+    """
+    polls = {"n": 0}
+
+    def fake_state(db_path, task_id):
+        i = min(polls["n"], len(task_states) - 1)
+        return task_states[i]
+
+    def fake_inspect(paseo_bin, agent_id):
+        i = min(polls["n"], len(inspect_results) - 1)
+        polls["n"] += 1
+        return inspect_results[i]
+
+    monkeypatch.setattr(paseo_spawn, "_read_task_run_state", fake_state)
+    monkeypatch.setattr(paseo_spawn, "_inspect_agent_ok", fake_inspect)
+
+    return paseo_spawn.watch_worker(
+        task_id="t_w",
+        agent_id="ag_w",
+        db_path="/nonexistent.db",
+        run_id=run_id,
+        deadline=deadline,
+        poll_seconds=0,
+        gone_threshold=gone_threshold,
+    ), polls["n"]
+
+
+def test_watch_exits_0_on_terminal_task_state(monkeypatch):
+    """Task done in the DB → exit 0, even while the agent looks alive."""
+    from hermes_cli import paseo_spawn
+
+    rc, _ = _watch(
+        paseo_spawn,
+        monkeypatch,
+        task_states=[("running", 1), ("running", 1), ("done", 1)],
+        inspect_results=[True],
+    )
+    assert rc == 0
+
+
+def test_watch_ignores_agent_idle_while_task_running(monkeypatch):
+    """Agent flapping to idle (inspect ok) must NOT terminate the watcher.
+
+    The loop keeps polling through many agent-alive polls while the task is
+    running, and only exits when the task's DB state settles. This is the
+    regression guard for the t_6811e170 false protocol violation.
+    """
+    from hermes_cli import paseo_spawn
+
+    # 20 polls of a healthy (idle-flapping) agent with the task running — the
+    # watcher must survive all of them and exit 0 only on the DB transition.
+    rc, polls = _watch(
+        paseo_spawn,
+        monkeypatch,
+        task_states=[("running", 1)] * 20 + [("blocked", 1)],
+        inspect_results=[True],
+    )
+    assert rc == 0
+    assert polls >= 20  # it genuinely kept watching
+
+
+def test_watch_exits_1_when_agent_gone_consecutively(monkeypatch):
+    """Agent gone for N consecutive polls while task still running → exit 1."""
+    from hermes_cli import paseo_spawn
+
+    rc, polls = _watch(
+        paseo_spawn,
+        monkeypatch,
+        task_states=[("running", 1)],
+        inspect_results=[False],
+        gone_threshold=3,
+    )
+    assert rc == 1
+    assert polls == 3  # exactly the consecutive threshold
+
+
+def test_watch_transient_inspect_failures_reset(monkeypatch):
+    """Non-consecutive inspect failures (daemon blips) never reach the threshold."""
+    from hermes_cli import paseo_spawn
+
+    # Pattern: 2 bad, 1 good (reset), 2 bad, 1 good (reset), … then task done.
+    inspect_seq = [False, False, True] * 4 + [True]
+    task_seq = [("running", 1)] * (len(inspect_seq) - 1) + [("done", 1)]
+    rc, _ = _watch(
+        paseo_spawn,
+        monkeypatch,
+        task_states=task_seq,
+        inspect_results=inspect_seq,
+        gone_threshold=3,
+    )
+    assert rc == 0  # blips never accumulated to the threshold
+
+
+def test_watch_exits_1_on_deadline(monkeypatch):
+    """Deadline in the past + task still running → exit 1."""
+    import time
+
+    from hermes_cli import paseo_spawn
+
+    rc, _ = _watch(
+        paseo_spawn,
+        monkeypatch,
+        task_states=[("running", 1)],
+        inspect_results=[True],
+        deadline=time.time() - 10,
+    )
+    assert rc == 1
+
+
+def test_watch_exits_0_when_run_superseded(monkeypatch):
+    """current_run_id moved past our run → our watch is stale → exit 0."""
+    from hermes_cli import paseo_spawn
+
+    rc, _ = _watch(
+        paseo_spawn,
+        monkeypatch,
+        task_states=[("running", 2)],  # a newer run owns the task
+        inspect_results=[True],
+        run_id=1,
+    )
+    assert rc == 0
+
+
+def test_watch_exits_0_when_task_deleted(monkeypatch):
+    """Task row gone from the DB → nothing left to watch → exit 0."""
+    from hermes_cli import paseo_spawn
+
+    rc, _ = _watch(
+        paseo_spawn,
+        monkeypatch,
+        task_states=[("__missing__", None)],
+        inspect_results=[True],
+    )
+    assert rc == 0
+
+
+def test_watch_survives_transient_db_errors(monkeypatch):
+    """None from the DB reader (locked/busy) keeps the loop alive."""
+    from hermes_cli import paseo_spawn
+
+    rc, _ = _watch(
+        paseo_spawn,
+        monkeypatch,
+        task_states=[None, None, ("running", 1), ("done", 1)],
+        inspect_results=[True],
+    )
+    assert rc == 0
+
+
+def test_read_task_run_state_against_real_db(tmp_path, monkeypatch):
+    """The read-only reader works against a real kanban schema, and never writes."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    db_path = tmp_path / "kanban.db"
+    conn = kb.connect(db_path)
+    try:
+        tid = kb.create_task(conn, title="watched")
+        conn.execute(
+            "UPDATE tasks SET status='running', current_run_id=42 WHERE id=?", (tid,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert paseo_spawn._read_task_run_state(str(db_path), tid) == ("running", 42)
+    assert paseo_spawn._read_task_run_state(str(db_path), "t_nope") == ("__missing__", None)
+    # Unreadable path → transient (None), not a crash.
+    assert paseo_spawn._read_task_run_state(str(tmp_path / "missing.db"), tid) is None
+
+
+def test_inspect_agent_ok_parsing(monkeypatch):
+    """_inspect_agent_ok maps inspect --json states to live/gone correctly."""
+    import json as _json
+
+    from hermes_cli import paseo_spawn
+
+    def make_run(rc, payload):
+        def fake_run(cmd, *a, **k):
+            return _CompletedRun(returncode=rc, stdout=_json.dumps(payload))
+
+        return fake_run
+
+    ok = {"Id": "ag_1", "Status": "idle", "Archived": False, "ArchivedAt": None}
+    monkeypatch.setattr(subprocess, "run", make_run(0, ok))
+    assert paseo_spawn._inspect_agent_ok("paseo", "ag_1") is True
+
+    archived = dict(ok, Archived=True, ArchivedAt="2026-07-14T00:00:00Z")
+    monkeypatch.setattr(subprocess, "run", make_run(0, archived))
+    assert paseo_spawn._inspect_agent_ok("paseo", "ag_1") is False
+
+    errored = dict(ok, Status="error")
+    monkeypatch.setattr(subprocess, "run", make_run(0, errored))
+    assert paseo_spawn._inspect_agent_ok("paseo", "ag_1") is False
+
+    monkeypatch.setattr(subprocess, "run", make_run(1, {}))  # not found / daemon down
+    assert paseo_spawn._inspect_agent_ok("paseo", "ag_1") is False
+
+
+def test_watch_entrypoint_end_to_end(tmp_path, monkeypatch):
+    """`python -m hermes_cli.paseo_spawn --watch` exits 0 once the task settles."""
+    import subprocess as real_subprocess
+    import sys
+    import threading
+    import time
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    from hermes_cli import kanban_db as kb
+
+    db_path = tmp_path / "kanban.db"
+    conn = kb.connect(db_path)
+    tid = kb.create_task(conn, title="e2e")
+    conn.execute("UPDATE tasks SET status='running', current_run_id=1 WHERE id=?", (tid,))
+    conn.commit()
+
+    # Stub paseo bin: inspect always reports a live agent.
+    stub = tmp_path / "paseo"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "echo '{\"Id\": \"ag_1\", \"Status\": \"idle\", \"Archived\": false}'\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+
+    def settle():
+        # Own connection: sqlite3 connections are not shareable across threads.
+        import sqlite3
+
+        time.sleep(1.0)
+        c2 = sqlite3.connect(str(db_path), timeout=10)
+        try:
+            c2.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+            c2.commit()
+        finally:
+            c2.close()
+
+    t = threading.Thread(target=settle)
+    t.start()
+    try:
+        proc = real_subprocess.run(
+            [
+                sys.executable, "-m", "hermes_cli.paseo_spawn",
+                "--watch", "--task", tid, "--agent", "ag_1",
+                "--db", str(db_path), "--run", "1",
+                "--paseo-bin", str(stub),
+            ],
+            env={**__import__("os").environ, "HERMES_PASEO_WATCH_POLL": "0.2"},
+            timeout=30,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        t.join()
+        conn.close()
+    assert proc.returncode == 0, proc.stderr

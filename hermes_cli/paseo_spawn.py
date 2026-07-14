@@ -12,11 +12,27 @@ semantics are preserved:
   the agent's provider process via ``paseo run --env``, so the kanban toolset
   auto-appends (``HERMES_KANBAN_TASK``), heartbeats fire, goal-loop mode works,
   and board/DB/branch pins resolve exactly as for a normal worker.
-* The dispatcher still receives a *PID* whose lifetime tracks the agent: a
-  tracked ``paseo wait <agentId>`` watcher child. When the agent goes idle the
-  watcher exits, so the dispatcher's PID-liveness / protocol-violation logic
-  behaves identically to the ``hermes chat`` path (watcher exit rc 0 + task
-  still running == protocol violation, detected downstream).
+* The dispatcher still receives a *PID* whose lifetime tracks the worker: a
+  tracked watch-loop child (``python -m hermes_cli.paseo_spawn --watch ...``).
+  IMPORTANT: the watcher's exit condition is the *kanban task's DB state*, NOT
+  the Paseo agent's idle flag. ACP agents flap to ``idle`` between protocol
+  turns (and on permission states), so ``paseo wait`` would exit rc 0 mid-task
+  and the dispatcher would misclassify a healthy worker as a protocol
+  violation (observed live on t_6811e170). The watch loop instead polls:
+
+  - the kanban DB (read-only): task left this run's ``running`` state
+    (done/blocked/review/archived, reclaimed, run superseded, or deleted)
+    → **exit 0** — only the task's DB state decides success.
+  - ``paseo inspect <agent> --json``: agent archived / deleted / errored /
+    daemon unreachable for N *consecutive* polls → **exit 1** (worker
+    genuinely gone; the dispatcher's crash recovery is then correct).
+    Transient daemon blips reset on the next good poll.
+  - a deadline (task ``max_runtime + slack``) → **exit 1** (the dispatcher's
+    stale-timeout reclaim would fire anyway; the nonzero exit keeps the
+    classification honest).
+
+  While the agent works, ChingLing's env-driven auto-heartbeat keeps the task
+  fresh — the watcher never exits 0 merely because the agent object says idle.
 
 Config keys (under ``kanban.paseo_spawn`` in the profile ``config.yaml``):
 
@@ -25,7 +41,7 @@ Config keys (under ``kanban.paseo_spawn`` in the profile ``config.yaml``):
 * ``provider`` (str, default ``"hermes"``) — Paseo provider to run under.
 * ``paseo_bin`` (str, default ``"paseo"``) — path/name of the paseo CLI.
 * ``wait_timeout_slack_seconds`` (int, default ``300``) — added to the task's
-  ``max_runtime_seconds`` to size the watcher's ``--timeout``.
+  ``max_runtime_seconds`` to size the watch loop's deadline.
 
 Robustness contract: a Paseo outage must NEVER stall dispatch. Any failure of
 the health check falls back automatically to ``_default_spawn`` (one WARNING).
@@ -40,14 +56,13 @@ CLI facts this module relies on (paseo v0.1.107, verified against the bundled
   <id>") — there is no ``workspaceId`` in the JSON, so it is parsed best-effort.
 * ``paseo ls -g --json --label k=v`` filters non-archived agents by label and
   emits a JSON array of ``{id, shortId, name, provider, status, cwd, ...}``.
-* ``paseo wait <id> [--timeout <seconds>]`` waits for the agent to become idle.
-  IMPORTANT: the flag is ``--timeout`` (seconds), NOT ``--wait-timeout`` (that
-  belongs to ``paseo run``). ``paseo wait`` exits **rc 0 for every agent state**
-  it resolves — ``idle``, ``timeout`` (still running at deadline), ``permission``
-  and ``error`` are all returned as data. It only exits nonzero (rc 1) when it
-  cannot talk to the daemon / the wait itself fails. So the watcher exiting is
-  the signal the dispatcher watches; a timeout does not surface as a distinct
-  exit code and is instead handled by the dispatcher's stale-timeout reclaim.
+* ``paseo inspect <id> --json`` emits a single JSON object with capitalized
+  keys (``Id``/``Status``/``Archived``/``ArchivedAt``/…). A missing agent or an
+  unreachable daemon exits rc 1 with an ``{"error": …}`` payload on stderr.
+* ``paseo wait`` is deliberately NOT used as the watcher: it resolves rc 0 as
+  soon as the agent reports ``idle`` — which ACP providers flap to between
+  protocol turns — and it also exits rc 0 for ``timeout`` / ``permission`` /
+  ``error`` states (only daemon/connection failures are nonzero).
 """
 
 from __future__ import annotations
@@ -269,24 +284,211 @@ def _record_linkage_comment(
         )
 
 
-def _spawn_watcher(
-    paseo_bin: str,
+# ---------------------------------------------------------------------------
+# Watch loop (the tracked worker PID)
+# ---------------------------------------------------------------------------
+
+# Poll cadence and agent-gone threshold. 6 consecutive bad inspects at a 10s
+# cadence ≈ 60s of sustained "agent gone / daemon down" before declaring the
+# worker dead — long enough to ride out a paseo daemon restart.
+WATCH_POLL_SECONDS = 10.0
+WATCH_GONE_THRESHOLD = 6
+
+# Exit codes of the watch loop (the PID the dispatcher tracks):
+#   0 — the kanban task left this run's `running` state (terminal transition,
+#       reclaim, run superseded, or task deleted). The dispatcher only flags a
+#       protocol violation for tasks still `running`, so rc 0 here is always
+#       clean.
+#   1 — the agent is genuinely gone (archived/deleted/errored/unreachable for
+#       WATCH_GONE_THRESHOLD consecutive polls) or the deadline passed while
+#       the task is still running. Dispatcher crash recovery is then correct.
+WATCH_EXIT_TASK_SETTLED = 0
+WATCH_EXIT_WORKER_GONE = 1
+
+
+def _read_task_run_state(db_path: str, task_id: str):
+    """Read ``(status, current_run_id)`` for ``task_id`` — read-only, no writes.
+
+    Opens its own short-lived read-only connection (URI ``mode=ro``) with a
+    busy timeout so the watcher can never write to, lock, or initialize the
+    kanban DB. Returns:
+
+    * ``(status, current_run_id)`` when the row exists,
+    * ``("__missing__", None)`` when the task row is gone (deleted), and
+    * ``None`` on transient errors (locked/busy/unreadable) — the caller keeps
+      looping; a permanently unreadable DB is bounded by the deadline.
+    """
+    import sqlite3
+    from urllib.parse import quote
+
+    try:
+        uri = f"file:{quote(str(db_path))}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            row = conn.execute(
+                "SELECT status, current_run_id FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return ("__missing__", None)
+    return (row[0], row[1])
+
+
+def _inspect_agent_ok(paseo_bin: str, agent_id: str) -> bool:
+    """One ``paseo inspect`` poll: True iff the agent is live and usable.
+
+    "Usable" = inspect succeeds, agent is not archived, and its status is not
+    ``error``. Any failure (nonzero rc, timeout, unparsable JSON, daemon down)
+    returns False; the caller applies the consecutive-poll threshold so
+    transient daemon blips don't kill the watcher.
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603 - fixed argv
+            [paseo_bin, "inspect", agent_id, "--json"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=_LS_TIMEOUT_SECONDS,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    if proc.returncode != 0:
+        return False
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    # inspect --json uses capitalized keys (Status/Archived/ArchivedAt); accept
+    # lowercase variants defensively in case the CLI schema changes.
+    archived = data.get("Archived", data.get("archived"))
+    if archived is None:
+        archived = (data.get("ArchivedAt") or data.get("archivedAt")) is not None
+    if archived:
+        return False
+    status = data.get("Status", data.get("status"))
+    if status == "error":
+        return False
+    return True
+
+
+def watch_worker(
+    *,
+    task_id: str,
     agent_id: str,
-    timeout_seconds: Optional[int],
+    db_path: str,
+    run_id: Optional[int] = None,
+    deadline: Optional[float] = None,
+    paseo_bin: str = "paseo",
+    poll_seconds: float = WATCH_POLL_SECONDS,
+    gone_threshold: int = WATCH_GONE_THRESHOLD,
+) -> int:
+    """The watch loop body; returns the process exit code.
+
+    The kanban task's DB state is the ONLY success signal: the loop exits 0
+    exactly when the task is no longer ``running`` under ``run_id`` (terminal
+    transition, reclaim, run superseded, or deleted). The Paseo agent flapping
+    to ``idle`` between ACP turns never terminates the watcher. Agent-gone
+    (``gone_threshold`` consecutive bad inspects) and deadline overrun exit 1.
+    """
+    import time
+
+    consecutive_bad = 0
+    while True:
+        # (a) Task DB state — the authoritative success signal.
+        state = _read_task_run_state(db_path, task_id)
+        if state is not None:
+            status, current_run = state
+            if status != "running":
+                _log.info(
+                    "paseo watch: task %s left running (status=%s) — done",
+                    task_id,
+                    status,
+                )
+                return WATCH_EXIT_TASK_SETTLED
+            if run_id is not None and current_run is not None and int(current_run) != int(run_id):
+                _log.info(
+                    "paseo watch: task %s run superseded (%s -> %s) — done",
+                    task_id,
+                    run_id,
+                    current_run,
+                )
+                return WATCH_EXIT_TASK_SETTLED
+
+        # (b) Agent liveness — only consecutive sustained failure counts.
+        if _inspect_agent_ok(paseo_bin, agent_id):
+            consecutive_bad = 0
+        else:
+            consecutive_bad += 1
+            if consecutive_bad >= gone_threshold:
+                _log.warning(
+                    "paseo watch: agent %s gone/unreachable for %d consecutive "
+                    "polls — declaring worker dead (task %s)",
+                    agent_id,
+                    consecutive_bad,
+                    task_id,
+                )
+                return WATCH_EXIT_WORKER_GONE
+
+        # (c) Deadline (task max_runtime + slack).
+        if deadline is not None and time.time() >= deadline:
+            _log.warning(
+                "paseo watch: deadline passed for task %s (agent %s) — exiting",
+                task_id,
+                agent_id,
+            )
+            return WATCH_EXIT_WORKER_GONE
+
+        time.sleep(poll_seconds)
+
+
+def _spawn_watcher(
+    task_id: str,
+    agent_id: str,
+    db_path: str,
+    run_id: Optional[int],
+    deadline: Optional[float],
+    paseo_bin: str,
     log_f,
 ) -> int:
-    """Popen a tracked ``paseo wait`` child; return its PID.
+    """Popen the tracked watch-loop child; return its PID.
 
-    The watcher's lifetime approximates the agent's run: it blocks until the
-    agent goes idle (or the optional ``--timeout`` fires). Its stdout/stderr go
-    to the shared per-task worker log. ``start_new_session`` detaches it so the
-    dispatcher's process-group handling matches ``_default_spawn``.
+    Runs ``<sys.executable> -m hermes_cli.paseo_spawn --watch ...`` — the same
+    interpreter as the dispatching gateway, so ``hermes_cli`` resolves to the
+    deployed tree. Its stdout/stderr go to the shared per-task worker log.
+    ``start_new_session`` detaches it so the dispatcher's process-group
+    handling matches ``_default_spawn``.
     """
-    cmd = [paseo_bin, "wait", agent_id, "--json"]
-    if timeout_seconds and timeout_seconds > 0:
-        # `paseo wait` uses `--timeout <seconds>` (NOT `--wait-timeout`).
-        cmd.extend(["--timeout", str(int(timeout_seconds))])
-    log_f.write(f"[paseo_spawn] watching agent {agent_id}\n".encode())
+    import sys
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "hermes_cli.paseo_spawn",
+        "--watch",
+        "--task",
+        task_id,
+        "--agent",
+        agent_id,
+        "--db",
+        db_path,
+        "--paseo-bin",
+        paseo_bin,
+    ]
+    if run_id is not None:
+        cmd.extend(["--run", str(int(run_id))])
+    if deadline is not None:
+        cmd.extend(["--deadline", str(int(deadline))])
+    log_f.write(
+        f"[paseo_spawn] watching agent {agent_id} (task-state watch loop)\n".encode()
+    )
     log_f.flush()
     proc = subprocess.Popen(  # noqa: S603 - argv is a fixed list built above
         cmd,
@@ -296,6 +498,41 @@ def _spawn_watcher(
         start_new_session=True,
     )
     return proc.pid
+
+
+def main(argv: Optional[list] = None) -> int:
+    """CLI entrypoint: ``python -m hermes_cli.paseo_spawn --watch ...``."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="hermes_cli.paseo_spawn")
+    parser.add_argument("--watch", action="store_true", required=True)
+    parser.add_argument("--task", required=True)
+    parser.add_argument("--agent", required=True)
+    parser.add_argument("--db", required=True)
+    parser.add_argument("--run", type=int, default=None)
+    parser.add_argument("--deadline", type=float, default=None)
+    parser.add_argument("--paseo-bin", default="paseo")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [paseo_watch] %(levelname)s %(message)s",
+    )
+    # Test hook: override the poll cadence (seconds) without changing the CLI
+    # contract the dispatcher spawns with.
+    try:
+        poll_seconds = float(os.environ.get("HERMES_PASEO_WATCH_POLL", WATCH_POLL_SECONDS))
+    except ValueError:
+        poll_seconds = WATCH_POLL_SECONDS
+    return watch_worker(
+        task_id=args.task,
+        agent_id=args.agent,
+        db_path=args.db,
+        run_id=args.run,
+        deadline=args.deadline,
+        paseo_bin=args.paseo_bin,
+        poll_seconds=poll_seconds,
+    )
 
 
 def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
@@ -362,15 +599,32 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
             )
             _record_linkage_comment(task, agent_id, workspace_id, profile_arg, board)
 
-        # Size the watcher timeout: task max runtime + slack (unbounded when the
-        # task has no max runtime — the watcher then simply lives until the
-        # agent goes idle).
-        max_runtime = getattr(task, "max_runtime_seconds", None)
-        timeout_seconds = None
-        if max_runtime:
-            timeout_seconds = int(max_runtime) + int(slack)
+        # Watch-loop deadline: task max runtime + slack (unbounded when the
+        # task has no max runtime — the loop then lives until the task's DB
+        # state settles or the agent is genuinely gone).
+        import time
 
-        return _spawn_watcher(paseo_bin, agent_id, timeout_seconds, log_f)
+        max_runtime = getattr(task, "max_runtime_seconds", None)
+        deadline = None
+        if max_runtime:
+            deadline = time.time() + int(max_runtime) + int(slack)
+
+        run_id = getattr(task, "current_run_id", None)
+        return _spawn_watcher(
+            task.id,
+            agent_id,
+            env["HERMES_KANBAN_DB"],
+            run_id,
+            deadline,
+            paseo_bin,
+            log_f,
+        )
     except Exception:
         log_f.close()
         raise
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via subprocess
+    import sys
+
+    sys.exit(main())
