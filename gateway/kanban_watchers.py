@@ -331,6 +331,19 @@ class GatewayKanbanWatchersMixin:
                     receipt_event_id = None
                     for ev in d["events"]:
                         kind = ev.kind
+                        # Silent-until-Done delivery profile for
+                        # developer-assigned tasks: internal terminal states
+                        # (blocked/gave_up/crashed/timed_out) stay on the board
+                        # and are escalated to Hermes, but the creator only ever
+                        # receives the "completed" ping. This is a delivery-side
+                        # skip only: the event was already claimed by
+                        # claim_unseen_events_for_sub, and because we `continue`
+                        # (rather than `break`) the loop still reaches its else
+                        # branch and _kanban_advance clears the pending claim and
+                        # advances the cursor cleanly. Completion is unaffected,
+                        # so the Slack completion receipt still records normally.
+                        if task and task.assignee == "developer" and kind != "completed":
+                            continue
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -456,7 +469,14 @@ class GatewayKanbanWatchersMixin:
                             self._kanban_advance, sub, d["cursor"], board_slug,
                             receipt_id, receipt_event_id,
                         )
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        # developer-assigned tasks are silent-until-Done, so
+                        # only a completion is allowed to wake the creator;
+                        # other terminal kinds are handled internally.
+                        _WAKE_KINDS = (
+                            ("completed",)
+                            if task and task.assignee == "developer"
+                            else ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        )
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         if _wake_kinds:
                             try:
