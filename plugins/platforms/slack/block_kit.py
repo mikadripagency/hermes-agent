@@ -323,6 +323,83 @@ def _render_table(rows: List[str]) -> str:
 
 
 # ----------------------------------------------------------------------------
+# Empty-element sanitization
+# ----------------------------------------------------------------------------
+
+
+def _empty_cell() -> Block:
+    """A minimal non-empty table cell (single space).
+
+    A table row must keep all its cells to preserve column alignment, but Slack
+    rejects a cell whose ``rich_text`` has no content, so a fully-empty cell is
+    filled with a single space.
+    """
+    return {
+        "type": "rich_text",
+        "elements": [
+            {"type": "rich_text_section", "elements": [{"type": "text", "text": " "}]}
+        ],
+    }
+
+
+def _prune_rt_elements(elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop rich_text leaves Slack rejects and recurse into containers.
+
+    Slack fails the whole ``chat.postMessage`` with ``invalid_blocks`` if any
+    ``text``/``link`` object has an empty string ("must be more than 0
+    characters"); an empty table cell or a blank list item ("- ") is the usual
+    source. Whitespace such as ``"\\n"`` is a valid separator and is kept.
+    Containers whose children all drop out are removed too.
+    """
+    out: List[Dict[str, Any]] = []
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        etype = el.get("type")
+        if etype in ("text", "link"):
+            if el.get("text"):  # empty string "" is rejected; "\n" is kept
+                out.append(el)
+            continue
+        child = el.get("elements")
+        if isinstance(child, list):
+            el["elements"] = _prune_rt_elements(child)
+            if not el["elements"]:
+                continue
+        out.append(el)
+    return out
+
+
+def _sanitize_blocks(blocks: List[Block]) -> List[Block]:
+    """Strip empty-text elements Slack rejects, dropping now-empty blocks.
+
+    A rich render must never lose a message to an ``invalid_blocks`` rejection,
+    so any element whose text is empty is filtered before send. Table cells are
+    kept (as a single space) to preserve column alignment.
+    """
+    out: List[Block] = []
+    for block in blocks:
+        btype = block.get("type")
+        if btype == "rich_text":
+            block["elements"] = _prune_rt_elements(block.get("elements", []))
+            if not block["elements"]:
+                continue
+        elif btype in ("section", "header"):
+            if not (block.get("text") or {}).get("text"):
+                continue
+        elif btype == "table":
+            new_rows = []
+            for row in block.get("rows", []):
+                cells = []
+                for cell in row:
+                    cell["elements"] = _prune_rt_elements(cell.get("elements", []))
+                    cells.append(cell if cell["elements"] else _empty_cell())
+                new_rows.append(cells)
+            block["rows"] = new_rows
+        out.append(block)
+    return out
+
+
+# ----------------------------------------------------------------------------
 # Public entry point
 # ----------------------------------------------------------------------------
 
@@ -482,6 +559,10 @@ def render_blocks(
             i += 1
 
         flush_para()
+
+        # Filter empty-text elements Slack rejects with ``invalid_blocks``
+        # before the caller ever sends the payload.
+        blocks = _sanitize_blocks(blocks)
 
         if not blocks:
             return None

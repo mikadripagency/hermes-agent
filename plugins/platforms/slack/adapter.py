@@ -1409,7 +1409,27 @@ class SlackAdapter(BasePlatformAdapter):
                     if broadcast and i == 0:
                         kwargs["reply_broadcast"] = True
 
-                last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+                try:
+                    last_result = await self._get_client(chat_id).chat_postMessage(
+                        **kwargs
+                    )
+                except Exception as post_exc:
+                    # A malformed Block Kit payload fails the whole send with
+                    # ``invalid_blocks`` and would otherwise drop the message.
+                    # The ``text`` field is always present, so retry once
+                    # without blocks so a rich-render bug never loses content.
+                    if "blocks" in kwargs and "invalid_blocks" in str(post_exc).lower():
+                        logger.warning(
+                            "[Slack] invalid_blocks on chunk %d; retrying text-only: %s",
+                            i,
+                            post_exc,
+                        )
+                        kwargs.pop("blocks", None)
+                        last_result = await self._get_client(
+                            chat_id
+                        ).chat_postMessage(**kwargs)
+                    else:
+                        raise
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
@@ -1500,7 +1520,24 @@ class SlackAdapter(BasePlatformAdapter):
                 blocks = self._maybe_blocks(content)
                 if blocks:
                     update_kwargs["blocks"] = blocks
-            await self._get_client(chat_id).chat_update(**update_kwargs)
+            try:
+                await self._get_client(chat_id).chat_update(**update_kwargs)
+            except Exception as edit_exc:
+                # Same invalid_blocks safety net as send(): never lose the
+                # finalized text to a rich-render bug.
+                if (
+                    "blocks" in update_kwargs
+                    and "invalid_blocks" in str(edit_exc).lower()
+                ):
+                    logger.warning(
+                        "[Slack] invalid_blocks on edit %s; retrying text-only: %s",
+                        message_id,
+                        edit_exc,
+                    )
+                    update_kwargs.pop("blocks", None)
+                    await self._get_client(chat_id).chat_update(**update_kwargs)
+                else:
+                    raise
             if finalize:
                 await self.stop_typing(chat_id)
             return SendResult(success=True, message_id=message_id)

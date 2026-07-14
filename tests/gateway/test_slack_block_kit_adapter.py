@@ -78,6 +78,55 @@ class TestSendMessageBlocks:
             assert c.kwargs["text"]
 
 
+class TestInvalidBlocksFallback:
+    @pytest.mark.asyncio
+    async def test_send_retries_text_only_on_invalid_blocks(self):
+        adapter, client = _make_adapter({"rich_blocks": True})
+        calls = []
+
+        async def flaky_post(**kwargs):
+            calls.append(kwargs)
+            if "blocks" in kwargs:
+                raise Exception("The request contained invalid_blocks: ...")
+            return {"ts": "111.222"}
+
+        client.chat_postMessage = AsyncMock(side_effect=flaky_post)
+        result = await adapter.send("C1", RICH_MD)
+        # message is NOT lost: a text-only retry succeeds
+        assert result.success
+        assert len(calls) == 2
+        assert "blocks" in calls[0]
+        assert "blocks" not in calls[1]
+        assert calls[1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_send_reraises_non_block_errors(self):
+        adapter, client = _make_adapter({"rich_blocks": True})
+        client.chat_postMessage = AsyncMock(side_effect=Exception("channel_not_found"))
+        result = await adapter.send("C1", RICH_MD)
+        # a non-invalid_blocks failure is reported, not silently retried forever
+        assert not result.success
+        assert "channel_not_found" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_edit_retries_text_only_on_invalid_blocks(self):
+        adapter, client = _make_adapter({"rich_blocks": True})
+        calls = []
+
+        async def flaky_update(**kwargs):
+            calls.append(kwargs)
+            if "blocks" in kwargs:
+                raise Exception("invalid_blocks")
+            return {"ts": "111.222"}
+
+        client.chat_update = AsyncMock(side_effect=flaky_update)
+        result = await adapter.edit_message("C1", "111.222", RICH_MD, finalize=True)
+        assert result.success
+        assert len(calls) == 2
+        assert "blocks" not in calls[1]
+        assert calls[1]["text"]
+
+
 class TestEditMessageBlocks:
     @pytest.mark.asyncio
     async def test_intermediate_edit_no_blocks(self):

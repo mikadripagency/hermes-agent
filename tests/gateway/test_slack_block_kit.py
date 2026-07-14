@@ -210,6 +210,61 @@ class TestTables:
         assert "|" in str(body[0])
 
 
+def _all_text_elements(node):
+    """Yield every text/link object anywhere in a block tree."""
+    if isinstance(node, dict):
+        if node.get("type") in ("text", "link"):
+            yield node
+        for v in node.values():
+            yield from _all_text_elements(v)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _all_text_elements(item)
+
+
+class TestEmptyTextElements:
+    """Regression: Slack rejects empty text objects with ``invalid_blocks``
+    ("must be more than 0 characters"). The renderer must never emit one."""
+
+    def test_no_empty_text_element_in_table_with_blank_cells(self):
+        md = (
+            "| Name | Note |\n"
+            "|------|------|\n"
+            "| a |  |\n"
+            "|  | b |"
+        )
+        blocks = render_blocks(md)
+        assert blocks[0]["type"] == "table"
+        for el in _all_text_elements(blocks):
+            assert el.get("text") != "", f"empty text element: {el}"
+        # empty cells kept (column alignment preserved) with a space placeholder
+        assert all(len(r) == 2 for r in blocks[0]["rows"])
+
+    def test_blank_list_item_produces_no_empty_text(self):
+        # "- " is a bullet with empty content -> must not yield an empty text el
+        blocks = render_blocks("- \n- real item")
+        for el in _all_text_elements(blocks):
+            assert el.get("text") != ""
+
+    def test_blank_quote_line_keeps_newline_drops_empty(self):
+        blocks = render_blocks("> first\n>\n> third")
+        for el in _all_text_elements(blocks):
+            assert el.get("text") != ""
+
+    def test_empty_code_fence_drops_block(self):
+        # a fenced block with no body would produce an empty preformatted text
+        blocks = render_blocks("before\n\n```\n```\n\nafter")
+        assert blocks is not None
+        for el in _all_text_elements(blocks):
+            assert el.get("text") != ""
+
+    def test_whitespace_separators_are_kept(self):
+        # newline separators between quote lines are valid (>0 chars) and kept
+        blocks = render_blocks("> a\n> b")
+        newlines = [e for e in _all_text_elements(blocks) if e.get("text") == "\n"]
+        assert newlines, "expected newline separators to survive sanitization"
+
+
 class TestLimits:
     def test_oversized_section_is_split_under_limit(self):
         big = "word " * 2000  # ~10000 chars, single paragraph
