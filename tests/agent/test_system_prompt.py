@@ -99,3 +99,50 @@ class TestCodingContextBlock:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
+
+
+class TestKanbanGuidance:
+    """The full worker protocol is worker-only; ordinary chat with the kanban
+    toolset gets a short orchestrator blurb instead (token cost regression)."""
+
+    def test_worker_context_gets_full_protocol(self, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+        agent = _make_agent(
+            valid_tool_names=["kanban_show"], _kanban_worker_guidance=None,
+        )
+        prompt = _stable_prompt(agent)
+        assert "Kanban task execution protocol" in prompt
+        assert "kanban_heartbeat" in prompt
+
+    def test_orchestrator_context_gets_short_blurb_only(self, monkeypatch):
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        agent = _make_agent(
+            valid_tool_names=["kanban_show"], _kanban_worker_guidance=None,
+        )
+        prompt = _stable_prompt(agent)
+        assert "Kanban orchestration" in prompt
+        # The ~5KB worker protocol must NOT leak into ordinary chat sessions.
+        assert "Kanban task execution protocol" not in prompt
+
+    def test_no_kanban_tools_no_guidance(self, monkeypatch):
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        agent = _make_agent(valid_tool_names=[], _kanban_worker_guidance=None)
+        prompt = _stable_prompt(agent)
+        assert "Kanban orchestration" not in prompt
+        assert "Kanban task execution protocol" not in prompt
+
+    def test_preresolved_guidance_used_verbatim(self):
+        from agent.prompt_builder import KANBAN_ORCHESTRATOR_GUIDANCE
+        agent = _make_agent(
+            valid_tool_names=["kanban_show"],
+            _kanban_worker_guidance=KANBAN_ORCHESTRATOR_GUIDANCE,
+        )
+        assert "Kanban orchestration" in _stable_prompt(agent)
+
+
+def test_orchestrator_guidance_is_much_shorter_and_has_routing_verbs():
+    from agent.prompt_builder import KANBAN_GUIDANCE, KANBAN_ORCHESTRATOR_GUIDANCE
+    # The whole point is a smaller prompt: well under half the worker protocol.
+    assert len(KANBAN_ORCHESTRATOR_GUIDANCE) < len(KANBAN_GUIDANCE) / 2
+    for verb in ("kanban_create", "kanban_list", "kanban_show", "kanban_comment"):
+        assert verb in KANBAN_ORCHESTRATOR_GUIDANCE

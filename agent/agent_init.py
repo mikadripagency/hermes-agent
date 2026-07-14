@@ -1179,16 +1179,23 @@ def init_agent(
     elif not agent.quiet_mode:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
 
-    # Kanban worker/orchestrator lifecycle guidance is session-static:
-    # the dispatcher decides at spawn time whether this process is a kanban
-    # worker (kanban_show tool is present iff HERMES_KANBAN_TASK is set).
-    # Resolving the ~835-token block once here avoids re-running the
-    # membership test + reference on every system-prompt rebuild
-    # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
-    )
+    # Kanban lifecycle guidance is session-static, so resolve it once here
+    # rather than re-running the membership test on every system-prompt rebuild
+    # (init + each context compression). The kanban tools are present both for
+    # dispatcher-spawned workers (HERMES_KANBAN_TASK set) AND for orchestrator
+    # profiles that enable the kanban toolset in ordinary chat. Only a worker
+    # needs the full ~5KB task-execution protocol; an orchestrator gets a short
+    # routing blurb instead, so we stop wasting ~1.3K tokens/request injecting
+    # the worker protocol into every ordinary chat session.
+    from agent.prompt_builder import KANBAN_GUIDANCE, KANBAN_ORCHESTRATOR_GUIDANCE
+    if "kanban_show" in agent.valid_tool_names:
+        agent._kanban_worker_guidance = (
+            KANBAN_GUIDANCE
+            if os.environ.get("HERMES_KANBAN_TASK")
+            else KANBAN_ORCHESTRATOR_GUIDANCE
+        )
+    else:
+        agent._kanban_worker_guidance = ""
 
     # Check tool requirements
     if agent.tools and not agent.quiet_mode:

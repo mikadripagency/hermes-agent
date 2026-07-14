@@ -284,6 +284,28 @@ KANBAN_GUIDANCE = (
     "cross-agent handoffs that outlive one API loop."
 )
 
+# Short guidance for the ORCHESTRATOR surface (kanban tools enabled in a normal
+# chat profile, but NOT a dispatcher-spawned worker — no HERMES_KANBAN_TASK).
+# The full ~5KB worker lifecycle protocol (KANBAN_GUIDANCE) is worker-only; an
+# orchestrator just needs the routing verbs, so injecting the whole protocol
+# into every ordinary chat wasted ~1.3K tokens/request. Workers still receive
+# KANBAN_GUIDANCE in full (see agent_init._kanban_worker_guidance).
+KANBAN_ORCHESTRATOR_GUIDANCE = (
+    "# Kanban orchestration\n"
+    "You route work through the shared board at `~/.hermes/kanban.db` with the "
+    "`kanban_*` tools. Core verbs: `kanban_create(title=..., assignee=<profile>, "
+    "parents=[...])` to fan work out to specialist profiles (ground every "
+    "assignee in a REAL profile — an unknown assignee sits in `ready` forever, "
+    "and express dependencies via `parents`, not prose); `kanban_list()` to "
+    "survey the board; `kanban_show(task_id)` to read a task's thread and "
+    "handoffs; `kanban_comment(task_id, ...)` to annotate. As the long-lived "
+    "owner you also hold completion authority — `kanban_complete`, "
+    "`kanban_block`, and `kanban_unblock` move a task through In Review → Done or "
+    "back to In Progress. Dispatcher-spawned workers receive the full "
+    "task-execution protocol automatically, so you don't need to restate it to "
+    "them."
+)
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "
