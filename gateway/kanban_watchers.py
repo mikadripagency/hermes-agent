@@ -338,6 +338,11 @@ class GatewayKanbanWatchersMixin:
                     board_tag = f"[{board_slug}] " if board_slug else ""
                     for ev in d["events"]:
                         kind = ev.kind
+                        # ChingLing is a silent-until-Done delivery profile.
+                        # Internal terminal states stay on the board and are
+                        # escalated to Hermes; Mika only receives completion.
+                        if task and task.assignee == "developer" and kind != "completed":
+                            continue
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -489,7 +494,11 @@ class GatewayKanbanWatchersMixin:
                         # same state. See the longer comment on TERMINAL_KINDS
                         # above for the failure mode this prevents.
                         task_terminal = task and task.status in {"done", "archived"}
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = (
+                            ("completed",)
+                            if task and task.assignee == "developer"
+                            else ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        )
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         if _wake_kinds:
                             try:

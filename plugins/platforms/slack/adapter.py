@@ -2685,13 +2685,28 @@ class SlackAdapter(BasePlatformAdapter):
                 att_footer = att.get("footer", "")
                 att_fallback = att.get("fallback", "")
 
-                # Skip message-type attachments (e.g. Slack bot messages with
-                # is_msg_unfurl) to avoid echoing our own content.
-                if att.get("is_msg_unfurl"):
-                    continue
+                is_message_unfurl = bool(att.get("is_msg_unfurl"))
+
+                # Slack forwards/shared-message cards arrive as attachments with
+                # is_msg_unfurl=true. They are the actual content the user is
+                # asking about, so do not drop them wholesale. Only suppress a
+                # forwarded copy of our own bot message to avoid echo loops.
+                if is_message_unfurl and self._bot_user_id:
+                    forwarded_author = att.get("author_id") or att.get("bot_id")
+                    if forwarded_author == self._bot_user_id:
+                        continue
 
                 # Build a readable representation.
-                if att_title and att_url:
+                if is_message_unfurl:
+                    author = att.get("author_name") or att.get("author_subname")
+                    channel = att.get("channel_id")
+                    if author and channel:
+                        header = f"Forwarded Slack message from {author} in <#{channel}>"
+                    elif author:
+                        header = f"Forwarded Slack message from {author}"
+                    else:
+                        header = "Forwarded Slack message"
+                elif att_title and att_url:
                     header = f"📎 [{att_title}]({att_url})"
                 elif att_title:
                     header = f"📎 {att_title}"
@@ -2908,7 +2923,30 @@ class SlackAdapter(BasePlatformAdapter):
         media_urls = []
         media_types = []
         attachment_notices: List[str] = []
-        files = event.get("files", [])
+        files = list(event.get("files", []) or [])
+        seen_file_keys = {
+            f.get("id") or f.get("url_private_download") or f.get("url_private")
+            for f in files
+            if isinstance(f, dict)
+        }
+        for att in slack_attachments:
+            # Forwarded Slack messages can carry their screenshots/documents
+            # inside attachment.files instead of the top-level event.files.
+            # Surface those as normal media so image/document understanding runs.
+            for nested_file in att.get("files") or []:
+                if not isinstance(nested_file, dict):
+                    continue
+                key = (
+                    nested_file.get("id")
+                    or nested_file.get("url_private_download")
+                    or nested_file.get("url_private")
+                )
+                if key and key in seen_file_keys:
+                    continue
+                files.append(nested_file)
+                if key:
+                    seen_file_keys.add(key)
+
         for f in files:
             # Slack Connect channels return stub file objects with
             # file_access="check_file_info" and no URL fields. We must
