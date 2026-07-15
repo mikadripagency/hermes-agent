@@ -68,8 +68,30 @@ CLI facts this module relies on (paseo v0.1.107, verified against the bundled
   (kind ``worktree``, projectId = the main repo root), so the agent groups
   under its project in the sidebar instead of minting a stray per-run
   "directory" workspace. An existing non-archived registration for the same
-  cwd is reused (bare ``--cwd`` runs never dedupe). Scratch/dir tasks — and
-  ANY failure in workspace resolution — fall back to plain ``--cwd``.
+  cwd is reused (bare ``--cwd`` runs never dedupe).
+* Directory tasks (``workspace_kind == "dir"`` and any other non-worktree
+  kind) whose cwd lies STRICTLY inside a registered non-git Paseo project get
+  grouped too — but via a different lever. The daemon's directory-workspace
+  classifier is purely path-derived: for a non-git directory it sets
+  ``projectId``/``projectRootPath`` to the directory itself (see
+  ``createLocalCheckoutWorkspace`` → ``classifyDirectoryForProjectMembership``
+  → ``deriveProjectRootPath``/``deriveProjectGroupingKey`` in the daemon's
+  ``workspace-registry-model.js``), and the ``directory`` source's optional
+  ``projectId`` field is silently ignored by the local-create handler
+  (``handleWorkspaceCreateLocal``). So a bare ``--cwd <subdir>`` mints a fresh
+  top-level project keyed on the subdir (observed: every Apex experiment task
+  became its own sidebar project). Instead we register the grouping workspace
+  at the PROJECT ROOT — the daemon then attaches it to the existing project
+  (matched by exact ``rootPath``) — while ``paseo run`` still receives
+  ``--cwd <subdir>``. With an explicit ``--workspace`` the CLI uses the
+  ``--cwd`` value as the run cwd (``resolveRunWorkspace`` returns
+  ``{id, cwd}`` unchanged in ``run.js``), so the workspace's registered cwd
+  (project root) and the agent's working directory (subdir) legitimately
+  differ. All dir tasks under one project therefore reuse one root-anchored
+  workspace and group under that project.
+* Scratch tasks (under ``~/.hermes/kanban/workspaces``, not inside any
+  registered project) — and ANY failure in workspace resolution — fall back
+  to plain ``--cwd``.
 * ``paseo inspect <id> --json`` emits a single JSON object with capitalized
   keys (``Id``/``Status``/``Archived``/``ArchivedAt``/…). A missing agent or an
   unreachable daemon exits rc 1 with an ``{"error": …}`` payload on stderr.
@@ -293,6 +315,55 @@ def _find_registered_workspace(workspace_path: str) -> Optional[str]:
     return None
 
 
+def _registered_project_root_for_cwd(cwd: str) -> Optional[str]:
+    """Return the rootPath of the deepest registered project *containing* ``cwd``.
+
+    Reads the daemon's project registry (``~/.paseo/projects/projects.json``)
+    directly — read-only, race-tolerant (a miss just means we skip grouping).
+    A project "contains" ``cwd`` when its ``rootPath`` is a STRICT ancestor of
+    ``cwd`` (i.e. ``cwd`` is a proper subdirectory); matching is by realpath so
+    symlinks resolve. The exact ``cwd == rootPath`` case is deliberately
+    excluded: such a path already groups correctly under its own project via a
+    bare run, and skipping it avoids re-anchoring onto a stray per-subdir
+    project the daemon may have minted from an earlier bare ``--cwd`` run.
+    Deepest (longest ``rootPath``) match wins. Returns None on any error or
+    when ``cwd`` is not inside any registered project.
+    """
+    import os.path
+
+    registry = _paseo_home() / "projects" / "projects.json"
+    try:
+        with open(registry, "r", encoding="utf-8") as f:
+            projects = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(projects, list):
+        return None
+    try:
+        target = os.path.realpath(cwd)
+    except OSError:
+        return None
+    best_root: Optional[str] = None
+    best_len = -1
+    for proj in projects:
+        if not isinstance(proj, dict) or proj.get("archivedAt") is not None:
+            continue
+        root = proj.get("rootPath")
+        if not root:
+            continue
+        try:
+            real_root = os.path.realpath(str(root))
+        except OSError:
+            continue
+        if target == real_root:
+            continue  # exact match: already groups on its own; skip strays
+        prefix = real_root.rstrip(os.sep) + os.sep
+        if target.startswith(prefix) and len(real_root) > best_len:
+            best_root = str(root)
+            best_len = len(real_root)
+    return best_root
+
+
 def _create_directory_workspace(paseo_bin: str, workspace_path: str) -> Optional[str]:
     """Create a daemon workspace backed by ``workspace_path``; return its id.
 
@@ -352,30 +423,51 @@ def _create_directory_workspace(paseo_bin: str, workspace_path: str) -> Optional
 
 
 def _resolve_task_workspace_id(paseo_bin: str, task, workspace: str, log_f) -> Optional[str]:
-    """Resolve the Paseo workspace to run a repo-worktree task in.
+    """Resolve the Paseo workspace to group this task's agent under.
 
-    Only ``workspace_kind == "worktree"`` tasks get a registered workspace —
-    the daemon classifies their git-worktree path as a project-linked
-    worktree workspace, so the agent groups under the repo project in the
-    sidebar. Reusing an existing registration (by cwd) avoids the
-    one-new-workspace-per-run duplication of bare ``--cwd`` runs. Scratch /
-    dir tasks return None (plain ``--cwd``), as does ANY failure here — a
-    workspace-registration problem must never block the spawn.
+    Two grouping mechanisms, keyed on ``workspace_kind``:
+
+    * ``"worktree"`` — register a workspace at the git-worktree cwd itself. The
+      daemon classifies it as a project-linked worktree workspace (projectId =
+      main repo root), so the agent groups under the repo project.
+    * any other kind (``"dir"`` etc.) — group ONLY when the task's cwd lies
+      strictly inside a registered Paseo project. The daemon can't attach a
+      non-git *subdirectory* workspace to its parent project (a bare directory
+      workspace is keyed on its own path), so we register the grouping
+      workspace at the PROJECT ROOT and let ``paseo run --cwd <subdir>`` place
+      the agent in the subdir (an explicit ``--workspace`` keeps ``--cwd`` as
+      the run cwd). Tasks not inside any registered project return None.
+
+    Either way an existing non-archived registration for the resolved
+    registration path is reused (avoids the one-workspace-per-run duplication
+    of bare ``--cwd`` runs). Scratch tasks (not under a project) return None
+    (plain ``--cwd``), as does ANY failure here — a workspace-registration
+    problem must never block the spawn.
     """
     try:
-        if getattr(task, "workspace_kind", None) != "worktree":
-            return None
-        existing = _find_registered_workspace(workspace)
+        kind = getattr(task, "workspace_kind", None)
+        if kind == "worktree":
+            # The git-worktree path is itself the project-linked registration.
+            registration_path = workspace
+        else:
+            # Non-worktree (dir/…) task: anchor grouping at the registered
+            # project root that strictly contains the cwd; otherwise plain
+            # --cwd (scratch tasks and anything outside a project).
+            registration_path = _registered_project_root_for_cwd(workspace)
+            if not registration_path:
+                return None
+        existing = _find_registered_workspace(registration_path)
         if existing:
             log_f.write(
                 f"[paseo_spawn] using registered workspace {existing}\n".encode()
             )
             log_f.flush()
             return existing
-        created = _create_directory_workspace(paseo_bin, workspace)
+        created = _create_directory_workspace(paseo_bin, registration_path)
         if created:
             log_f.write(
-                f"[paseo_spawn] registered project workspace {created}\n".encode()
+                f"[paseo_spawn] registered project workspace {created} "
+                f"(anchored at {registration_path})\n".encode()
             )
             log_f.flush()
         return created
@@ -876,9 +968,10 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
             board_slug = env.get("HERMES_KANBAN_BOARD")
             if board_slug:
                 labels.append(("kanban_board", board_slug))
-            # Repo-worktree tasks run inside a registered, project-linked
-            # Paseo workspace so they group under the project in the sidebar;
-            # scratch/dir tasks (and any resolution failure) keep plain --cwd.
+            # Worktree tasks run inside a registered, project-linked Paseo
+            # workspace; dir tasks under a registered project group via a
+            # root-anchored workspace (+ --cwd subdir). Scratch tasks (and any
+            # resolution failure) keep plain --cwd.
             run_workspace_id = _resolve_task_workspace_id(
                 paseo_bin, task, workspace, log_f
             )

@@ -479,6 +479,16 @@ def _write_workspace_registry(tmp_path, monkeypatch, entries):
     return home
 
 
+def _write_project_registry(tmp_path, monkeypatch, entries):
+    home = tmp_path / ".paseo"
+    (home / "projects").mkdir(parents=True, exist_ok=True)
+    (home / "projects" / "projects.json").write_text(
+        json.dumps(entries), encoding="utf-8"
+    )
+    monkeypatch.setenv("PASEO_HOME", str(home))
+    return home
+
+
 def test_worktree_task_uses_registered_workspace(monkeypatch, tmp_path):
     """A worktree task with an existing registration → --workspace, no create."""
     _profile_home(tmp_path, monkeypatch)
@@ -561,12 +571,24 @@ def test_workspace_resolution_failure_falls_back_to_cwd(monkeypatch, tmp_path):
     assert pid == 9999  # spawn unaffected
 
 
-def test_scratch_task_keeps_plain_cwd(monkeypatch, tmp_path):
-    """Non-worktree tasks never touch workspace resolution."""
+def test_scratch_task_not_under_project_keeps_plain_cwd(monkeypatch, tmp_path):
+    """A non-worktree task outside any registered project → plain --cwd.
+
+    Its cwd isn't inside a registered project root, so grouping short-circuits
+    before any workspace registration lookup/create.
+    """
     _profile_home(tmp_path, monkeypatch)
     from hermes_cli import kanban_db as kb
     from hermes_cli import paseo_spawn
 
+    # A registered project that does NOT contain the scratch cwd.
+    (tmp_path / "elsewhere").mkdir()
+    _write_project_registry(
+        tmp_path,
+        monkeypatch,
+        [{"projectId": str(tmp_path / "elsewhere"), "rootPath": str(tmp_path / "elsewhere"),
+          "kind": "non_git", "archivedAt": None}],
+    )
     workspace = tmp_path / "scratch"
     workspace.mkdir()
     monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
@@ -575,14 +597,201 @@ def test_scratch_task_keeps_plain_cwd(monkeypatch, tmp_path):
         paseo_spawn, "_find_registered_workspace",
         lambda path: looked.append(path) or None,
     )
+    created = []
+    monkeypatch.setattr(
+        paseo_spawn, "_create_directory_workspace",
+        lambda *a, **k: created.append(a) or "wks_should_not_be_used",
+    )
     calls = _install_fake_paseo(monkeypatch)
 
     paseo_spawn.spawn_via_paseo(
         _make_task(kb, workspace_kind="scratch"), str(workspace), board=None
     )
 
+    run_cmd = calls["run"][0]
+    assert "--workspace" not in run_cmd
+    assert run_cmd[run_cmd.index("--cwd") + 1] == str(workspace)
+    assert looked == []  # resolution short-circuits: not inside a project
+    assert created == []
+
+
+def test_dir_task_under_project_groups_via_root_workspace(monkeypatch, tmp_path):
+    """A dir task inside a registered project → workspace anchored at the ROOT.
+
+    The grouping workspace is created for the PROJECT ROOT (so the daemon
+    attaches it to the existing project), while the agent still runs in the
+    subdirectory via --cwd.
+    """
+    _profile_home(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    project_root = tmp_path / "Apex-Experiments"
+    subdir = project_root / "shinie-ipl-main-image"
+    subdir.mkdir(parents=True)
+    _write_project_registry(
+        tmp_path,
+        monkeypatch,
+        [{"projectId": str(project_root), "rootPath": str(project_root),
+          "kind": "non_git", "archivedAt": None}],
+    )
+    _write_workspace_registry(tmp_path, monkeypatch, [])  # nothing registered yet
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    created_paths = []
+
+    def fake_create(bin_, path):
+        created_paths.append(path)
+        return "wks_root001"
+
+    monkeypatch.setattr(paseo_spawn, "_create_directory_workspace", fake_create)
+    calls = _install_fake_paseo(monkeypatch)
+
+    paseo_spawn.spawn_via_paseo(
+        _make_task(kb, workspace_kind="dir"), str(subdir), board=None
+    )
+
+    run_cmd = calls["run"][0]
+    # Grouping workspace is created for the project ROOT, not the subdir.
+    assert created_paths == [str(project_root)]
+    assert run_cmd[run_cmd.index("--workspace") + 1] == "wks_root001"
+    # ...but the agent still runs in the subdirectory.
+    assert run_cmd[run_cmd.index("--cwd") + 1] == str(subdir)
+
+
+def test_dir_task_reuses_existing_root_registration(monkeypatch, tmp_path):
+    """A second dir task under the same project reuses the root workspace."""
+    _profile_home(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    project_root = tmp_path / "Apex-Experiments"
+    subdir = project_root / "another-experiment"
+    subdir.mkdir(parents=True)
+    _write_project_registry(
+        tmp_path,
+        monkeypatch,
+        [{"projectId": str(project_root), "rootPath": str(project_root),
+          "kind": "non_git", "archivedAt": None}],
+    )
+    # An existing non-archived workspace registered AT THE ROOT.
+    _write_workspace_registry(
+        tmp_path,
+        monkeypatch,
+        [
+            {"workspaceId": "wks_archived", "cwd": str(project_root), "archivedAt": "2026-01-01"},
+            {"workspaceId": "wks_rootlive", "cwd": str(project_root), "archivedAt": None},
+        ],
+    )
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    created = []
+    monkeypatch.setattr(
+        paseo_spawn, "_create_directory_workspace",
+        lambda *a, **k: created.append(a) or "wks_should_not_be_used",
+    )
+    calls = _install_fake_paseo(monkeypatch)
+
+    paseo_spawn.spawn_via_paseo(
+        _make_task(kb, workspace_kind="dir"), str(subdir), board=None
+    )
+
+    run_cmd = calls["run"][0]
+    assert run_cmd[run_cmd.index("--workspace") + 1] == "wks_rootlive"
+    assert run_cmd[run_cmd.index("--cwd") + 1] == str(subdir)
+    assert created == []  # existing root registration reused
+
+
+def test_dir_task_resolution_failure_falls_back_to_cwd(monkeypatch, tmp_path):
+    """A dir task inside a project whose root workspace can't be created → --cwd."""
+    _profile_home(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    project_root = tmp_path / "Apex-Experiments"
+    subdir = project_root / "exp"
+    subdir.mkdir(parents=True)
+    _write_project_registry(
+        tmp_path,
+        monkeypatch,
+        [{"projectId": str(project_root), "rootPath": str(project_root),
+          "kind": "non_git", "archivedAt": None}],
+    )
+    _write_workspace_registry(tmp_path, monkeypatch, [])
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    monkeypatch.setattr(
+        paseo_spawn, "_create_directory_workspace", lambda bin_, path: None
+    )
+    calls = _install_fake_paseo(monkeypatch)
+
+    pid = paseo_spawn.spawn_via_paseo(
+        _make_task(kb, workspace_kind="dir"), str(subdir), board=None
+    )
+
+    run_cmd = calls["run"][0]
+    assert "--workspace" not in run_cmd
+    assert run_cmd[run_cmd.index("--cwd") + 1] == str(subdir)
+    assert pid == 9999
+
+
+def test_dir_task_at_project_root_is_not_reanchored(monkeypatch, tmp_path):
+    """cwd == a registered project root → not a strict subdir → plain --cwd.
+
+    The exact-match case already groups correctly on a bare run; re-anchoring
+    would risk latching onto a stray per-subdir project. Strict-ancestor only.
+    """
+    _profile_home(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    project_root = tmp_path / "Apex-Experiments"
+    project_root.mkdir()
+    _write_project_registry(
+        tmp_path,
+        monkeypatch,
+        [{"projectId": str(project_root), "rootPath": str(project_root),
+          "kind": "non_git", "archivedAt": None}],
+    )
+    _write_workspace_registry(tmp_path, monkeypatch, [])
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    created = []
+    monkeypatch.setattr(
+        paseo_spawn, "_create_directory_workspace",
+        lambda *a, **k: created.append(a) or "wks_x",
+    )
+    calls = _install_fake_paseo(monkeypatch)
+
+    paseo_spawn.spawn_via_paseo(
+        _make_task(kb, workspace_kind="dir"), str(project_root), board=None
+    )
+
     assert "--workspace" not in calls["run"][0]
-    assert looked == []  # resolution short-circuits on workspace_kind
+    assert created == []
+
+
+def test_registered_project_root_deepest_match_wins(tmp_path, monkeypatch):
+    """The deepest strict-ancestor project root is chosen; symlinks resolve."""
+    from hermes_cli import paseo_spawn
+
+    outer = tmp_path / "Projects"
+    inner = outer / "Apex-Experiments"
+    leaf = inner / "shinie" / "deep"
+    leaf.mkdir(parents=True)
+    _write_project_registry(
+        tmp_path,
+        monkeypatch,
+        [
+            {"projectId": str(outer), "rootPath": str(outer), "kind": "non_git", "archivedAt": None},
+            {"projectId": str(inner), "rootPath": str(inner), "kind": "non_git", "archivedAt": None},
+            {"projectId": str(tmp_path / "gone"), "rootPath": str(tmp_path / "gone"),
+             "kind": "non_git", "archivedAt": "2026-01-01"},  # archived: ignored
+        ],
+    )
+
+    # Deepest strict ancestor of the leaf is `inner`, not `outer`.
+    assert paseo_spawn._registered_project_root_for_cwd(str(leaf)) == str(inner)
+    # A path outside every project → None.
+    assert paseo_spawn._registered_project_root_for_cwd(str(tmp_path / "unrelated")) is None
+    # Exact match on a root → excluded (not a strict ancestor).
+    assert paseo_spawn._registered_project_root_for_cwd(str(inner)) == str(outer)
 
 
 def test_create_directory_workspace_invokes_daemon_client(monkeypatch, tmp_path):
