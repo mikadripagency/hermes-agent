@@ -72,13 +72,14 @@ def _install_fake_paseo(
     run_stdout=None,
     run_stderr="Created workspace ws_abc123 - repo (main)\n",
     run_rc: int = 0,
+    archive_rc: int = 0,
 ):
     """Patch subprocess.run/Popen to emulate the paseo CLI. Returns a recorder."""
     if run_stdout is None:
         run_stdout = json.dumps(
             {"agentId": "ag_1234567", "status": "running", "provider": "hermes", "cwd": "/ws"}
         )
-    calls: dict = {"run": [], "ls": [], "status": [], "popen": []}
+    calls: dict = {"run": [], "ls": [], "status": [], "archive": [], "popen": []}
 
     def fake_run(cmd, *args, **kwargs):
         sub = cmd[1] if len(cmd) > 1 else None
@@ -88,6 +89,9 @@ def _install_fake_paseo(
         if sub == "ls":
             calls["ls"].append(list(cmd))
             return _CompletedRun(returncode=0, stdout=json.dumps(ls_agents or []))
+        if sub == "archive":
+            calls["archive"].append(list(cmd))
+            return _CompletedRun(returncode=archive_rc, stderr="" if archive_rc == 0 else "archive failed")
         if sub == "run":
             calls["run"].append(list(cmd))
             return _CompletedRun(returncode=run_rc, stdout=run_stdout, stderr=run_stderr)
@@ -180,8 +184,8 @@ def test_daemon_down_falls_back_to_default_spawn(monkeypatch, tmp_path):
     assert pid == 9999
 
 
-def test_existing_agent_reattaches_without_second_run(monkeypatch, tmp_path):
-    """A live labeled agent → watcher only, no second `paseo run`."""
+def test_actively_working_agent_reattaches_without_second_run(monkeypatch, tmp_path):
+    """An ACTIVELY working labeled agent → watcher only: no archive, no new run."""
     _profile_home(tmp_path, monkeypatch)
     from hermes_cli import kanban_db as kb
     from hermes_cli import paseo_spawn
@@ -196,7 +200,8 @@ def test_existing_agent_reattaches_without_second_run(monkeypatch, tmp_path):
 
     pid = paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
 
-    assert calls["run"] == []  # double-spawn guard fired
+    assert calls["run"] == []  # no duplicate agent
+    assert calls["archive"] == []  # a working agent is never archived
     assert len(calls["popen"]) == 1
     watch_cmd = calls["popen"][0]
     assert "--watch" in watch_cmd
@@ -204,8 +209,14 @@ def test_existing_agent_reattaches_without_second_run(monkeypatch, tmp_path):
     assert pid == 9999
 
 
-def test_idle_agent_is_reattachable(monkeypatch, tmp_path):
-    """An idle (non-archived) agent still counts as re-attachable."""
+def test_idle_agent_archived_and_fresh_agent_spawned(monkeypatch, tmp_path):
+    """An idle labeled agent is a stale remnant: archive it, launch fresh.
+
+    A Paseo agent maps to a RUN. The idle agent's env carries the OLD run id /
+    claim lock (kanban tools would reject it; no heartbeats flow) — regression
+    guard for t_6811e170 runs 324/325 which re-attached to a finished agent and
+    timed out.
+    """
     _profile_home(tmp_path, monkeypatch)
     from hermes_cli import kanban_db as kb
     from hermes_cli import paseo_spawn
@@ -213,19 +224,31 @@ def test_idle_agent_is_reattachable(monkeypatch, tmp_path):
     monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
     calls = _install_fake_paseo(
         monkeypatch,
-        ls_agents=[{"id": "ag_idle", "status": "idle"}],
+        ls_agents=[{"id": "ag_stale", "status": "idle"}],
     )
     workspace = tmp_path / "ws"
     workspace.mkdir()
 
-    paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
-    assert calls["run"] == []
+    pid = paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
+
+    # Stale agent archived (no --force: it isn't running).
+    assert len(calls["archive"]) == 1
+    assert calls["archive"][0][:3] == ["paseo", "archive", "ag_stale"]
+    assert "--force" not in calls["archive"][0]
+    # Fresh agent created with the NEW run's env.
+    assert len(calls["run"]) == 1
+    run_cmd = calls["run"][0]
+    env_pairs = [run_cmd[i + 1] for i, a in enumerate(run_cmd) if a == "--env"]
+    assert "HERMES_KANBAN_RUN_ID=7" in env_pairs
+    assert "--label kanban_run=7" in " ".join(run_cmd)
+    # Watcher tracks the NEW agent.
     watch_cmd = calls["popen"][0]
-    assert watch_cmd[watch_cmd.index("--agent") + 1] == "ag_idle"
+    assert watch_cmd[watch_cmd.index("--agent") + 1] == "ag_1234567"
+    assert pid == 9999
 
 
-def test_errored_agent_not_reattached(monkeypatch, tmp_path):
-    """An errored agent is NOT re-attachable → a fresh agent is launched."""
+def test_errored_agent_archived_and_fresh_agent_spawned(monkeypatch, tmp_path):
+    """An errored agent is stale too → archived, fresh agent launched."""
     _profile_home(tmp_path, monkeypatch)
     from hermes_cli import kanban_db as kb
     from hermes_cli import paseo_spawn
@@ -239,7 +262,56 @@ def test_errored_agent_not_reattached(monkeypatch, tmp_path):
     workspace.mkdir()
 
     paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
-    assert len(calls["run"]) == 1  # errored agent ignored, new one created
+    assert len(calls["archive"]) == 1
+    assert calls["archive"][0][2] == "ag_dead"
+    assert len(calls["run"]) == 1  # fresh agent created
+
+
+def test_archive_failure_still_spawns_fresh_agent(monkeypatch, tmp_path):
+    """`paseo archive` failing must not block the fresh spawn."""
+    _profile_home(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    calls = _install_fake_paseo(
+        monkeypatch,
+        ls_agents=[{"id": "ag_stuck", "status": "idle"}],
+        archive_rc=1,
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    pid = paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
+
+    assert len(calls["archive"]) == 1  # attempted
+    assert len(calls["run"]) == 1  # fresh agent still launched
+    assert len(calls["popen"]) == 1  # watcher still spawned
+    assert pid == 9999
+
+
+def test_mixed_agents_prefers_active_over_stale(monkeypatch, tmp_path):
+    """With one idle and one running agent, re-attach to the running one."""
+    _profile_home(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    calls = _install_fake_paseo(
+        monkeypatch,
+        ls_agents=[
+            {"id": "ag_old_idle", "status": "idle"},
+            {"id": "ag_working", "status": "running"},
+        ],
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
+    assert calls["run"] == []
+    assert calls["archive"] == []  # active agent found → no archiving pass
+    watch_cmd = calls["popen"][0]
+    assert watch_cmd[watch_cmd.index("--agent") + 1] == "ag_working"
 
 
 def test_comment_failure_does_not_break_spawn(monkeypatch, tmp_path):

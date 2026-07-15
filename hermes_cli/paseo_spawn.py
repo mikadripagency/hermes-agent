@@ -76,12 +76,17 @@ from typing import Optional
 
 _log = logging.getLogger(__name__)
 
-# Agent statuses that mean "this agent is still ours to re-attach to" for the
-# double-spawn guard. ``paseo ls`` already excludes archived agents; among the
-# live ones, running/idle are the states a kanban worker legitimately sits in
-# (idle == between turns / just finished, still attached). Anything else (e.g.
-# ``error``) is treated as no usable agent so a fresh one is launched.
-_REATTACHABLE_STATUSES = {"running", "idle"}
+# Agent statuses that mean "this agent is ACTIVELY working" for the re-attach
+# guard. A Paseo agent maps to a RUN, not to the task's lifetime: an idle
+# labeled agent is a stale remnant of a finished run — its env carries the OLD
+# run id / claim lock, so the kanban tools would reject anything it did, and no
+# heartbeats flow (observed live: t_6811e170 runs 324/325 re-attached to an
+# idle agent and timed out). Only an agent still mid-run is worth re-attaching
+# to (the real recovery case: watcher died, agent still working). The CLI's
+# agent-status vocabulary is running/idle/error (see ls.js statusOrder);
+# busy/working are accepted defensively in case the daemon grows new active
+# states. Everything else (idle, error, unknown) is stale → archive + fresh.
+_ACTIVE_STATUSES = {"running", "busy", "working"}
 
 # stderr line emitted by ``paseo run`` announcing the workspace it used.
 _WORKSPACE_RE = re.compile(r"(?:Using|Created) workspace (\S+)")
@@ -129,12 +134,12 @@ def _paseo_healthy(paseo_bin: str) -> bool:
     return proc.returncode == 0
 
 
-def _find_reattachable_agent(paseo_bin: str, task_id: str) -> Optional[str]:
-    """Return the id of an existing non-archived agent for ``task_id``.
+def _list_task_agents(paseo_bin: str, task_id: str) -> list:
+    """Return non-archived agents labeled ``kanban_task=<task_id>``.
 
     Uses ``paseo ls -g --json --label kanban_task=<id>`` so the guard is global
     (finds the agent regardless of the dispatcher's cwd) and idempotent across
-    dispatcher recovery. Returns ``None`` on any error — a failed guard must not
+    dispatcher recovery. Returns ``[]`` on any error — a failed guard must not
     block the spawn (worst case: a redundant agent, never a stalled task).
     """
     try:
@@ -148,7 +153,7 @@ def _find_reattachable_agent(paseo_bin: str, task_id: str) -> Optional[str]:
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
         _log.warning("kanban paseo_spawn: `paseo ls` failed for task %s (%s)", task_id, exc)
-        return None
+        return []
     if proc.returncode != 0:
         _log.warning(
             "kanban paseo_spawn: `paseo ls` exited %s for task %s: %s",
@@ -156,20 +161,47 @@ def _find_reattachable_agent(paseo_bin: str, task_id: str) -> Optional[str]:
             task_id,
             (proc.stderr or "").strip()[:300],
         )
-        return None
+        return []
     try:
         agents = json.loads(proc.stdout or "[]")
     except json.JSONDecodeError as exc:
         _log.warning("kanban paseo_spawn: could not parse `paseo ls` JSON for task %s (%s)", task_id, exc)
-        return None
+        return []
     if not isinstance(agents, list):
-        return None
-    for agent in agents:
-        if not isinstance(agent, dict):
-            continue
-        if agent.get("status") in _REATTACHABLE_STATUSES and agent.get("id"):
-            return str(agent["id"])
-    return None
+        return []
+    return [a for a in agents if isinstance(a, dict) and a.get("id")]
+
+
+def _archive_agent(paseo_bin: str, agent_id: str, task_id: str) -> None:
+    """Best-effort ``paseo archive <id>`` of a stale agent. Never raises.
+
+    Only called for agents that are NOT actively working, so no ``--force``
+    (which would interrupt a live run). Failure is logged and the spawn
+    proceeds — a stray stale agent is cosmetic; a stalled task is not.
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603 - fixed argv
+            [paseo_bin, "archive", agent_id, "--json"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=_LS_TIMEOUT_SECONDS,
+            text=True,
+        )
+        if proc.returncode != 0:
+            _log.warning(
+                "kanban paseo_spawn: could not archive stale agent %s for task %s: %s",
+                agent_id,
+                task_id,
+                (proc.stderr or "").strip()[:300],
+            )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        _log.warning(
+            "kanban paseo_spawn: could not archive stale agent %s for task %s (%s)",
+            agent_id,
+            task_id,
+            exc,
+        )
 
 
 def _worker_env_delta(env: dict) -> dict:
@@ -572,22 +604,51 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
     kb._rotate_worker_log(log_path, rotate_bytes, backup_count)
     log_f = open(log_path, "ab")
     try:
-        # Double-spawn guard: if a live agent for this task already exists, do
-        # NOT create a second one — just re-attach a watcher. Makes dispatcher
-        # recovery (watcher PID died but agent still alive) idempotent.
-        existing = _find_reattachable_agent(paseo_bin, task.id)
-        if existing:
+        # Double-spawn guard, run-scoped: a Paseo agent maps to a RUN, not to
+        # the task's lifetime.
+        #
+        # * An agent that is still ACTIVELY working (status running/busy/
+        #   working) is the real recovery case — the watcher PID died but the
+        #   agent is mid-run with a still-valid env. Re-attach a watcher only;
+        #   never create a duplicate.
+        # * Idle / errored labeled agents are STALE remnants of finished runs:
+        #   their env carries the old HERMES_KANBAN_RUN_ID / CLAIM_LOCK, so
+        #   the kanban tools would reject them and no heartbeats would flow.
+        #   Archive them (best-effort) and create a FRESH agent with the new
+        #   run's env — keeping at most one non-archived agent per task.
+        agents = _list_task_agents(paseo_bin, task.id)
+        active = next(
+            (a for a in agents if a.get("status") in _ACTIVE_STATUSES),
+            None,
+        )
+        if active is not None:
+            agent_id = str(active["id"])
             _log.info(
-                "kanban paseo_spawn: re-attached to existing agent %s for task %s",
-                existing,
+                "kanban paseo_spawn: re-attached to actively working agent %s "
+                "for task %s",
+                agent_id,
                 task.id,
             )
             log_f.write(
-                f"[paseo_spawn] re-attached to existing agent {existing}\n".encode()
+                f"[paseo_spawn] re-attached to existing agent {agent_id}\n".encode()
             )
             log_f.flush()
-            agent_id = existing
         else:
+            for stale in agents:
+                stale_id = str(stale["id"])
+                _log.info(
+                    "kanban paseo_spawn: archiving stale agent %s "
+                    "(status=%s) for task %s before fresh spawn",
+                    stale_id,
+                    stale.get("status"),
+                    task.id,
+                )
+                log_f.write(
+                    f"[paseo_spawn] archiving stale agent {stale_id} "
+                    f"(status={stale.get('status')})\n".encode()
+                )
+                log_f.flush()
+                _archive_agent(paseo_bin, stale_id, task.id)
             labels: list[tuple[str, str]] = [("kanban_task", task.id)]
             if getattr(task, "current_run_id", None) is not None:
                 labels.append(("kanban_run", str(task.current_run_id)))
