@@ -155,6 +155,47 @@ def _expand_acp_enabled_toolsets(
     return expanded
 
 
+def _resolve_acp_max_iterations(config: Dict[str, Any] | None) -> int:
+    """Resolve the tool-calling iteration budget for an ACP-spawned agent.
+
+    Mirrors the CLI's ``max-turns`` precedence (see cli.py) minus the CLI-arg
+    tier, which does not exist on the ACP path:
+
+        config ``agent.max_turns`` → legacy root-level ``max_turns``
+        → ``HERMES_MAX_ITERATIONS`` env (int, validated) → hard default 90.
+
+    Without this the ACP adapter always built ``AIAgent`` at its 90-iteration
+    default and long kanban tasks died with "Iteration budget exhausted
+    (90/90)" no matter what ``agent.max_turns`` the user configured.
+    """
+    from hermes_cli.config import cfg_get
+
+    # Config tiers: explicit agent.max_turns, then legacy root-level max_turns
+    # (CLI backwards-compat). Truthy/positive int only — matches the CLI's
+    # ``if CLI_CONFIG["agent"].get("max_turns")`` truthiness guard while adding
+    # defensive int-coercion for YAML that stored the value as a string.
+    for value in (cfg_get(config, "agent", "max_turns"), cfg_get(config, "max_turns")):
+        if value is None:
+            continue
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+
+    env_value = os.getenv("HERMES_MAX_ITERATIONS")
+    if env_value:
+        try:
+            parsed = int(env_value)
+        except (TypeError, ValueError):
+            parsed = 0
+        if parsed > 0:
+            return parsed
+
+    return 90
+
+
 def _clear_task_cwd(task_id: str) -> None:
     """Remove task-specific cwd overrides for an ACP session."""
     if not task_id:
@@ -635,6 +676,7 @@ class SessionManager:
             "session_id": session_id,
             "session_db": self._get_db(),
             "model": model or default_model,
+            "max_iterations": _resolve_acp_max_iterations(config),
         }
 
         try:

@@ -763,3 +763,114 @@ class TestPersistence:
 
         assert stdout_buf.getvalue() == ""
         assert stderr_buf.getvalue() == "ACP noise\n"
+
+
+# ---------------------------------------------------------------------------
+# max_iterations resolution (agent.max_turns honored on the ACP path)
+# ---------------------------------------------------------------------------
+
+
+class TestAcpMaxIterations:
+    """`_make_agent` must honor agent.max_turns like the CLI, instead of
+    always defaulting AIAgent to 90 (root cause of "Iteration budget
+    exhausted (90/90)" on long ACP/kanban tasks)."""
+
+    def test_resolver_prefers_config_agent_max_turns(self, monkeypatch):
+        monkeypatch.delenv("HERMES_MAX_ITERATIONS", raising=False)
+        assert acp_session._resolve_acp_max_iterations(
+            {"agent": {"max_turns": 500}}
+        ) == 500
+
+    def test_resolver_honors_legacy_root_max_turns(self, monkeypatch):
+        monkeypatch.delenv("HERMES_MAX_ITERATIONS", raising=False)
+        assert acp_session._resolve_acp_max_iterations({"max_turns": 250}) == 250
+
+    def test_resolver_coerces_string_config_value(self, monkeypatch):
+        monkeypatch.delenv("HERMES_MAX_ITERATIONS", raising=False)
+        assert acp_session._resolve_acp_max_iterations(
+            {"agent": {"max_turns": "300"}}
+        ) == 300
+
+    def test_resolver_falls_back_to_env(self, monkeypatch):
+        monkeypatch.setenv("HERMES_MAX_ITERATIONS", "175")
+        assert acp_session._resolve_acp_max_iterations({"agent": {}}) == 175
+
+    def test_resolver_ignores_invalid_env_and_uses_default(self, monkeypatch):
+        monkeypatch.setenv("HERMES_MAX_ITERATIONS", "not-a-number")
+        assert acp_session._resolve_acp_max_iterations({}) == 90
+
+    def test_resolver_default_when_unset(self, monkeypatch):
+        monkeypatch.delenv("HERMES_MAX_ITERATIONS", raising=False)
+        assert acp_session._resolve_acp_max_iterations({}) == 90
+        assert acp_session._resolve_acp_max_iterations(None) == 90
+
+    def test_config_agent_max_turns_wins_over_env(self, monkeypatch):
+        monkeypatch.setenv("HERMES_MAX_ITERATIONS", "42")
+        assert acp_session._resolve_acp_max_iterations(
+            {"agent": {"max_turns": 500}}
+        ) == 500
+
+    def test_make_agent_passes_configured_max_iterations(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HERMES_MAX_ITERATIONS", raising=False)
+        captured = {}
+
+        def fake_agent(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(model=kwargs.get("model"))
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "model": {"provider": "openrouter", "default": "test-model"},
+                "mcp_servers": {},
+                "agent": {"max_turns": 500},
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None, **kw: {
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+                "base_url": "https://openrouter.example/v1",
+                "api_key": "***",
+                "command": None,
+                "args": [],
+            },
+        )
+        db = SessionDB(tmp_path / "state.db")
+        with patch("run_agent.AIAgent", side_effect=fake_agent):
+            SessionManager(db=db).create_session(cwd="/work")
+
+        assert captured["max_iterations"] == 500
+
+    def test_make_agent_defaults_to_90(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HERMES_MAX_ITERATIONS", raising=False)
+        captured = {}
+
+        def fake_agent(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(model=kwargs.get("model"))
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "model": {"provider": "openrouter", "default": "test-model"},
+                "mcp_servers": {},
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None, **kw: {
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+                "base_url": "https://openrouter.example/v1",
+                "api_key": "***",
+                "command": None,
+                "args": [],
+            },
+        )
+        db = SessionDB(tmp_path / "state.db")
+        with patch("run_agent.AIAgent", side_effect=fake_agent):
+            SessionManager(db=db).create_session(cwd="/work")
+
+        assert captured["max_iterations"] == 90
