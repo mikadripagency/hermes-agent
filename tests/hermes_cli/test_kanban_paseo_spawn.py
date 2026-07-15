@@ -127,6 +127,9 @@ def test_enabled_healthy_launches_agent_with_contract(monkeypatch, tmp_path):
     assert run_cmd[:4] == ["paseo", "run", "-d", "--json"]
     assert "--provider" in run_cmd and run_cmd[run_cmd.index("--provider") + 1] == "hermes"
     assert "--cwd" in run_cmd and run_cmd[run_cmd.index("--cwd") + 1] == str(workspace)
+    # Workers must never pause on permission prompts: default ACP mode is
+    # dont_ask (valid hermes ACP mode ids: default / accept_edits / dont_ask).
+    assert "--mode" in run_cmd and run_cmd[run_cmd.index("--mode") + 1] == "dont_ask"
     # Title carries id + truncated title (<=60 chars, ellipsised).
     title = run_cmd[run_cmd.index("--title") + 1]
     assert title.startswith("t_paseo · ")
@@ -288,6 +291,45 @@ def test_archive_failure_still_spawns_fresh_agent(monkeypatch, tmp_path):
     assert len(calls["run"]) == 1  # fresh agent still launched
     assert len(calls["popen"]) == 1  # watcher still spawned
     assert pid == 9999
+
+
+def test_mode_omitted_when_configured_empty(monkeypatch, tmp_path):
+    """kanban.paseo_spawn.mode: '' → no --mode flag (provider default)."""
+    _profile_home(
+        tmp_path,
+        monkeypatch,
+        paseo_cfg="kanban:\n  paseo_spawn:\n    mode: ''\n",
+    )
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    calls = _install_fake_paseo(monkeypatch)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
+    assert "--mode" not in calls["run"][0]
+
+
+def test_mode_override_from_config(monkeypatch, tmp_path):
+    """A custom kanban.paseo_spawn.mode value is passed through."""
+    _profile_home(
+        tmp_path,
+        monkeypatch,
+        paseo_cfg="kanban:\n  paseo_spawn:\n    mode: accept_edits\n",
+    )
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    calls = _install_fake_paseo(monkeypatch)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
+    run_cmd = calls["run"][0]
+    assert run_cmd[run_cmd.index("--mode") + 1] == "accept_edits"
 
 
 def test_mixed_agents_prefers_active_over_stale(monkeypatch, tmp_path):

@@ -39,6 +39,12 @@ Config keys (under ``kanban.paseo_spawn`` in the profile ``config.yaml``):
 * ``enabled`` (bool, default ``False``) — gate. When false the dispatcher never
   reaches this module.
 * ``provider`` (str, default ``"hermes"``) — Paseo provider to run under.
+* ``mode`` (str, default ``"dont_ask"``) — ACP session mode passed as
+  ``paseo run --mode``. Workers must never pause on permission prompts; the
+  hermes ACP adapter's valid mode ids are ``default`` / ``accept_edits`` /
+  ``dont_ask`` (see ``acp_adapter/server.py`` — ``dont_ask`` maps the edit
+  approval policy to ``session``, i.e. auto-allow). Set to an empty string /
+  null to omit the flag and use the provider default.
 * ``paseo_bin`` (str, default ``"paseo"``) — path/name of the paseo CLI.
 * ``wait_timeout_slack_seconds`` (int, default ``300``) — added to the task's
   ``max_runtime_seconds`` to size the watch loop's deadline.
@@ -225,6 +231,7 @@ def _launch_agent(
     env: dict,
     labels: list[tuple[str, str]],
     log_f,
+    mode: Optional[str] = None,
 ) -> tuple[str, Optional[str]]:
     """Run ``paseo run -d`` and return ``(agentId, workspaceId | None)``.
 
@@ -246,6 +253,11 @@ def _launch_agent(
         "--title",
         title,
     ]
+    if mode:
+        # ACP session mode: `dont_ask` keeps dispatcher-spawned workers from
+        # ever pausing on a permission prompt (matches manually-created
+        # Paseo agents, which run with modeId "dont_ask").
+        cmd.extend(["--mode", mode])
     for key, value in labels:
         cmd.extend(["--label", f"{key}={value}"])
     for key, value in _worker_env_delta(env).items():
@@ -579,6 +591,10 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
     cfg = _paseo_spawn_config()
     paseo_bin = cfg.get("paseo_bin") or "paseo"
     provider = cfg.get("provider") or "hermes"
+    # ACP session mode (default dont_ask so workers never pause on permission
+    # prompts). An explicit empty string / null omits --mode entirely.
+    mode = cfg.get("mode", "dont_ask")
+    mode = str(mode).strip() if mode is not None else ""
     slack = kb._positive_int(cfg.get("wait_timeout_slack_seconds"), 300, minimum=0)
 
     # Health check — automatic fallback on any daemon trouble.
@@ -656,7 +672,8 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
             if board_slug:
                 labels.append(("kanban_board", board_slug))
             agent_id, workspace_id = _launch_agent(
-                paseo_bin, provider, workspace, task, env, labels, log_f
+                paseo_bin, provider, workspace, task, env, labels, log_f,
+                mode=mode or None,
             )
             _record_linkage_comment(task, agent_id, workspace_id, profile_arg, board)
 
