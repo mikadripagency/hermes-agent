@@ -3090,6 +3090,16 @@ DEFAULT_CONFIG = {
         # upstream installer is not appropriate for the machine, for example
         # on non-admin accounts where `/Applications` is not writable.
         "refresh_cua_driver": True,
+        # Pin the update to the currently checked-out branch. When True and
+        # the checkout is on a branch OTHER than the update target (normally
+        # ``main``), ``hermes update`` refuses to switch branches: it updates
+        # the current branch against its OWN configured upstream instead, or
+        # aborts if that branch has no upstream. This protects deployment /
+        # fork branches (e.g. ``deploy`` tracking ``fork/deploy``) whose local
+        # fixes a switch-to-main-and-pull would silently destroy. Off by
+        # default to preserve the historical "always update against main"
+        # behavior for ordinary installs.
+        "pin_branch": False,
     },
 
     # Language Server Protocol — semantic diagnostics from real

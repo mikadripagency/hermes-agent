@@ -8398,6 +8398,84 @@ def _resolve_update_branch(args) -> str:
     return (getattr(args, "branch", None) or "main").strip() or "main"
 
 
+def _update_branch_is_pinned() -> bool:
+    """True when ``updates.pin_branch`` is enabled.
+
+    When set, ``hermes update`` must never switch a deployment/fork checkout
+    to the default update branch — see ``_resolve_update_remote``.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly, cfg_get
+
+        return bool(cfg_get(load_config_readonly(), "updates", "pin_branch", default=False))
+    except Exception:
+        return False
+
+
+def _branch_upstream(git_cmd, root, branch):
+    """Resolve ``branch``'s configured upstream tracking ref.
+
+    Returns ``(remote, remote_branch, tracking_ref)`` — e.g. a local
+    ``deploy`` tracking ``fork/deploy`` yields ``("fork", "deploy",
+    "fork/deploy")``. Returns ``None`` when the branch has no upstream.
+    """
+    tracking = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", "--symbolic-full-name", f"{branch}@{{upstream}}"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    if tracking.returncode != 0:
+        return None
+    ref = tracking.stdout.strip()
+    if not ref:
+        return None
+    remote = subprocess.run(
+        git_cmd + ["config", "--get", f"branch.{branch}.remote"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if not remote:
+        return None
+    prefix = f"{remote}/"
+    remote_branch = ref[len(prefix):] if ref.startswith(prefix) else ref
+    return (remote, remote_branch, ref)
+
+
+class _PinnedBranchError(RuntimeError):
+    """Raised when ``updates.pin_branch`` forbids switching away from a
+    pinned branch that has no upstream to update against."""
+
+    def __init__(self, current_branch: str, target_branch: str):
+        self.current_branch = current_branch
+        self.target_branch = target_branch
+        super().__init__(
+            f"pinned branch — refusing to switch to {target_branch}; update manually"
+        )
+
+
+def _resolve_update_remote(git_cmd, root, target_branch, current_branch, *, pinned):
+    """Decide which remote/branch ``hermes update`` pulls from.
+
+    Returns ``(remote, remote_branch, tracking_ref)``.
+
+    Default behavior (pinning off, detached HEAD, or already on the target
+    branch): ``("origin", target_branch, "origin/<target_branch>")`` — the
+    caller may still switch branches to reach the target, exactly as before.
+
+    Pinned + on a different branch: never switch. Resolve the current
+    branch's own configured upstream and pull that instead. Raises
+    ``_PinnedBranchError`` when the pinned branch has no upstream.
+    """
+    if pinned and current_branch and current_branch not in ("HEAD", target_branch):
+        upstream = _branch_upstream(git_cmd, root, current_branch)
+        if not upstream:
+            raise _PinnedBranchError(current_branch, target_branch)
+        return upstream
+    return ("origin", target_branch, f"origin/{target_branch}")
+
+
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     """Implement ``hermes update --check``: fetch and report without installing.
 
@@ -9570,9 +9648,38 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # against.
         branch = _resolve_update_branch(args)
 
+        # Pinned-branch guard (updates.pin_branch). Resolve which remote/branch
+        # we update against BEFORE fetching, so a deployment/fork checkout is
+        # never switched to `main`: switching + pulling silently destroys the
+        # local fixes such a branch carries. Read the current branch up front
+        # (offline, cheap) to make the decision. Default behavior is unchanged:
+        # remote=origin, remote_branch=branch, upstream_ref=origin/<branch>.
+        update_target = branch
+        current_branch = subprocess.run(
+            git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        try:
+            remote, remote_branch, upstream_ref = _resolve_update_remote(
+                git_cmd,
+                PROJECT_ROOT,
+                update_target,
+                current_branch,
+                pinned=_update_branch_is_pinned(),
+            )
+        except _PinnedBranchError as exc:
+            print(f"✗ {exc}")
+            sys.exit(1)
+        # When pinned to a non-target branch, update THAT branch (against its
+        # own upstream) rather than the default target. Setting `branch` to the
+        # pinned branch makes the "switch to branch" logic below a no-op.
+        branch = remote_branch
+
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
+            git_cmd + ["fetch", remote, remote_branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -9589,7 +9696,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "✗ Authentication failed — check your git credentials or SSH key."
                 )
             else:
-                print("✗ Failed to fetch updates from origin.")
+                print(f"✗ Failed to fetch updates from {remote}.")
                 if stderr:
                     print(f"  {stderr.splitlines()[0]}")
             sys.exit(1)
@@ -9661,7 +9768,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # Check if there are updates
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{upstream_ref}", "--count"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -9776,7 +9883,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         pre_pull_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
         try:
             pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
+                git_cmd + ["pull", "--ff-only", remote, remote_branch],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
@@ -9789,17 +9896,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                 )
                 reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                    git_cmd + ["reset", "--hard", upstream_ref],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
                 )
                 if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
+                    print(f"✗ Failed to reset to {upstream_ref}.")
                     if reset_result.stderr.strip():
                         print(f"  {reset_result.stderr.strip()}")
                     print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        f"  Try manually: git fetch {remote} && git reset --hard {upstream_ref}"
                     )
                     sys.exit(1)
 
