@@ -17,7 +17,7 @@ import json
 import subprocess
 
 
-def _make_task(kb, *, assignee: str = "w", task_id: str = "t_paseo"):
+def _make_task(kb, *, assignee: str = "w", task_id: str = "t_paseo", workspace_kind: str = "dir"):
     return kb.Task(
         id=task_id,
         title="Implement the widget with a rather long title that exceeds sixty characters for truncation",
@@ -29,7 +29,7 @@ def _make_task(kb, *, assignee: str = "w", task_id: str = "t_paseo"):
         created_at=1,
         started_at=None,
         completed_at=None,
-        workspace_kind="dir",
+        workspace_kind=workspace_kind,
         workspace_path=None,
         claim_lock="lock",
         claim_expires=None,
@@ -414,6 +414,197 @@ def test_run_failure_raises(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError):
         paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
+
+
+# ---------------------------------------------------------------------------
+# Project-linked workspace resolution (repo-worktree tasks)
+# ---------------------------------------------------------------------------
+
+
+def _write_workspace_registry(tmp_path, monkeypatch, entries):
+    home = tmp_path / ".paseo"
+    (home / "projects").mkdir(parents=True, exist_ok=True)
+    (home / "projects" / "workspaces.json").write_text(
+        json.dumps(entries), encoding="utf-8"
+    )
+    monkeypatch.setenv("PASEO_HOME", str(home))
+    return home
+
+
+def test_worktree_task_uses_registered_workspace(monkeypatch, tmp_path):
+    """A worktree task with an existing registration → --workspace, no create."""
+    _profile_home(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    workspace = tmp_path / "wt"
+    workspace.mkdir()
+    _write_workspace_registry(
+        tmp_path,
+        monkeypatch,
+        [
+            {"workspaceId": "wks_archived", "cwd": str(workspace), "archivedAt": "2026-01-01"},
+            {"workspaceId": "wks_live0001", "cwd": str(workspace), "archivedAt": None},
+        ],
+    )
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    created = []
+    monkeypatch.setattr(
+        paseo_spawn, "_create_directory_workspace",
+        lambda *a, **k: created.append(a) or "wks_should_not_be_used",
+    )
+    calls = _install_fake_paseo(monkeypatch)
+
+    paseo_spawn.spawn_via_paseo(
+        _make_task(kb, workspace_kind="worktree"), str(workspace), board=None
+    )
+
+    run_cmd = calls["run"][0]
+    assert run_cmd[run_cmd.index("--workspace") + 1] == "wks_live0001"
+    assert "--cwd" in run_cmd  # cwd is still pinned
+    assert created == []  # existing registration reused, nothing created
+
+
+def test_worktree_task_creates_workspace_when_unregistered(monkeypatch, tmp_path):
+    """No registration → daemon workspace created, its id passed as --workspace."""
+    _profile_home(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    workspace = tmp_path / "wt"
+    workspace.mkdir()
+    _write_workspace_registry(tmp_path, monkeypatch, [])
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    monkeypatch.setattr(
+        paseo_spawn, "_create_directory_workspace", lambda bin_, path: "wks_fresh001"
+    )
+    calls = _install_fake_paseo(monkeypatch)
+
+    paseo_spawn.spawn_via_paseo(
+        _make_task(kb, workspace_kind="worktree"), str(workspace), board=None
+    )
+
+    run_cmd = calls["run"][0]
+    assert run_cmd[run_cmd.index("--workspace") + 1] == "wks_fresh001"
+
+
+def test_workspace_resolution_failure_falls_back_to_cwd(monkeypatch, tmp_path):
+    """Workspace create failing → plain --cwd run, spawn proceeds."""
+    _profile_home(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    workspace = tmp_path / "wt"
+    workspace.mkdir()
+    _write_workspace_registry(tmp_path, monkeypatch, [])
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    monkeypatch.setattr(
+        paseo_spawn, "_create_directory_workspace", lambda bin_, path: None
+    )
+    calls = _install_fake_paseo(monkeypatch)
+
+    pid = paseo_spawn.spawn_via_paseo(
+        _make_task(kb, workspace_kind="worktree"), str(workspace), board=None
+    )
+
+    run_cmd = calls["run"][0]
+    assert "--workspace" not in run_cmd
+    assert run_cmd[run_cmd.index("--cwd") + 1] == str(workspace)
+    assert pid == 9999  # spawn unaffected
+
+
+def test_scratch_task_keeps_plain_cwd(monkeypatch, tmp_path):
+    """Non-worktree tasks never touch workspace resolution."""
+    _profile_home(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    workspace = tmp_path / "scratch"
+    workspace.mkdir()
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    looked = []
+    monkeypatch.setattr(
+        paseo_spawn, "_find_registered_workspace",
+        lambda path: looked.append(path) or None,
+    )
+    calls = _install_fake_paseo(monkeypatch)
+
+    paseo_spawn.spawn_via_paseo(
+        _make_task(kb, workspace_kind="scratch"), str(workspace), board=None
+    )
+
+    assert "--workspace" not in calls["run"][0]
+    assert looked == []  # resolution short-circuits on workspace_kind
+
+
+def test_create_directory_workspace_invokes_daemon_client(monkeypatch, tmp_path):
+    """_create_directory_workspace shells node with the client.js URI and parses the id."""
+    from hermes_cli import paseo_spawn
+
+    client_js = tmp_path / "dist" / "utils" / "client.js"
+    client_js.parent.mkdir(parents=True)
+    client_js.write_text("// stub", encoding="utf-8")
+    monkeypatch.setattr(paseo_spawn, "_paseo_client_js", lambda bin_: client_js)
+    import shutil as _shutil
+
+    monkeypatch.setattr(_shutil, "which", lambda name: "/usr/bin/node" if name == "node" else None)
+
+    captured = {}
+
+    def fake_run(cmd, *a, **k):
+        captured["cmd"] = list(cmd)
+        return _CompletedRun(returncode=0, stdout='{"workspaceId": "wks_new42"}\n')
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    ws = paseo_spawn._create_directory_workspace("paseo", "/some/worktree")
+
+    assert ws == "wks_new42"
+    cmd = captured["cmd"]
+    assert cmd[0] == "/usr/bin/node"
+    assert "--input-type=module" in cmd
+    assert cmd[-2] == client_js.as_uri()
+    assert cmd[-1] == "/some/worktree"
+
+
+def test_create_directory_workspace_failure_returns_none(monkeypatch, tmp_path):
+    """Daemon errors and missing prerequisites both yield None (no raise)."""
+    from hermes_cli import paseo_spawn
+
+    # Missing client.js → None without shelling out.
+    monkeypatch.setattr(paseo_spawn, "_paseo_client_js", lambda bin_: None)
+    assert paseo_spawn._create_directory_workspace("paseo", "/x") is None
+
+    # Daemon error (nonzero rc) → None.
+    client_js = tmp_path / "client.js"
+    client_js.write_text("// stub", encoding="utf-8")
+    monkeypatch.setattr(paseo_spawn, "_paseo_client_js", lambda bin_: client_js)
+    import shutil as _shutil
+
+    monkeypatch.setattr(_shutil, "which", lambda name: "/usr/bin/node")
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **k: _CompletedRun(returncode=1, stderr="daemon down"),
+    )
+    assert paseo_spawn._create_directory_workspace("paseo", "/x") is None
+
+
+def test_find_registered_workspace_matches_realpath(tmp_path, monkeypatch):
+    """Registry lookup resolves symlinks and skips archived entries."""
+    from hermes_cli import paseo_spawn
+
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real_dir)
+    _write_workspace_registry(
+        tmp_path,
+        monkeypatch,
+        [{"workspaceId": "wks_sym", "cwd": str(link), "archivedAt": None}],
+    )
+
+    assert paseo_spawn._find_registered_workspace(str(real_dir)) == "wks_sym"
+    assert paseo_spawn._find_registered_workspace(str(tmp_path / "other")) is None
 
 
 # ---------------------------------------------------------------------------

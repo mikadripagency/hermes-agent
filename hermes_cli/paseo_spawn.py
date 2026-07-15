@@ -62,6 +62,14 @@ CLI facts this module relies on (paseo v0.1.107, verified against the bundled
   <id>") — there is no ``workspaceId`` in the JSON, so it is parsed best-effort.
 * ``paseo ls -g --json --label k=v`` filters non-archived agents by label and
   emits a JSON array of ``{id, shortId, name, provider, status, cwd, ...}``.
+* Repo-worktree tasks (``workspace_kind == "worktree"``) run inside a
+  registered Paseo workspace (``paseo run --workspace <id>``): the daemon
+  classifies the git-worktree path as a project-linked worktree workspace
+  (kind ``worktree``, projectId = the main repo root), so the agent groups
+  under its project in the sidebar instead of minting a stray per-run
+  "directory" workspace. An existing non-archived registration for the same
+  cwd is reused (bare ``--cwd`` runs never dedupe). Scratch/dir tasks — and
+  ANY failure in workspace resolution — fall back to plain ``--cwd``.
 * ``paseo inspect <id> --json`` emits a single JSON object with capitalized
   keys (``Id``/``Status``/``Archived``/``ArchivedAt``/…). A missing agent or an
   unreachable daemon exits rc 1 with an ``{"error": …}`` payload on stderr.
@@ -210,6 +218,176 @@ def _archive_agent(paseo_bin: str, agent_id: str, task_id: str) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Project-linked workspace resolution (repo-worktree tasks)
+# ---------------------------------------------------------------------------
+
+_WORKSPACE_CREATE_TIMEOUT_SECONDS = 30
+
+# node -e script that asks the daemon to create a workspace backed by an
+# existing directory. The daemon classifies the path itself: a git worktree
+# registers as kind "worktree" with projectId = the main repo root (see the
+# daemon's createLocalCheckoutWorkspace / classifyDirectoryForProjectMembership)
+# — i.e. exactly the project-linked sidebar grouping we want. argv[1] = the
+# client.js file URI is imported dynamically; argv[2] = the directory path.
+_CREATE_WORKSPACE_SCRIPT = (
+    "const {connectToDaemon} = await import(process.argv[1]);"
+    "const c = await connectToDaemon({});"
+    "try {"
+    "  const r = await c.createWorkspace({source:{kind:'directory', path: process.argv[2]}});"
+    "  if (!r.workspace) throw new Error(r.error ?? 'workspace create failed');"
+    "  console.log(JSON.stringify({workspaceId: r.workspace.workspaceId ?? r.workspace.id ?? null}));"
+    "} finally { await c.close().catch(() => {}); }"
+)
+
+
+def _paseo_home() -> "os.PathLike":
+    from pathlib import Path
+
+    return Path(os.environ.get("PASEO_HOME") or (Path.home() / ".paseo"))
+
+
+def _paseo_client_js(paseo_bin: str):
+    """Locate the paseo CLI's daemon-client module next to the resolved bin.
+
+    The installed layout is ``<prefix>/lib/node_modules/@getpaseo/cli/bin/paseo``
+    with the client at ``../dist/utils/client.js``. Returns None when it can't
+    be found (→ caller falls back to plain ``--cwd``).
+    """
+    import shutil
+    from pathlib import Path
+
+    resolved = shutil.which(paseo_bin) or paseo_bin
+    try:
+        real = Path(resolved).resolve()
+    except OSError:
+        return None
+    candidate = real.parent.parent / "dist" / "utils" / "client.js"
+    return candidate if candidate.is_file() else None
+
+
+def _find_registered_workspace(workspace_path: str) -> Optional[str]:
+    """Return the id of a non-archived Paseo workspace whose cwd is the path.
+
+    Reads the daemon's workspace registry file directly (same convention as
+    the manual launcher) — cheap, read-only, and race-tolerant: a miss just
+    means we create one. Returns None on any error.
+    """
+    import os.path
+
+    registry = _paseo_home() / "projects" / "workspaces.json"
+    try:
+        with open(registry, "r", encoding="utf-8") as f:
+            entries = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(entries, list):
+        return None
+    target = os.path.realpath(workspace_path)
+    for item in entries:
+        if not isinstance(item, dict) or item.get("archivedAt") is not None:
+            continue
+        cwd = item.get("cwd")
+        if cwd and os.path.realpath(str(cwd)) == target and item.get("workspaceId"):
+            return str(item["workspaceId"])
+    return None
+
+
+def _create_directory_workspace(paseo_bin: str, workspace_path: str) -> Optional[str]:
+    """Create a daemon workspace backed by ``workspace_path``; return its id.
+
+    Returns None on any failure (missing node, missing client.js, daemon
+    error, unparsable output) — the caller falls back to plain ``--cwd``.
+    """
+    import shutil
+
+    client_js = _paseo_client_js(paseo_bin)
+    node = shutil.which("node")
+    if client_js is None or node is None:
+        _log.warning(
+            "kanban paseo_spawn: cannot create project workspace "
+            "(client.js=%s node=%s) — falling back to --cwd",
+            client_js,
+            node,
+        )
+        return None
+    try:
+        proc = subprocess.run(  # noqa: S603 - fixed argv
+            [
+                node,
+                "--input-type=module",
+                "-e",
+                _CREATE_WORKSPACE_SCRIPT,
+                client_js.as_uri(),
+                workspace_path,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=_WORKSPACE_CREATE_TIMEOUT_SECONDS,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        _log.warning("kanban paseo_spawn: workspace create failed for %s (%s)", workspace_path, exc)
+        return None
+    if proc.returncode != 0:
+        _log.warning(
+            "kanban paseo_spawn: workspace create exited %s for %s: %s",
+            proc.returncode,
+            workspace_path,
+            (proc.stderr or "").strip()[:300],
+        )
+        return None
+    try:
+        data = json.loads((proc.stdout or "").strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError) as exc:
+        _log.warning(
+            "kanban paseo_spawn: unparsable workspace create output for %s (%s)",
+            workspace_path,
+            exc,
+        )
+        return None
+    ws_id = data.get("workspaceId") if isinstance(data, dict) else None
+    return str(ws_id) if ws_id else None
+
+
+def _resolve_task_workspace_id(paseo_bin: str, task, workspace: str, log_f) -> Optional[str]:
+    """Resolve the Paseo workspace to run a repo-worktree task in.
+
+    Only ``workspace_kind == "worktree"`` tasks get a registered workspace —
+    the daemon classifies their git-worktree path as a project-linked
+    worktree workspace, so the agent groups under the repo project in the
+    sidebar. Reusing an existing registration (by cwd) avoids the
+    one-new-workspace-per-run duplication of bare ``--cwd`` runs. Scratch /
+    dir tasks return None (plain ``--cwd``), as does ANY failure here — a
+    workspace-registration problem must never block the spawn.
+    """
+    try:
+        if getattr(task, "workspace_kind", None) != "worktree":
+            return None
+        existing = _find_registered_workspace(workspace)
+        if existing:
+            log_f.write(
+                f"[paseo_spawn] using registered workspace {existing}\n".encode()
+            )
+            log_f.flush()
+            return existing
+        created = _create_directory_workspace(paseo_bin, workspace)
+        if created:
+            log_f.write(
+                f"[paseo_spawn] registered project workspace {created}\n".encode()
+            )
+            log_f.flush()
+        return created
+    except Exception as exc:  # absolute fallback: never block the spawn
+        _log.warning(
+            "kanban paseo_spawn: workspace resolution failed for task %s (%s) — using --cwd",
+            getattr(task, "id", "?"),
+            exc,
+        )
+        return None
+
+
 def _worker_env_delta(env: dict) -> dict:
     """Vars ``_build_worker_env`` added/changed vs the ambient environment.
 
@@ -232,11 +410,16 @@ def _launch_agent(
     labels: list[tuple[str, str]],
     log_f,
     mode: Optional[str] = None,
+    workspace_id: Optional[str] = None,
 ) -> tuple[str, Optional[str]]:
     """Run ``paseo run -d`` and return ``(agentId, workspaceId | None)``.
 
-    Raises on failure (the dispatcher records it as a spawn failure, same as
-    ``_default_spawn`` raising).
+    ``workspace_id``, when set, runs the agent inside that existing Paseo
+    workspace (``--workspace``) so repo-worktree tasks group under their
+    project in the sidebar; ``--cwd`` is always passed as well (with an
+    explicit workspace, ``paseo run`` uses the ``--cwd`` value as the run
+    cwd). Raises on failure (the dispatcher records it as a spawn failure,
+    same as ``_default_spawn`` raising).
     """
     prompt = f"work kanban task {task.id}"
     title = f"{task.id} · {_truncate_title(getattr(task, 'title', None))}".strip(" ·")
@@ -253,6 +436,8 @@ def _launch_agent(
         "--title",
         title,
     ]
+    if workspace_id:
+        cmd.extend(["--workspace", workspace_id])
     if mode:
         # ACP session mode: `dont_ask` keeps dispatcher-spawned workers from
         # ever pausing on a permission prompt (matches manually-created
@@ -290,16 +475,17 @@ def _launch_agent(
     if not agent_id:
         raise RuntimeError(f"`paseo run` returned no agentId for task {task.id}: {data!r}")
 
-    workspace_id = None
-    match = _WORKSPACE_RE.search(stderr)
-    if match:
-        workspace_id = match.group(1)
+    resolved_workspace_id = workspace_id  # explicit --workspace wins
+    if not resolved_workspace_id:
+        match = _WORKSPACE_RE.search(stderr)
+        if match:
+            resolved_workspace_id = match.group(1)
 
     log_f.write(
-        f"[paseo_spawn] agent={agent_id} workspace={workspace_id or '?'}\n".encode()
+        f"[paseo_spawn] agent={agent_id} workspace={resolved_workspace_id or '?'}\n".encode()
     )
     log_f.flush()
-    return str(agent_id), workspace_id
+    return str(agent_id), resolved_workspace_id
 
 
 def _record_linkage_comment(
@@ -671,9 +857,16 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
             board_slug = env.get("HERMES_KANBAN_BOARD")
             if board_slug:
                 labels.append(("kanban_board", board_slug))
+            # Repo-worktree tasks run inside a registered, project-linked
+            # Paseo workspace so they group under the project in the sidebar;
+            # scratch/dir tasks (and any resolution failure) keep plain --cwd.
+            run_workspace_id = _resolve_task_workspace_id(
+                paseo_bin, task, workspace, log_f
+            )
             agent_id, workspace_id = _launch_agent(
                 paseo_bin, provider, workspace, task, env, labels, log_f,
                 mode=mode or None,
+                workspace_id=run_workspace_id,
             )
             _record_linkage_comment(task, agent_id, workspace_id, profile_arg, board)
 
