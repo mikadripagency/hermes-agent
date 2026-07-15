@@ -779,8 +779,27 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
     provider = cfg.get("provider") or "hermes"
     # ACP session mode (default dont_ask so workers never pause on permission
     # prompts). An explicit empty string / null omits --mode entirely.
+    #
+    # YAML scalars are a trap here: `mode: off/no/false` parse to the Python
+    # bool ``False`` (and `on/yes/true` to ``True``), which naive stringifying
+    # would turn into a bogus ``--mode False`` / ``--mode True``. Normalize:
+    # bool False (or null / empty) → omit --mode; bool True → fall back to the
+    # safe default with a warning; everything else → the stripped string value.
     mode = cfg.get("mode", "dont_ask")
-    mode = str(mode).strip() if mode is not None else ""
+    if isinstance(mode, bool):
+        if mode:
+            _log.warning(
+                "kanban paseo_spawn: kanban.paseo_spawn.mode was a boolean "
+                "true (YAML on/yes/true); falling back to default mode %r",
+                "dont_ask",
+            )
+            mode = "dont_ask"
+        else:
+            mode = ""
+    elif mode is None:
+        mode = ""
+    else:
+        mode = str(mode).strip()
     slack = kb._positive_int(cfg.get("wait_timeout_slack_seconds"), 300, minimum=0)
 
     # Health check — automatic fallback on any daemon trouble.

@@ -332,6 +332,54 @@ def test_mode_override_from_config(monkeypatch, tmp_path):
     assert run_cmd[run_cmd.index("--mode") + 1] == "accept_edits"
 
 
+def test_mode_yaml_false_omits_flag(monkeypatch, tmp_path):
+    """kanban.paseo_spawn.mode: off → YAML bool False → no --mode flag.
+
+    Regression: `str(False)` used to leak a bogus `--mode False`.
+    """
+    _profile_home(
+        tmp_path,
+        monkeypatch,
+        paseo_cfg="kanban:\n  paseo_spawn:\n    mode: off\n",
+    )
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    calls = _install_fake_paseo(monkeypatch)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
+    run_cmd = calls["run"][0]
+    assert "--mode" not in run_cmd
+    assert "False" not in run_cmd
+
+
+def test_mode_yaml_true_falls_back_to_default(monkeypatch, tmp_path):
+    """kanban.paseo_spawn.mode: on → YAML bool True → safe default dont_ask.
+
+    Regression: `str(True)` used to leak a bogus `--mode True`.
+    """
+    _profile_home(
+        tmp_path,
+        monkeypatch,
+        paseo_cfg="kanban:\n  paseo_spawn:\n    mode: on\n",
+    )
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    calls = _install_fake_paseo(monkeypatch)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
+    run_cmd = calls["run"][0]
+    assert run_cmd[run_cmd.index("--mode") + 1] == "dont_ask"
+    assert "True" not in run_cmd
+
+
 def test_mixed_agents_prefers_active_over_stale(monkeypatch, tmp_path):
     """With one idle and one running agent, re-attach to the running one."""
     _profile_home(tmp_path, monkeypatch)
