@@ -1085,15 +1085,18 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
             )
             _record_linkage_comment(task, agent_id, workspace_id, profile_arg, board)
 
-        # Watch-loop deadline: task max runtime + slack (unbounded when the
-        # task has no max runtime — the loop then lives until the task's DB
-        # state settles or the agent is genuinely gone).
+        # Watch-loop deadline: task max runtime + slack. A task with no
+        # explicit max_runtime still gets a bounded deadline from the canonical
+        # fallback (kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS, the same 7200s bound
+        # the sentinel/dispatcher use) rather than being spawned deadline-less
+        # (t_05292e4e's default-profile watcher hung unbounded with no
+        # --deadline). The soft-stall check still catches idle-frozen workers
+        # far sooner; this is the hard ceiling.
         import time
 
         max_runtime = getattr(task, "max_runtime_seconds", None)
-        deadline = None
-        if max_runtime:
-            deadline = time.time() + int(max_runtime) + int(slack)
+        effective_runtime = int(max_runtime) if max_runtime else kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS
+        deadline = time.time() + effective_runtime + int(slack)
 
         run_id = getattr(task, "current_run_id", None)
         return _spawn_watcher(

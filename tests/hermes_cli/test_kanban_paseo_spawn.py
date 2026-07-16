@@ -164,6 +164,36 @@ def test_enabled_healthy_launches_agent_with_contract(monkeypatch, tmp_path):
     assert abs(deadline - (_time.time() + 1800 + 300)) < 60
 
 
+def test_no_max_runtime_derives_fallback_deadline(monkeypatch, tmp_path):
+    """A task with no max_runtime still gets a bounded --deadline (FIX 3).
+
+    t_05292e4e's default-profile watcher was spawned deadline-less and hung
+    unbounded. When max_runtime is absent we fall back to the canonical
+    kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS (7200s), the same bound the sentinel
+    uses, plus slack.
+    """
+    import dataclasses
+    import time as _time
+
+    _profile_home(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    calls = _install_fake_paseo(monkeypatch)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    task = dataclasses.replace(_make_task(kb), max_runtime_seconds=None)
+    paseo_spawn.spawn_via_paseo(task, str(workspace), board=None)
+
+    watch_cmd = calls["popen"][0]
+    assert "--deadline" in watch_cmd, "deadline-less watcher regression"
+    deadline = float(watch_cmd[watch_cmd.index("--deadline") + 1])
+    expected = _time.time() + kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS + 300
+    assert abs(deadline - expected) < 60
+
+
 def test_watcher_receives_idle_stall_default(monkeypatch, tmp_path):
     """The watcher is spawned with the default idle-stall threshold (FIX 1)."""
     _profile_home(tmp_path, monkeypatch)

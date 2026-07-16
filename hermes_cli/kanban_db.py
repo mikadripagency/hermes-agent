@@ -222,6 +222,15 @@ def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
 # during the launch window.
 DEFAULT_CRASH_GRACE_SECONDS = 30
 
+# Canonical fallback worker runtime bound (seconds) used when a task carries no
+# explicit ``max_runtime_seconds``. Mirrors the kanban sentinel's
+# ``DEFAULT_MAX_RUNTIME_S`` (env ``SENTINEL_DEFAULT_MAX_RUNTIME_S``, default
+# 7200 = 2h): a watcher / worker spawned for a deadline-less task must still get
+# a bounded deadline so a hung run cannot sit "running" forever (t_05292e4e was
+# spawned with no --deadline). Callers that need a deadline for a task with no
+# max_runtime fall back to this instead of omitting the bound entirely.
+DEFAULT_WORKER_MAX_RUNTIME_SECONDS = 7200
+
 
 # Sentinel exit code a kanban worker uses to signal "I bailed because the
 # provider rate-limited / exhausted quota, not because the task failed."
