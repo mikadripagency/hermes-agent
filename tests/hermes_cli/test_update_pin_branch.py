@@ -83,9 +83,22 @@ class TestResolveUpdateRemote:
             GIT, repo_with_upstream, "main", "main", pinned=True
         ) == ("origin", "main", "origin/main")
 
-    def test_pinned_detached_head_stays_default(self, repo_with_upstream):
+    def test_pinned_detached_head_aborts(self, repo_with_upstream):
+        # Detached HEAD under pinning must refuse: switching to origin/main
+        # would abandon the checked-out (fix-carrying) commit. Regression guard
+        # for the 2026-07-15 incident where the updater ran upstream code.
+        with pytest.raises(_PinnedBranchError) as exc:
+            _resolve_update_remote(
+                GIT, repo_with_upstream, "main", "HEAD", pinned=True
+            )
+        assert "refusing to switch to main" in str(exc.value)
+        assert exc.value.current_branch == "HEAD"
+
+    def test_detached_head_not_pinned_stays_default(self, repo_with_upstream):
+        # With pinning OFF, detached HEAD keeps the historical default (the
+        # caller switches to the target branch as before).
         assert _resolve_update_remote(
-            GIT, repo_with_upstream, "main", "HEAD", pinned=True
+            GIT, repo_with_upstream, "main", "HEAD", pinned=False
         ) == ("origin", "main", "origin/main")
 
     def test_pinned_without_upstream_raises(self, repo_with_upstream):

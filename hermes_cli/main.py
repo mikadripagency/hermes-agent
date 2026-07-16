@@ -8460,15 +8460,24 @@ def _resolve_update_remote(git_cmd, root, target_branch, current_branch, *, pinn
 
     Returns ``(remote, remote_branch, tracking_ref)``.
 
-    Default behavior (pinning off, detached HEAD, or already on the target
-    branch): ``("origin", target_branch, "origin/<target_branch>")`` — the
-    caller may still switch branches to reach the target, exactly as before.
+    Default behavior (pinning off, or already on the target branch):
+    ``("origin", target_branch, "origin/<target_branch>")`` — the caller may
+    still switch branches to reach the target, exactly as before.
 
-    Pinned + on a different branch: never switch. Resolve the current
+    Pinned + detached HEAD: never switch. There is no branch whose upstream we
+    could fast-forward, and letting the caller switch to ``origin/<target>``
+    would abandon the checked-out commit (which may carry local fork fixes).
+    Raises ``_PinnedBranchError``.
+
+    Pinned + on a different (named) branch: never switch. Resolve the current
     branch's own configured upstream and pull that instead. Raises
     ``_PinnedBranchError`` when the pinned branch has no upstream.
     """
-    if pinned and current_branch and current_branch not in ("HEAD", target_branch):
+    if pinned and current_branch == "HEAD":
+        # Detached HEAD under pinning — refuse rather than silently switching
+        # to the target branch and trampling the detached (fix-carrying) commit.
+        raise _PinnedBranchError(current_branch, target_branch)
+    if pinned and current_branch and current_branch != target_branch:
         upstream = _branch_upstream(git_cmd, root, current_branch)
         if not upstream:
             raise _PinnedBranchError(current_branch, target_branch)
