@@ -616,6 +616,19 @@ def _record_linkage_comment(
 WATCH_POLL_SECONDS = 10.0
 WATCH_GONE_THRESHOLD = 6
 
+# Soft-stall detection: an agent that reports ``idle`` while its kanban task's
+# ``last_heartbeat_at`` is frozen for longer than this is a worker that has
+# effectively gone away between turns (ACP session finished/hung but the daemon
+# still holds the PID alive — the claim_extended `pid_alive` trap seen on
+# t_18088232 run 349, where a frozen heartbeat kept a finished agent "running"
+# for ~56 min). Declaring the worker gone hands recovery to the dispatcher's
+# fresh-agent-per-run + checkpoint-resume path, which is designed for exactly
+# this. Default 900s (15 min). 0 disables the check entirely. A *busy*
+# (running/working) agent is never stall-exited: the ACP auto-heartbeat fires
+# per agent loop iteration, so an actively working agent heartbeats and only
+# ``idle`` ever qualifies as a candidate stall.
+WATCH_IDLE_STALL_SECONDS = 900.0
+
 # Exit codes of the watch loop (the PID the dispatcher tracks):
 #   0 — the kanban task left this run's `running` state (terminal transition,
 #       reclaim, run superseded, or task deleted). The dispatcher only flags a
@@ -661,13 +674,18 @@ def _read_task_run_state(db_path: str, task_id: str):
     return (row[0], row[1])
 
 
-def _inspect_agent_ok(paseo_bin: str, agent_id: str) -> bool:
-    """One ``paseo inspect`` poll: True iff the agent is live and usable.
+def _inspect_agent_state(paseo_bin: str, agent_id: str):
+    """One ``paseo inspect`` poll → ``(ok, status)``.
 
-    "Usable" = inspect succeeds, agent is not archived, and its status is not
-    ``error``. Any failure (nonzero rc, timeout, unparsable JSON, daemon down)
-    returns False; the caller applies the consecutive-poll threshold so
-    transient daemon blips don't kill the watcher.
+    * ``ok`` is True iff the agent is live and usable — inspect succeeds, the
+      agent is not archived, and its status is not ``error``. Any failure
+      (nonzero rc, timeout, unparsable JSON, daemon down) yields ``ok=False``;
+      the caller applies the consecutive-poll threshold so transient daemon
+      blips don't kill the watcher.
+    * ``status`` is the lowercased agent status string (e.g. ``"idle"`` /
+      ``"running"``) when it could be read, else ``None``. A transient inspect
+      failure returns ``(False, None)`` — it must never be mistaken for an
+      idle agent by the soft-stall check.
     """
     try:
         proc = subprocess.run(  # noqa: S603 - fixed argv
@@ -679,26 +697,65 @@ def _inspect_agent_ok(paseo_bin: str, agent_id: str) -> bool:
             text=True,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return False
+        return (False, None)
     if proc.returncode != 0:
-        return False
+        return (False, None)
     try:
         data = json.loads(proc.stdout or "{}")
     except json.JSONDecodeError:
-        return False
+        return (False, None)
     if not isinstance(data, dict):
-        return False
+        return (False, None)
     # inspect --json uses capitalized keys (Status/Archived/ArchivedAt); accept
     # lowercase variants defensively in case the CLI schema changes.
+    raw_status = data.get("Status", data.get("status"))
+    status = str(raw_status).strip().lower() if raw_status is not None else None
     archived = data.get("Archived", data.get("archived"))
     if archived is None:
         archived = (data.get("ArchivedAt") or data.get("archivedAt")) is not None
     if archived:
-        return False
-    status = data.get("Status", data.get("status"))
+        return (False, status)
     if status == "error":
-        return False
-    return True
+        return (False, status)
+    return (True, status)
+
+
+def _inspect_agent_ok(paseo_bin: str, agent_id: str) -> bool:
+    """Back-compat liveness wrapper over :func:`_inspect_agent_state`."""
+    return _inspect_agent_state(paseo_bin, agent_id)[0]
+
+
+def _read_task_heartbeat(db_path: str, task_id: str):
+    """Read ``last_heartbeat_at`` (epoch seconds) for ``task_id`` — read-only.
+
+    Same read-only, non-locking discipline as :func:`_read_task_run_state`.
+    Returns the integer epoch seconds when a heartbeat has been recorded, and
+    ``None`` when the column is NULL, the row is gone, or the DB is
+    transiently unreadable (locked/busy). ``None`` means "cannot determine
+    staleness" — the soft-stall check treats it as "keep watching".
+    """
+    import sqlite3
+    from urllib.parse import quote
+
+    try:
+        uri = f"file:{quote(str(db_path))}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            row = conn.execute(
+                "SELECT last_heartbeat_at FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    if row is None or row[0] is None:
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return None
 
 
 def watch_worker(
@@ -711,20 +768,34 @@ def watch_worker(
     paseo_bin: str = "paseo",
     poll_seconds: float = WATCH_POLL_SECONDS,
     gone_threshold: int = WATCH_GONE_THRESHOLD,
+    idle_stall_seconds: float = 0.0,
 ) -> int:
     """The watch loop body; returns the process exit code.
 
     The kanban task's DB state is the ONLY success signal: the loop exits 0
     exactly when the task is no longer ``running`` under ``run_id`` (terminal
     transition, reclaim, run superseded, or deleted). The Paseo agent flapping
-    to ``idle`` between ACP turns never terminates the watcher. Agent-gone
-    (``gone_threshold`` consecutive bad inspects) and deadline overrun exit 1.
+    to ``idle`` between ACP turns never terminates the watcher on its own.
+    Agent-gone (``gone_threshold`` consecutive bad inspects) and deadline
+    overrun exit 1.
+
+    ``idle_stall_seconds`` (> 0 to enable) adds a soft-stall exit: an agent
+    reporting ``idle`` whose kanban task ``last_heartbeat_at`` is frozen for
+    longer than the threshold is treated as an effectively-gone worker and
+    exits 1 (dispatcher recovery + fresh-agent-per-run take over). Only
+    ``idle`` qualifies — a busy/working agent heartbeats each loop iteration,
+    so it is never stall-exited even if its heartbeat momentarily lags; an
+    idle agent with a *fresh* heartbeat (between turns) keeps being watched;
+    and a transient inspect failure never counts as idle.
     """
     import time
 
     consecutive_bad = 0
+    stall_enabled = bool(idle_stall_seconds and idle_stall_seconds > 0)
     while True:
-        # (a) Task DB state — the authoritative success signal.
+        # (a) Task DB state — the authoritative success signal. A terminal
+        # (or superseded/deleted) task always exits 0 here first, ahead of any
+        # liveness or soft-stall verdict below.
         state = _read_task_run_state(db_path, task_id)
         if state is not None:
             status, current_run = state
@@ -744,8 +815,14 @@ def watch_worker(
                 )
                 return WATCH_EXIT_TASK_SETTLED
 
-        # (b) Agent liveness — only consecutive sustained failure counts.
-        if _inspect_agent_ok(paseo_bin, agent_id):
+        # (b) Agent liveness — only consecutive sustained failure counts. When
+        # the soft-stall check is enabled we read (ok, status) in one inspect
+        # so a single poll drives both liveness and idle detection.
+        if stall_enabled:
+            agent_ok, agent_status = _inspect_agent_state(paseo_bin, agent_id)
+        else:
+            agent_ok, agent_status = _inspect_agent_ok(paseo_bin, agent_id), None
+        if agent_ok:
             consecutive_bad = 0
         else:
             consecutive_bad += 1
@@ -755,6 +832,24 @@ def watch_worker(
                     "polls — declaring worker dead (task %s)",
                     agent_id,
                     consecutive_bad,
+                    task_id,
+                )
+                return WATCH_EXIT_WORKER_GONE
+
+        # (b2) Soft-stall — an idle agent whose task heartbeat is frozen past
+        # the threshold is an effectively-gone worker (the pid_alive trap).
+        # Gated on ok+idle so transient inspect failures (ok=False) and busy
+        # agents (status != idle) can never trip it; a None heartbeat means
+        # "cannot determine staleness" → keep watching.
+        if stall_enabled and agent_ok and agent_status == "idle":
+            hb = _read_task_heartbeat(db_path, task_id)
+            if hb is not None and (time.time() - hb) > idle_stall_seconds:
+                _log.warning(
+                    "paseo watch: agent %s idle with frozen heartbeat "
+                    "(%.0fs > %.0fs) for task %s — declaring worker gone",
+                    agent_id,
+                    time.time() - hb,
+                    idle_stall_seconds,
                     task_id,
                 )
                 return WATCH_EXIT_WORKER_GONE
@@ -779,6 +874,7 @@ def _spawn_watcher(
     deadline: Optional[float],
     paseo_bin: str,
     log_f,
+    idle_stall_seconds: float = 0.0,
 ) -> int:
     """Popen the tracked watch-loop child; return its PID.
 
@@ -808,6 +904,8 @@ def _spawn_watcher(
         cmd.extend(["--run", str(int(run_id))])
     if deadline is not None:
         cmd.extend(["--deadline", str(int(deadline))])
+    if idle_stall_seconds and idle_stall_seconds > 0:
+        cmd.extend(["--idle-stall", str(int(idle_stall_seconds))])
     log_f.write(
         f"[paseo_spawn] watching agent {agent_id} (task-state watch loop)\n".encode()
     )
@@ -834,6 +932,7 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--run", type=int, default=None)
     parser.add_argument("--deadline", type=float, default=None)
     parser.add_argument("--paseo-bin", default="paseo")
+    parser.add_argument("--idle-stall", type=float, default=0.0)
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -854,6 +953,7 @@ def main(argv: Optional[list] = None) -> int:
         deadline=args.deadline,
         paseo_bin=args.paseo_bin,
         poll_seconds=poll_seconds,
+        idle_stall_seconds=args.idle_stall,
     )
 
 
@@ -893,6 +993,9 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
     else:
         mode = str(mode).strip()
     slack = kb._positive_int(cfg.get("wait_timeout_slack_seconds"), 300, minimum=0)
+    idle_stall_seconds = kb._positive_int(
+        cfg.get("idle_stall_seconds"), int(WATCH_IDLE_STALL_SECONDS), minimum=0
+    )
 
     # Health check — automatic fallback on any daemon trouble.
     if not _paseo_healthy(paseo_bin):
@@ -1001,6 +1104,7 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
             deadline,
             paseo_bin,
             log_f,
+            idle_stall_seconds=idle_stall_seconds,
         )
     except Exception:
         log_f.close()

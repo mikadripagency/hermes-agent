@@ -164,6 +164,52 @@ def test_enabled_healthy_launches_agent_with_contract(monkeypatch, tmp_path):
     assert abs(deadline - (_time.time() + 1800 + 300)) < 60
 
 
+def test_watcher_receives_idle_stall_default(monkeypatch, tmp_path):
+    """The watcher is spawned with the default idle-stall threshold (FIX 1)."""
+    _profile_home(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    calls = _install_fake_paseo(monkeypatch)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
+
+    watch_cmd = calls["popen"][0]
+    assert "--idle-stall" in watch_cmd
+    assert watch_cmd[watch_cmd.index("--idle-stall") + 1] == str(
+        int(paseo_spawn.WATCH_IDLE_STALL_SECONDS)
+    )
+
+
+def test_watcher_idle_stall_disabled_omits_flag(monkeypatch, tmp_path):
+    """kanban.paseo_spawn.idle_stall_seconds: 0 omits --idle-stall entirely."""
+    _profile_home(
+        tmp_path,
+        monkeypatch,
+        paseo_cfg=(
+            "kanban:\n"
+            "  paseo_spawn:\n"
+            "    enabled: true\n"
+            "    idle_stall_seconds: 0\n"
+        ),
+    )
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    calls = _install_fake_paseo(monkeypatch)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
+
+    watch_cmd = calls["popen"][0]
+    assert "--idle-stall" not in watch_cmd
+
+
 def test_daemon_down_falls_back_to_default_spawn(monkeypatch, tmp_path):
     """`paseo status` failure → automatic fallback to _default_spawn (no paseo run)."""
     _profile_home(tmp_path, monkeypatch)
@@ -1130,3 +1176,283 @@ def test_watch_entrypoint_end_to_end(tmp_path, monkeypatch):
         t.join()
         conn.close()
     assert proc.returncode == 0, proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# Soft-stall exit: idle agent + frozen heartbeat (FIX 1 / t_18088232 run 349)
+# ---------------------------------------------------------------------------
+
+_STALL_NOW = 1_000_000.0
+
+
+def _watch_stall(
+    paseo_spawn,
+    monkeypatch,
+    *,
+    task_states,
+    inspect_states,
+    heartbeat_ages,
+    idle_stall_seconds,
+    run_id=1,
+    gone_threshold=10_000,
+):
+    """Run watch_worker scripting (ok, status) inspects + heartbeat ages.
+
+    ``inspect_states`` yields ``(ok, status)`` tuples (what
+    ``_inspect_agent_state`` returns). ``heartbeat_ages`` yields the age of the
+    task's last heartbeat in seconds-ago (or ``None`` for "no heartbeat"). The
+    clock is frozen at ``_STALL_NOW`` and the poll index advances once per loop
+    iteration via a stubbed ``time.sleep`` — so a "frozen" heartbeat is just a
+    large age. The final entry of each list repeats forever.
+    """
+    import time as _time
+
+    polls = {"n": 0}
+
+    def fake_state(db_path, task_id):
+        return task_states[min(polls["n"], len(task_states) - 1)]
+
+    def fake_inspect_state(paseo_bin, agent_id):
+        return inspect_states[min(polls["n"], len(inspect_states) - 1)]
+
+    def fake_hb(db_path, task_id):
+        age = heartbeat_ages[min(polls["n"], len(heartbeat_ages) - 1)]
+        return None if age is None else _STALL_NOW - age
+
+    def fake_sleep(_seconds):
+        polls["n"] += 1
+
+    monkeypatch.setattr(paseo_spawn, "_read_task_run_state", fake_state)
+    monkeypatch.setattr(paseo_spawn, "_inspect_agent_state", fake_inspect_state)
+    monkeypatch.setattr(paseo_spawn, "_read_task_heartbeat", fake_hb)
+    monkeypatch.setattr(_time, "time", lambda: _STALL_NOW)
+    monkeypatch.setattr(_time, "sleep", fake_sleep)
+
+    rc = paseo_spawn.watch_worker(
+        task_id="t_w",
+        agent_id="ag_w",
+        db_path="/nonexistent.db",
+        run_id=run_id,
+        deadline=None,
+        poll_seconds=0,
+        gone_threshold=gone_threshold,
+        idle_stall_seconds=idle_stall_seconds,
+    )
+    return rc, polls["n"]
+
+
+def test_watch_idle_fresh_heartbeat_keeps_watching(monkeypatch):
+    """Idle agent with a FRESH heartbeat (between turns) must keep watching."""
+    from hermes_cli import paseo_spawn
+
+    rc, polls = _watch_stall(
+        paseo_spawn,
+        monkeypatch,
+        task_states=[("running", 1)] * 6 + [("done", 1)],
+        inspect_states=[(True, "idle")],
+        heartbeat_ages=[10],  # 10s ago — well within the 900s threshold
+        idle_stall_seconds=900,
+    )
+    assert rc == 0
+    assert polls >= 6  # it genuinely kept watching through the idle polls
+
+
+def test_watch_idle_frozen_heartbeat_exits_1(monkeypatch):
+    """Idle agent whose heartbeat is frozen past the threshold → exit 1."""
+    from hermes_cli import paseo_spawn
+
+    rc, _ = _watch_stall(
+        paseo_spawn,
+        monkeypatch,
+        task_states=[("running", 1)],  # never settles
+        inspect_states=[(True, "idle")],
+        heartbeat_ages=[1000],  # 1000s > 900s threshold
+        idle_stall_seconds=900,
+    )
+    assert rc == 1
+
+
+def test_watch_busy_frozen_heartbeat_keeps_watching(monkeypatch):
+    """A busy (running) agent is never stall-exited, even if its heartbeat lags.
+
+    Auto-heartbeat fires per agent loop iteration, so a working agent
+    heartbeats; only ``idle`` qualifies as a stall candidate. Here the agent
+    reports ``running`` with a stale heartbeat and the watcher must keep going
+    until the task settles.
+    """
+    from hermes_cli import paseo_spawn
+
+    rc, polls = _watch_stall(
+        paseo_spawn,
+        monkeypatch,
+        task_states=[("running", 1)] * 5 + [("done", 1)],
+        inspect_states=[(True, "running")],
+        heartbeat_ages=[1000],  # frozen, but agent is busy → ignored
+        idle_stall_seconds=900,
+    )
+    assert rc == 0
+    assert polls >= 5
+
+
+def test_watch_idle_stall_transient_inspect_failure_not_idle(monkeypatch):
+    """A transient inspect failure (ok=False) must never count as idle.
+
+    Even with a frozen heartbeat, an inspect that failed to read a status
+    cannot trip the soft-stall exit. With a high gone-threshold the failures
+    don't accumulate to "gone", so the watcher settles on the task state.
+    """
+    from hermes_cli import paseo_spawn
+
+    rc, _ = _watch_stall(
+        paseo_spawn,
+        monkeypatch,
+        task_states=[("running", 1)] * 4 + [("done", 1)],
+        inspect_states=[(False, None)],  # inspect failed → not idle
+        heartbeat_ages=[1000],  # frozen, but must be ignored
+        idle_stall_seconds=900,
+        gone_threshold=10_000,
+    )
+    assert rc == 0
+
+
+def test_watch_idle_no_heartbeat_keeps_watching(monkeypatch):
+    """Idle agent but heartbeat unreadable (None) → cannot judge → keep watching."""
+    from hermes_cli import paseo_spawn
+
+    rc, _ = _watch_stall(
+        paseo_spawn,
+        monkeypatch,
+        task_states=[("running", 1)] * 3 + [("done", 1)],
+        inspect_states=[(True, "idle")],
+        heartbeat_ages=[None],  # locked/never-heartbeated → don't stall
+        idle_stall_seconds=900,
+    )
+    assert rc == 0
+
+
+def test_watch_terminal_state_wins_over_idle_stall(monkeypatch):
+    """A terminal task exits 0 first, even when idle + heartbeat is frozen."""
+    from hermes_cli import paseo_spawn
+
+    rc, _ = _watch_stall(
+        paseo_spawn,
+        monkeypatch,
+        task_states=[("done", 1)],
+        inspect_states=[(True, "idle")],
+        heartbeat_ages=[100_000],  # ancient, but the task is already terminal
+        idle_stall_seconds=900,
+    )
+    assert rc == 0
+
+
+def test_watch_idle_stall_threshold_configurable(monkeypatch):
+    """The stall threshold is configurable: same frozen heartbeat, two verdicts."""
+    from hermes_cli import paseo_spawn
+
+    # Heartbeat 200s old: past a 100s threshold → stall (exit 1).
+    rc_tight, _ = _watch_stall(
+        paseo_spawn,
+        monkeypatch,
+        task_states=[("running", 1)],
+        inspect_states=[(True, "idle")],
+        heartbeat_ages=[200],
+        idle_stall_seconds=100,
+    )
+    assert rc_tight == 1
+
+    # Same 200s-old heartbeat, but a 100000s threshold → still watching → 0.
+    rc_loose, _ = _watch_stall(
+        paseo_spawn,
+        monkeypatch,
+        task_states=[("running", 1)] * 3 + [("done", 1)],
+        inspect_states=[(True, "idle")],
+        heartbeat_ages=[200],
+        idle_stall_seconds=100_000,
+    )
+    assert rc_loose == 0
+
+
+def test_watch_idle_stall_disabled_ignores_frozen_heartbeat(monkeypatch):
+    """idle_stall_seconds=0 disables the check entirely (uses liveness path)."""
+    from hermes_cli import paseo_spawn
+
+    # With the check disabled, watch_worker uses _inspect_agent_ok for
+    # liveness; stub it to "alive". A frozen heartbeat must be ignored.
+    polls = {"n": 0}
+    task_states = [("running", 1)] * 4 + [("done", 1)]
+
+    def fake_state(db_path, task_id):
+        return task_states[min(polls["n"], len(task_states) - 1)]
+
+    def fake_ok(paseo_bin, agent_id):
+        polls["n"] += 1
+        return True
+
+    def _should_not_be_called(*a, **k):  # pragma: no cover - guard
+        raise AssertionError("heartbeat read while stall disabled")
+
+    monkeypatch.setattr(paseo_spawn, "_read_task_run_state", fake_state)
+    monkeypatch.setattr(paseo_spawn, "_inspect_agent_ok", fake_ok)
+    monkeypatch.setattr(paseo_spawn, "_read_task_heartbeat", _should_not_be_called)
+
+    rc = paseo_spawn.watch_worker(
+        task_id="t_w",
+        agent_id="ag_w",
+        db_path="/nonexistent.db",
+        run_id=1,
+        poll_seconds=0,
+        idle_stall_seconds=0,
+    )
+    assert rc == 0
+
+
+def test_inspect_agent_state_extracts_status(monkeypatch):
+    """_inspect_agent_state returns (ok, lowercased status); failures → (False, None)."""
+    import json as _json
+
+    from hermes_cli import paseo_spawn
+
+    def make_run(rc, payload):
+        def fake_run(cmd, *a, **k):
+            return _CompletedRun(returncode=rc, stdout=_json.dumps(payload))
+
+        return fake_run
+
+    idle = {"Id": "ag_1", "Status": "Idle", "Archived": False, "ArchivedAt": None}
+    monkeypatch.setattr(subprocess, "run", make_run(0, idle))
+    assert paseo_spawn._inspect_agent_state("paseo", "ag_1") == (True, "idle")
+
+    running = dict(idle, Status="running")
+    monkeypatch.setattr(subprocess, "run", make_run(0, running))
+    assert paseo_spawn._inspect_agent_state("paseo", "ag_1") == (True, "running")
+
+    errored = dict(idle, Status="error")
+    monkeypatch.setattr(subprocess, "run", make_run(0, errored))
+    assert paseo_spawn._inspect_agent_state("paseo", "ag_1") == (False, "error")
+
+    # Daemon down / not found → (False, None), never mistaken for idle.
+    monkeypatch.setattr(subprocess, "run", make_run(1, {}))
+    assert paseo_spawn._inspect_agent_state("paseo", "ag_1") == (False, None)
+
+
+def test_read_task_heartbeat_against_real_db(tmp_path, monkeypatch):
+    """_read_task_heartbeat reads last_heartbeat_at read-only; NULL/missing → None."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    db_path = tmp_path / "kanban.db"
+    conn = kb.connect(db_path)
+    try:
+        tid = kb.create_task(conn, title="hb")
+        conn.execute(
+            "UPDATE tasks SET status='running', last_heartbeat_at=123456 WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert paseo_spawn._read_task_heartbeat(str(db_path), tid) == 123456
+    assert paseo_spawn._read_task_heartbeat(str(db_path), "t_nope") is None
+    assert paseo_spawn._read_task_heartbeat(str(tmp_path / "missing.db"), tid) is None
