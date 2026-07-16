@@ -5773,6 +5773,16 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_per_project_capped: list[tuple[str, str, int]] = field(default_factory=list)
+    """Tasks deferred this tick because their project is already at
+    ``kanban.max_in_progress_per_project``. Each entry is
+    ``(task_id, project_id, current_running_count)``. Mirrors
+    ``skipped_per_profile_capped`` but groups by ``tasks.project_id`` — it
+    caps concurrent workers within a single project (repo / experiment lane)
+    so one project's fan-out cannot saturate the board while others starve.
+    Tasks with no project (NULL ``project_id``) are exempt and never counted.
+    NOT operator-actionable — picked up on a later tick when the project has
+    capacity."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -7047,6 +7057,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_per_project: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -7081,6 +7092,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_in_progress_per_project=max_in_progress_per_project,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -7097,6 +7109,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_in_progress_per_project=max_in_progress_per_project,
         )
 
 
@@ -7113,6 +7126,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_per_project: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -7187,7 +7201,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, project_id FROM tasks "
         "WHERE status IN ('ready', 'running') AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -7226,6 +7240,23 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
+    # Per-project concurrency cap: same shape as the per-profile cap but
+    # grouped by ``tasks.project_id``. Caps concurrent workers within a single
+    # project (repo / experiment lane) so one project's fan-out cannot
+    # saturate the board. Tasks with no project (NULL project_id) are exempt
+    # and never counted here.
+    _per_project_cap = max_in_progress_per_project if (
+        isinstance(max_in_progress_per_project, int)
+        and max_in_progress_per_project > 0
+    ) else None
+    _per_project_running: dict[str, int] = {}
+    if _per_project_cap is not None:
+        for prow in conn.execute(
+            "SELECT project_id, COUNT(*) AS n FROM tasks "
+            "WHERE status = 'running' AND claim_lock IS NOT NULL AND project_id IS NOT NULL "
+            "GROUP BY project_id"
+        ):
+            _per_project_running[prow["project_id"]] = int(prow["n"])
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -7325,6 +7356,17 @@ def _dispatch_once_locked(
                     (row["id"], row_assignee, current)
                 )
                 continue
+        # Per-project concurrency cap: even with global + per-profile headroom,
+        # refuse to spawn for a project already at its in-flight cap. Tasks
+        # with no project (NULL project_id) are exempt.
+        row_project = row["project_id"]
+        if _per_project_cap is not None and row_project:
+            current = _per_project_running.get(row_project, 0)
+            if current >= _per_project_cap:
+                result.skipped_per_project_capped.append(
+                    (row["id"], row_project, current)
+                )
+                continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -7355,6 +7397,10 @@ def _dispatch_once_locked(
             if _per_profile_cap is not None and row_assignee:
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
+                )
+            if _per_project_cap is not None and row_project:
+                _per_project_running[row_project] = (
+                    _per_project_running.get(row_project, 0) + 1
                 )
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
@@ -7410,6 +7456,10 @@ def _dispatch_once_locked(
             if _per_profile_cap is not None and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
+                )
+            if _per_project_cap is not None and getattr(claimed, "project_id", None):
+                _per_project_running[claimed.project_id] = (
+                    _per_project_running.get(claimed.project_id, 0) + 1
                 )
         except Exception as exc:
             auto = _record_spawn_failure(

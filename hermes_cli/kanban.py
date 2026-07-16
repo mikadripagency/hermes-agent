@@ -2140,6 +2140,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = _coerce_positive_int(
             _kanban_cfg.get("max_in_progress_per_profile")
         )
+        max_in_progress_per_project = _coerce_positive_int(
+            _kanban_cfg.get("max_in_progress_per_project")
+        )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
@@ -2150,6 +2153,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     except Exception:
         default_assignee = None
         max_in_progress_per_profile = None
+        max_in_progress_per_project = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
@@ -2161,6 +2165,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_in_progress_per_project=max_in_progress_per_project,
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2179,6 +2184,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
+            ],
+            "skipped_per_project_capped": [
+                {"task_id": tid, "project_id": proj, "current": current}
+                for (tid, proj, current) in res.skipped_per_project_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
@@ -2212,6 +2221,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         for tid, who, current in res.skipped_per_profile_capped:
             print(
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
+            )
+    if res.skipped_per_project_capped:
+        for tid, proj, current in res.skipped_per_project_capped:
+            print(
+                f"Deferred (project {proj} at per-project cap, {current} running): {tid}"
             )
     if res.skipped_nonspawnable:
         print(

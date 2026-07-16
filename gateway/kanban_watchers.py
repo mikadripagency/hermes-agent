@@ -987,6 +987,34 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        # Read kanban.max_in_progress_per_project — per-project concurrency
+        # cap. When set, no single project (repo / experiment lane) gets more
+        # than N workers running at once, even if the global max_in_progress /
+        # per-profile caps would allow it. Tasks with no project are exempt.
+        raw_per_project = kanban_cfg.get("max_in_progress_per_project", None)
+        max_in_progress_per_project = None
+        if raw_per_project is not None:
+            try:
+                max_in_progress_per_project = int(raw_per_project)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "kanban dispatcher: invalid kanban.max_in_progress_per_project=%r; ignoring",
+                    raw_per_project,
+                )
+                max_in_progress_per_project = None
+            else:
+                if max_in_progress_per_project < 1:
+                    logger.warning(
+                        "kanban dispatcher: kanban.max_in_progress_per_project=%r is below 1; ignoring",
+                        raw_per_project,
+                    )
+                    max_in_progress_per_project = None
+                else:
+                    logger.info(
+                        "kanban dispatcher: max_in_progress_per_project=%d",
+                        max_in_progress_per_project,
+                    )
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -1080,6 +1108,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    max_in_progress_per_project=max_in_progress_per_project,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
