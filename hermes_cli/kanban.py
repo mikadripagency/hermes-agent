@@ -722,6 +722,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_nrm.add_argument("--chat-id", required=True)
     p_nrm.add_argument("--thread-id", default=None)
 
+    p_nrec = sub.add_parser(
+        "notify-reconcile",
+        help="Acknowledge a historical completion from its stored receipt",
+    )
+    p_nrec.add_argument("task_id")
+    p_nrec.add_argument("--event-id", required=True, type=int)
+    p_nrec.add_argument("--platform", required=True, choices=("slack",))
+    p_nrec.add_argument("--chat-id", required=True)
+    p_nrec.add_argument("--thread-id", default="")
+    p_nrec.add_argument("--notifier-profile", required=True)
+
     # --- log ---
     p_log = sub.add_parser(
         "log",
@@ -970,6 +981,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "notify-subscribe":   _cmd_notify_subscribe,
             "notify-list":        _cmd_notify_list,
             "notify-unsubscribe": _cmd_notify_unsubscribe,
+            "notify-reconcile":   _cmd_notify_reconcile,
             "context":  _cmd_context,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
@@ -2490,6 +2502,24 @@ def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
         print("(no such subscription)", file=sys.stderr)
         return 1
     print(f"Unsubscribed from {args.task_id}")
+    return 0
+
+
+def _cmd_notify_reconcile(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        message_id = kb.reconcile_completion_delivery(
+            conn,
+            task_id=args.task_id,
+            event_id=args.event_id,
+            platform=args.platform,
+            chat_id=args.chat_id,
+            thread_id=args.thread_id,
+            notifier_profile=args.notifier_profile,
+        )
+    print(
+        f"Reconciled completion event {args.event_id} for {args.task_id} "
+        f"from receipt {message_id}"
+    )
     return 0
 
 
