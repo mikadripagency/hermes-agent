@@ -1283,6 +1283,24 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Durable completion-delivery ledger. New completion flows may create a
+-- pending row before sending; ``notify-reconcile`` can also add an
+-- acknowledged row for a historical send, but only from a matching durable
+-- subscription receipt.
+CREATE TABLE IF NOT EXISTS completion_deliveries (
+    event_id INTEGER PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    handoff_version INTEGER NOT NULL,
+    platform TEXT,
+    chat_id TEXT,
+    thread_id TEXT,
+    notifier_profile TEXT,
+    state TEXT NOT NULL DEFAULT 'pending',
+    receipt_id TEXT,
+    created_at INTEGER NOT NULL,
+    acknowledged_at INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -2058,6 +2076,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn, "kanban_notify_subs", "consecutive_failures",
                 "consecutive_failures INTEGER NOT NULL DEFAULT 0",
             )
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS completion_deliveries ("
+        "event_id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, "
+        "handoff_version INTEGER NOT NULL, platform TEXT, chat_id TEXT, "
+        "thread_id TEXT, notifier_profile TEXT, "
+        "state TEXT NOT NULL DEFAULT 'pending', receipt_id TEXT, "
+        "created_at INTEGER NOT NULL, acknowledged_at INTEGER)"
+    )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -8503,6 +8530,157 @@ def list_notify_subs(
     else:
         rows = conn.execute("SELECT * FROM kanban_notify_subs").fetchall()
     return [dict(r) for r in rows]
+
+
+def reconcile_completion_delivery(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: str = "",
+    notifier_profile: str,
+) -> str:
+    """Acknowledge a historical Slack completion from its durable receipt.
+
+    This path never sends a message and never accepts a caller-supplied receipt.
+    It only records a completed event whose exact subscription route already
+    carries a non-empty platform receipt. Repeating the same reconciliation is
+    idempotent; any conflicting ledger row is rejected.
+    """
+    task_id = str(task_id or "").strip()
+    platform = str(platform or "").strip().lower()
+    chat_id = str(chat_id or "").strip()
+    thread_id = str(thread_id or "").strip()
+    notifier_profile = str(notifier_profile or "").strip()
+    if not task_id or not chat_id or not notifier_profile:
+        raise ValueError("task, chat, and notifier profile are required")
+    if platform != "slack":
+        raise ValueError("completion receipt reconciliation only supports Slack")
+
+    now = int(time.time())
+    with write_txn(conn):
+        task_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+        }
+        version_expr = "t.handoff_version" if "handoff_version" in task_columns else "1"
+        event = conn.execute(
+            f"SELECT e.kind, t.status, {version_expr} AS handoff_version "
+            "FROM task_events e JOIN tasks t ON t.id = e.task_id "
+            "WHERE e.id = ? AND e.task_id = ?",
+            (int(event_id), task_id),
+        ).fetchone()
+        if event is None:
+            raise ValueError("completion event does not match the requested task")
+        if event["kind"] != "completed" or event["status"] != "done":
+            raise ValueError("reconciliation requires a completed event for a done task")
+
+        receipts = conn.execute(
+            "SELECT platform, chat_id, thread_id, "
+            "COALESCE(notifier_profile, '') AS notifier_profile, "
+            "TRIM(last_message_id) AS message_id, last_event_id, pending_event_id "
+            "FROM kanban_notify_subs WHERE task_id = ? "
+            "AND last_message_event_id = ? "
+            "AND TRIM(COALESCE(last_message_id, '')) <> ''",
+            (task_id, int(event_id)),
+        ).fetchall()
+        if len(receipts) != 1:
+            raise ValueError("expected one unambiguous matching subscription receipt")
+        receipt = receipts[0]
+        actual_route = (
+            receipt["platform"],
+            receipt["chat_id"],
+            receipt["thread_id"] or "",
+            receipt["notifier_profile"],
+        )
+        if actual_route != (platform, chat_id, thread_id, notifier_profile):
+            raise ValueError("subscription receipt does not match the requested route")
+        if receipt["pending_event_id"] is not None or int(receipt["last_event_id"]) < int(event_id):
+            raise ValueError("subscription receipt is not durably acknowledged")
+        message_id = str(receipt["message_id"])
+        handoff_version = int(event["handoff_version"] or 1)
+
+        existing = conn.execute(
+            "SELECT * FROM completion_deliveries WHERE event_id = ?",
+            (int(event_id),),
+        ).fetchone()
+        expected = (
+            task_id,
+            handoff_version,
+            platform,
+            chat_id,
+            thread_id,
+            notifier_profile,
+            message_id,
+        )
+        if existing is not None:
+            actual = (
+                existing["task_id"],
+                int(existing["handoff_version"]),
+                existing["platform"] or "",
+                existing["chat_id"] or "",
+                existing["thread_id"] or "",
+                existing["notifier_profile"] or "",
+                existing["receipt_id"] or "",
+            )
+            if existing["state"] == "acknowledged" and actual == expected:
+                return message_id
+            if (
+                existing["state"] == "pending"
+                and actual[0:2] == expected[0:2]
+                and not any(actual[2:])
+            ):
+                conn.execute(
+                    "UPDATE completion_deliveries SET platform = ?, chat_id = ?, "
+                    "thread_id = ?, notifier_profile = ?, state = 'acknowledged', "
+                    "receipt_id = ?, acknowledged_at = ? WHERE event_id = ?",
+                    (
+                        platform,
+                        chat_id,
+                        thread_id,
+                        notifier_profile,
+                        message_id,
+                        now,
+                        int(event_id),
+                    ),
+                )
+            else:
+                raise ValueError("conflicting completion delivery already exists")
+        else:
+            conn.execute(
+                "INSERT INTO completion_deliveries "
+                "(event_id, task_id, handoff_version, platform, chat_id, "
+                "thread_id, notifier_profile, state, receipt_id, created_at, "
+                "acknowledged_at) VALUES (?, ?, ?, ?, ?, ?, ?, "
+                "'acknowledged', ?, ?, ?)",
+                (
+                    int(event_id),
+                    task_id,
+                    handoff_version,
+                    platform,
+                    chat_id,
+                    thread_id,
+                    notifier_profile,
+                    message_id,
+                    now,
+                    now,
+                ),
+            )
+        _append_event(
+            conn,
+            task_id,
+            "completion_delivery_reconciled",
+            {
+                "completed_event_id": int(event_id),
+                "platform": platform,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "notifier_profile": notifier_profile,
+                "message_id": message_id,
+            },
+        )
+    return message_id
 
 
 def remove_notify_sub(
