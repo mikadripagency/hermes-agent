@@ -151,7 +151,22 @@ def test_reconcile_completion_delivery_rejects_task_mismatch_and_blank_receipt(k
             _reconcile(conn, task_id, event_id)
 
 
-def test_reconcile_completion_delivery_rejects_ambiguous_event_receipts(kanban_home):
+def test_reconcile_completion_delivery_rejects_in_flight_receipt(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id, event_id = _seed_completed_receipt(conn)
+        conn.execute(
+            "UPDATE kanban_notify_subs SET pending_event_id = ? WHERE task_id = ?",
+            (event_id, task_id),
+        )
+
+        with pytest.raises(ValueError, match="not durably acknowledged"):
+            _reconcile(conn, task_id, event_id)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM completion_deliveries"
+        ).fetchone()[0] == 0
+
+
+def test_reconcile_completion_delivery_uses_exact_route_with_unrelated_receipts(kanban_home):
     with kb.connect_closing() as conn:
         task_id, event_id = _seed_completed_receipt(conn)
         kb.add_notify_sub(
@@ -179,11 +194,15 @@ def test_reconcile_completion_delivery_rejects_ambiguous_event_receipts(kanban_h
             message_event_id=event_id,
         )
 
-        with pytest.raises(ValueError, match="unambiguous"):
-            _reconcile(conn, task_id, event_id)
-        assert conn.execute(
-            "SELECT COUNT(*) FROM completion_deliveries"
-        ).fetchone()[0] == 0
+        assert _reconcile(conn, task_id, event_id) == "1784203491.451939"
+        row = conn.execute(
+            "SELECT chat_id, receipt_id FROM completion_deliveries WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        assert dict(row) == {
+            "chat_id": "CORCH",
+            "receipt_id": "1784203491.451939",
+        }
 
 
 def test_reconcile_completion_delivery_does_not_requeue_or_duplicate_send(kanban_home):

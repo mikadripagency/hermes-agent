@@ -8577,25 +8577,24 @@ def reconcile_completion_delivery(
             raise ValueError("reconciliation requires a completed event for a done task")
 
         receipts = conn.execute(
-            "SELECT platform, chat_id, thread_id, "
-            "COALESCE(notifier_profile, '') AS notifier_profile, "
-            "TRIM(last_message_id) AS message_id, last_event_id, pending_event_id "
-            "FROM kanban_notify_subs WHERE task_id = ? "
+            "SELECT TRIM(last_message_id) AS message_id, last_event_id, pending_event_id "
+            "FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ? "
+            "AND COALESCE(notifier_profile, '') = ? "
             "AND last_message_event_id = ? "
             "AND TRIM(COALESCE(last_message_id, '')) <> ''",
-            (task_id, int(event_id)),
+            (
+                task_id,
+                platform,
+                chat_id,
+                thread_id,
+                notifier_profile,
+                int(event_id),
+            ),
         ).fetchall()
         if len(receipts) != 1:
             raise ValueError("expected one unambiguous matching subscription receipt")
         receipt = receipts[0]
-        actual_route = (
-            receipt["platform"],
-            receipt["chat_id"],
-            receipt["thread_id"] or "",
-            receipt["notifier_profile"],
-        )
-        if actual_route != (platform, chat_id, thread_id, notifier_profile):
-            raise ValueError("subscription receipt does not match the requested route")
         if receipt["pending_event_id"] is not None or int(receipt["last_event_id"]) < int(event_id):
             raise ValueError("subscription receipt is not durably acknowledged")
         message_id = str(receipt["message_id"])
