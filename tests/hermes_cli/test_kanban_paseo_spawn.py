@@ -194,6 +194,88 @@ def test_no_max_runtime_derives_fallback_deadline(monkeypatch, tmp_path):
     assert abs(deadline - expected) < 60
 
 
+def test_no_max_runtime_fallback_deadline_is_config_tunable(monkeypatch, tmp_path):
+    """kanban.default_max_runtime_seconds overrides the 7200s fallback bound
+    for deadline-less tasks (two E2E tasks doing legitimate work timed out at
+    exactly ~7200s under the hardcoded constant)."""
+    import dataclasses
+    import time as _time
+
+    root = _profile_home(tmp_path, monkeypatch)
+    root.joinpath("config.yaml").write_text(
+        "toolsets:\n  - kanban\nkanban:\n  default_max_runtime_seconds: 10800\n",
+        encoding="utf-8",
+    )
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    calls = _install_fake_paseo(monkeypatch)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    task = dataclasses.replace(_make_task(kb), max_runtime_seconds=None)
+    paseo_spawn.spawn_via_paseo(task, str(workspace), board=None)
+
+    watch_cmd = calls["popen"][0]
+    deadline = float(watch_cmd[watch_cmd.index("--deadline") + 1])
+    expected = _time.time() + 10800 + 300
+    assert abs(deadline - expected) < 60
+
+
+def test_explicit_max_runtime_beats_configured_default(monkeypatch, tmp_path):
+    """A per-task max_runtime_seconds always wins over the configured fallback."""
+    import time as _time
+
+    root = _profile_home(tmp_path, monkeypatch)
+    root.joinpath("config.yaml").write_text(
+        "toolsets:\n  - kanban\nkanban:\n  default_max_runtime_seconds: 10800\n",
+        encoding="utf-8",
+    )
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    calls = _install_fake_paseo(monkeypatch)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
+
+    watch_cmd = calls["popen"][0]
+    deadline = float(watch_cmd[watch_cmd.index("--deadline") + 1])
+    assert abs(deadline - (_time.time() + 1800 + 300)) < 60
+
+
+def test_default_worker_max_runtime_seconds_fallback_and_validation(monkeypatch, tmp_path):
+    """Helper unit: config value wins when positive; missing/invalid/zero
+    values fall back to the canonical 7200s constant."""
+    _profile_home(tmp_path, monkeypatch)
+    from hermes_cli import config as hconfig
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(
+        hconfig, "load_config",
+        lambda: {"kanban": {"default_max_runtime_seconds": 4321}},
+    )
+    assert kb.default_worker_max_runtime_seconds() == 4321
+
+    monkeypatch.setattr(hconfig, "load_config", lambda: {"kanban": {}})
+    assert kb.default_worker_max_runtime_seconds() == kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS
+
+    monkeypatch.setattr(
+        hconfig, "load_config",
+        lambda: {"kanban": {"default_max_runtime_seconds": 0}},
+    )
+    assert kb.default_worker_max_runtime_seconds() == kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS
+
+    monkeypatch.setattr(
+        hconfig, "load_config",
+        lambda: {"kanban": {"default_max_runtime_seconds": "not-a-number"}},
+    )
+    assert kb.default_worker_max_runtime_seconds() == kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS
+
+
 def test_watcher_receives_idle_stall_default(monkeypatch, tmp_path):
     """The watcher is spawned with the default idle-stall threshold (FIX 1)."""
     _profile_home(tmp_path, monkeypatch)

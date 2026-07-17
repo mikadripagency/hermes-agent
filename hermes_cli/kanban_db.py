@@ -232,6 +232,29 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 DEFAULT_WORKER_MAX_RUNTIME_SECONDS = 7200
 
 
+def default_worker_max_runtime_seconds() -> int:
+    """Config-tunable fallback worker runtime bound.
+
+    Reads ``kanban.default_max_runtime_seconds`` (profile config wins via the
+    normal ``load_config`` merge); any missing/invalid/non-positive value
+    falls back to :data:`DEFAULT_WORKER_MAX_RUNTIME_SECONDS` (7200s). Two
+    E2E tasks doing legitimate work timed out at exactly ~7200s because the
+    bound was hardcoded — profiles running long-lived workers can now raise
+    it without touching every task's ``max_runtime_seconds``. A per-task
+    ``max_runtime_seconds`` always takes precedence over this fallback.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        kanban_cfg = (load_config().get("kanban") or {})
+        value = int(kanban_cfg.get("default_max_runtime_seconds") or 0)
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return DEFAULT_WORKER_MAX_RUNTIME_SECONDS
+
+
 # Sentinel exit code a kanban worker uses to signal "I bailed because the
 # provider rate-limited / exhausted quota, not because the task failed."
 # The dispatcher's reap classifier maps this to a ``rate_limited`` exit kind

@@ -1087,7 +1087,8 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
 
         # Watch-loop deadline: task max runtime + slack. A task with no
         # explicit max_runtime still gets a bounded deadline from the canonical
-        # fallback (kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS, the same 7200s bound
+        # fallback (kb.default_worker_max_runtime_seconds(), config-tunable via
+        # kanban.default_max_runtime_seconds, default 7200s — the same bound
         # the sentinel/dispatcher use) rather than being spawned deadline-less
         # (t_05292e4e's default-profile watcher hung unbounded with no
         # --deadline). The soft-stall check still catches idle-frozen workers
@@ -1095,7 +1096,7 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
         import time
 
         max_runtime = getattr(task, "max_runtime_seconds", None)
-        effective_runtime = int(max_runtime) if max_runtime else kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS
+        effective_runtime = int(max_runtime) if max_runtime else kb.default_worker_max_runtime_seconds()
         deadline = time.time() + effective_runtime + int(slack)
 
         run_id = getattr(task, "current_run_id", None)

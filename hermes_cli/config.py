@@ -2771,6 +2771,12 @@ DEFAULT_CONFIG = {
         # channel the route is silently skipped.
         "orchestration_channel": "orchestration",
         "orchestration_platform": "slack",
+        # Fallback worker runtime bound (seconds) applied when a task
+        # carries no explicit ``max_runtime_seconds`` — the watcher deadline
+        # for deadline-less tasks. A per-task max_runtime_seconds always
+        # wins. Mirrors the kanban sentinel's default; keep the two in sync
+        # (the sentinel reads this key from the profile config too).
+        "default_max_runtime_seconds": 7200,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
