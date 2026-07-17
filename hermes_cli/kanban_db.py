@@ -4304,6 +4304,37 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        completed_event_id = int(
+            conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        )
+        # Durable completion-delivery ledger row at done-time, pending until
+        # a notifier records the real platform receipt
+        # (acknowledge_completion_delivery). Written unconditionally for
+        # EVERY task — no task-kind gating, legacy rows included — so the
+        # ledger is the primary record of "was the Done ping delivered?" and
+        # notify-reconcile stays a backstop for historical sends only.
+        conn.execute(
+            "INSERT OR IGNORE INTO completion_deliveries "
+            "(event_id, task_id, handoff_version, state, created_at) "
+            "VALUES (?, ?, ?, 'pending', ?)",
+            (
+                completed_event_id,
+                task_id,
+                _task_handoff_version(conn, task_id),
+                now,
+            ),
+        )
+    # Always resolve the shared orchestration route at done-time so the
+    # completion ping reaches the orchestration channel and not only the
+    # origin thread (t_18088232). Best-effort in its own txn: a routing
+    # failure must never un-complete the task.
+    try:
+        ensure_orchestration_completion_sub(conn, task_id, completed_event_id)
+    except Exception as exc:
+        _log.debug(
+            "orchestration completion route for %s not installed: %s",
+            task_id, exc,
+        )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -8644,6 +8675,216 @@ def list_notify_subs(
     else:
         rows = conn.execute("SELECT * FROM kanban_notify_subs").fetchall()
     return [dict(r) for r in rows]
+
+
+def _task_handoff_version(conn: sqlite3.Connection, task_id: str) -> int:
+    """Read ``tasks.handoff_version`` when the column exists (added by ops
+    tooling on some deployments), else 1. Mirrors the PRAGMA-driven lookup
+    :func:`reconcile_completion_delivery` uses so ledger rows written at
+    done-time and rows written by the reconcile backstop agree."""
+    try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        if "handoff_version" in columns:
+            row = conn.execute(
+                "SELECT handoff_version FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is not None and row["handoff_version"] is not None:
+                return int(row["handoff_version"])
+    except Exception:
+        pass
+    return 1
+
+
+def _resolve_orchestration_chat_id(platform: str, channel: str) -> Optional[str]:
+    """Resolve the configured orchestration channel to a platform chat id.
+
+    Reads ``<hermes_home>/channel_directory.json`` at call time (NOT via
+    ``gateway.channel_directory``, whose ``DIRECTORY_PATH`` is captured at
+    import time — worker/CLI processes and tests would otherwise see a stale
+    home). Accepts either a raw platform id (exact match against directory
+    entries, or any string that is not resolvable as a name but present as
+    an entry id) or a case-insensitive channel name. Returns ``None`` when
+    the directory is missing or the channel is unknown.
+    """
+    try:
+        from hermes_cli.config import get_hermes_home
+
+        directory_file = get_hermes_home() / "channel_directory.json"
+        if not directory_file.exists():
+            return None
+        with open(directory_file, encoding="utf-8") as fh:
+            data = json.load(fh)
+        entries = (data.get("platforms") or {}).get(platform) or []
+    except Exception:
+        return None
+    wanted = channel.strip().lstrip("#")
+    for entry in entries:
+        if entry.get("id") == wanted:
+            return str(entry["id"])
+    lowered = wanted.lower()
+    for entry in entries:
+        if str(entry.get("name") or "").strip().lstrip("#").lower() == lowered:
+            return str(entry["id"])
+    return None
+
+
+def ensure_orchestration_completion_sub(
+    conn: sqlite3.Connection, task_id: str, completed_event_id: int
+) -> bool:
+    """Ensure the shared orchestration channel is subscribed to *task_id*'s
+    completion.
+
+    Called from :func:`complete_task` at done-time so the terminal
+    ``completed`` event always reaches the orchestration channel, not only
+    the origin DM/thread subscription (evidence: t_18088232's completed
+    event 6582 was delivered solely to the creator's thread). The route is
+    resolved from ``kanban.orchestration_channel`` (a channel-directory name
+    or raw chat id; empty string disables) on
+    ``kanban.orchestration_platform`` (default ``slack``).
+
+    The subscription cursor starts at ``completed_event_id - 1`` so exactly
+    the completion (and nothing from the task's earlier terminal-kind
+    history) is delivered. Idempotent: an existing subscription row for the
+    same route keeps its cursor. Returns True when a new row was inserted.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    except Exception:
+        kcfg = {}
+    channel = str(kcfg.get("orchestration_channel", "orchestration") or "").strip()
+    if not channel:
+        return False
+    platform = str(kcfg.get("orchestration_platform", "slack") or "slack").strip().lower()
+    chat_id = _resolve_orchestration_chat_id(platform, channel)
+    if not chat_id:
+        return False
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_notify_subs
+                (task_id, platform, chat_id, thread_id, last_event_id, created_at)
+            VALUES (?, ?, ?, '', ?, ?)
+            """,
+            (task_id, platform, chat_id, max(0, int(completed_event_id) - 1), now),
+        )
+    return cur.rowcount > 0
+
+
+def acknowledge_completion_delivery(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: str = "",
+    notifier_profile: Optional[str] = None,
+    receipt_id: str,
+) -> bool:
+    """Primary done-time ledger acknowledgement for a delivered completion.
+
+    Called by the gateway notifier immediately after a successful send of a
+    ``completed`` event returned a real platform receipt. Upgrades the
+    pending ``completion_deliveries`` row :func:`complete_task` wrote at
+    done-time (or inserts an acknowledged row when none exists, e.g. rows
+    completed before this ledger shipped). Applies to EVERY task — there is
+    no task-kind gating, so legacy tasks get their acknowledgement too.
+    :func:`reconcile_completion_delivery` remains the manual backstop for
+    historical sends; this is the primary path.
+
+    Idempotent, and never raises on conflicts: a row already acknowledged
+    for a different route keeps its first receipt and this call returns
+    False, so the notifier loop cannot wedge on ledger bookkeeping.
+    """
+    task_id = str(task_id or "").strip()
+    platform = str(platform or "").strip().lower()
+    chat_id = str(chat_id or "").strip()
+    thread_id = str(thread_id or "").strip()
+    notifier_profile = str(notifier_profile or "").strip()
+    receipt_id = str(receipt_id or "").strip()
+    if not task_id or not chat_id or not receipt_id:
+        return False
+    now = int(time.time())
+    with write_txn(conn):
+        event = conn.execute(
+            "SELECT 1 FROM task_events WHERE id = ? AND task_id = ? "
+            "AND kind = 'completed'",
+            (int(event_id), task_id),
+        ).fetchone()
+        if event is None:
+            return False
+        existing = conn.execute(
+            "SELECT * FROM completion_deliveries WHERE event_id = ?",
+            (int(event_id),),
+        ).fetchone()
+        if existing is not None:
+            same_route = (
+                existing["task_id"] == task_id
+                and (existing["platform"] or "") in ("", platform)
+                and (existing["chat_id"] or "") in ("", chat_id)
+                and (existing["thread_id"] or "") in ("", thread_id)
+                and (existing["notifier_profile"] or "") in ("", notifier_profile)
+            )
+            if existing["state"] == "acknowledged":
+                # First receipt wins; a repeat of the same ack is idempotent.
+                return bool(
+                    same_route and (existing["receipt_id"] or "") == receipt_id
+                )
+            if existing["state"] != "pending" or not same_route:
+                return False
+            conn.execute(
+                "UPDATE completion_deliveries SET platform = ?, chat_id = ?, "
+                "thread_id = ?, notifier_profile = ?, state = 'acknowledged', "
+                "receipt_id = ?, acknowledged_at = ? WHERE event_id = ? "
+                "AND state = 'pending'",
+                (
+                    platform,
+                    chat_id,
+                    thread_id,
+                    notifier_profile,
+                    receipt_id,
+                    now,
+                    int(event_id),
+                ),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO completion_deliveries "
+                "(event_id, task_id, handoff_version, platform, chat_id, "
+                "thread_id, notifier_profile, state, receipt_id, created_at, "
+                "acknowledged_at) VALUES (?, ?, ?, ?, ?, ?, ?, "
+                "'acknowledged', ?, ?, ?)",
+                (
+                    int(event_id),
+                    task_id,
+                    _task_handoff_version(conn, task_id),
+                    platform,
+                    chat_id,
+                    thread_id,
+                    notifier_profile,
+                    receipt_id,
+                    now,
+                    now,
+                ),
+            )
+        _append_event(
+            conn,
+            task_id,
+            "completion_delivery_acknowledged",
+            {
+                "completed_event_id": int(event_id),
+                "platform": platform,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "notifier_profile": notifier_profile,
+                "message_id": receipt_id,
+            },
+        )
+    return True
 
 
 def reconcile_completion_delivery(

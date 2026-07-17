@@ -174,6 +174,52 @@ def test_slack_completion_without_receipt_stays_retryable(tmp_path, monkeypatch)
     assert [ev.kind for ev in _unseen_events_at(tid, "slack", "C123")] == ["completed"]
 
 
+def test_slack_completion_delivery_acknowledges_ledger_row(tmp_path, monkeypatch):
+    """Primary done-time path: a delivered completion with a real Slack
+    receipt upgrades the pending completion_deliveries row complete_task
+    wrote, without any manual notify-reconcile."""
+    db_path = tmp_path / "ledger-ack.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="ledger ack", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="C0LEDGER")
+        kb.complete_task(conn, tid, summary="done")
+        event_id = next(
+            ev.id for ev in kb.list_events(conn, tid) if ev.kind == "completed"
+        )
+        pending = conn.execute(
+            "SELECT state FROM completion_deliveries WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        assert pending["state"] == "pending"
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter, Platform.SLACK)))
+
+    assert len(adapter.sent) == 1
+    conn = kb.connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM completion_deliveries WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        assert row["state"] == "acknowledged"
+        assert row["receipt_id"] == "1783796000.123456"
+        assert row["chat_id"] == "C0LEDGER"
+        assert row["platform"] == "slack"
+        acked = [
+            ev for ev in kb.list_events(conn, tid)
+            if ev.kind == "completion_delivery_acknowledged"
+        ]
+        assert len(acked) == 1
+    finally:
+        conn.close()
+
+
 def _unseen_events_at(tid, platform, chat_id):
     conn = kb.connect()
     try:

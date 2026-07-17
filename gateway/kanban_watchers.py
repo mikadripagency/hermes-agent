@@ -358,6 +358,10 @@ class GatewayKanbanWatchersMixin:
                     board_tag = f"[{board_slug}] " if board_slug else ""
                     receipt_id = None
                     receipt_event_id = None
+                    # (event_id, message_id) of a successfully delivered
+                    # ``completed`` event — feeds the durable
+                    # completion_deliveries ledger acknowledgement below.
+                    completed_receipt = None
                     for ev in d["events"]:
                         kind = ev.kind
                         # Silent-until-Done delivery profile for
@@ -451,6 +455,8 @@ class GatewayKanbanWatchersMixin:
                                 raise RuntimeError("Slack completion send returned no message receipt")
                             if message_id:
                                 receipt_id, receipt_event_id = str(message_id), ev.id
+                            if message_id and kind == "completed":
+                                completed_receipt = (ev.id, str(message_id))
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
@@ -514,6 +520,19 @@ class GatewayKanbanWatchersMixin:
                             self._kanban_advance, sub, d["cursor"], board_slug,
                             receipt_id, receipt_event_id,
                         )
+                        # Primary done-time ledger acknowledgement: record the
+                        # real platform receipt on the completion_deliveries
+                        # row complete_task wrote at done-time. Applies to
+                        # every task (no task-kind gating); notify-reconcile
+                        # stays the manual backstop for historical sends.
+                        if completed_receipt is not None:
+                            await asyncio.to_thread(
+                                self._kanban_ack_completion,
+                                sub,
+                                board_slug,
+                                completed_receipt[0],
+                                completed_receipt[1],
+                            )
                         # developer-assigned tasks are silent-until-Done, so
                         # only a completion is allowed to wake the creator;
                         # other terminal kinds are handled internally.
@@ -625,6 +644,39 @@ class GatewayKanbanWatchersMixin:
             )
         finally:
             conn.close()
+
+    def _kanban_ack_completion(
+        self,
+        sub: dict,
+        board: Optional[str],
+        event_id: int,
+        receipt_id: str,
+    ) -> None:
+        """Sync helper: acknowledge a delivered completion in the durable
+        ``completion_deliveries`` ledger. Runs in to_thread. Best-effort —
+        the notification itself already delivered and the cursor advanced,
+        so a ledger bookkeeping failure must never wedge the tick."""
+        from hermes_cli import kanban_db as _kb
+        try:
+            conn = _kb.connect(board=board)
+            try:
+                _kb.acknowledge_completion_delivery(
+                    conn,
+                    task_id=sub["task_id"],
+                    event_id=int(event_id),
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                    notifier_profile=sub.get("notifier_profile") or "",
+                    receipt_id=receipt_id,
+                )
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: completion ledger ack failed for %s event %s: %s",
+                sub.get("task_id"), event_id, exc,
+            )
 
     def _kanban_unsub(self, sub: dict, board: Optional[str] = None) -> None:
         from hermes_cli import kanban_db as _kb

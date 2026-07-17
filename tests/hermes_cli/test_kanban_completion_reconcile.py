@@ -114,21 +114,24 @@ def test_reconcile_completion_delivery_rejects_event_route_and_profile_mismatch(
         task_id, event_id = _seed_completed_receipt(conn)
         with pytest.raises(ValueError):
             _reconcile(conn, task_id, event_id, **overrides)
+        # complete_task writes a pending done-time ledger row; a rejected
+        # reconcile must never have acknowledged it.
         assert conn.execute(
-            "SELECT COUNT(*) FROM completion_deliveries"
+            "SELECT COUNT(*) FROM completion_deliveries WHERE state = 'acknowledged'"
         ).fetchone()[0] == 0
 
 
 def test_reconcile_completion_delivery_rejects_conflicting_existing_delivery(kanban_home):
     with kb.connect_closing() as conn:
         task_id, event_id = _seed_completed_receipt(conn)
+        # Turn the done-time pending row into a conflicting acknowledged
+        # delivery on another route.
         conn.execute(
-            "INSERT INTO completion_deliveries "
-            "(event_id, task_id, handoff_version, platform, chat_id, thread_id, "
-            "notifier_profile, state, receipt_id, created_at, acknowledged_at) "
-            "VALUES (?, ?, 1, 'slack', 'COTHER', '', 'developer', "
-            "'acknowledged', 'different-receipt', 1, 1)",
-            (event_id, task_id),
+            "UPDATE completion_deliveries SET platform = 'slack', "
+            "chat_id = 'COTHER', thread_id = '', notifier_profile = 'developer', "
+            "state = 'acknowledged', receipt_id = 'different-receipt', "
+            "acknowledged_at = 1 WHERE event_id = ?",
+            (event_id,),
         )
 
         with pytest.raises(ValueError, match="conflicting"):
@@ -162,7 +165,7 @@ def test_reconcile_completion_delivery_rejects_in_flight_receipt(kanban_home):
         with pytest.raises(ValueError, match="not durably acknowledged"):
             _reconcile(conn, task_id, event_id)
         assert conn.execute(
-            "SELECT COUNT(*) FROM completion_deliveries"
+            "SELECT COUNT(*) FROM completion_deliveries WHERE state = 'acknowledged'"
         ).fetchone()[0] == 0
 
 

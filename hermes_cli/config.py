@@ -2763,6 +2763,14 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Shared orchestration channel that always receives the terminal
+        # ``completed`` notification for every task, in addition to any
+        # creator/thread subscriptions. Resolved at completion time against
+        # the channel directory (a raw platform chat id also works). Empty
+        # string disables the auto-route; when the directory has no such
+        # channel the route is silently skipped.
+        "orchestration_channel": "orchestration",
+        "orchestration_platform": "slack",
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
