@@ -2229,21 +2229,41 @@ def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path
     assert ws != repo  # not the shared default verbatim
 
 
-def test_worktree_no_path_no_board_default_raises(kanban_home, tmp_path, monkeypatch):
-    """With neither an explicit workspace_path nor a board default_workdir,
-    resolution fails loudly pointing at default_workdir / worktree:<path> —
-    rather than silently materializing under the dispatcher's CWD (the old
-    behavior that scattered worktrees under whatever dir launched the
-    gateway)."""
-    # Park the dispatcher CWD inside a real git repo so the OLD cwd-anchored
-    # code would have "succeeded" — proving the new code does NOT use cwd.
+def test_worktree_no_path_no_board_default_rejected_at_creation(kanban_home, tmp_path, monkeypatch):
+    """With neither an explicit workspace_path, nor a project anchor, nor a
+    board default_workdir, task CREATION fails loudly pointing at --project /
+    worktree:<path> — the doomed row (spawn_failed → gave_up without a line
+    of work, t_5ee8ac9c) is never persisted."""
+    # Park the dispatcher CWD inside a real git repo so a cwd-anchored
+    # fallback would have "succeeded" — proving the guard does NOT use cwd.
     decoy_repo = tmp_path / "decoy"
     _init_git_repo(decoy_repo)
     monkeypatch.chdir(decoy_repo)
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="ship", workspace_kind="worktree")
+        with pytest.raises(ValueError, match="--project|worktree:"):
+            kb.create_task(conn, title="ship", workspace_kind="worktree")
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_worktree_legacy_row_without_path_still_fails_loudly_at_dispatch(kanban_home, tmp_path, monkeypatch):
+    """Dispatch-time backstop for legacy rows that predate the creation-time
+    guard: a persisted worktree task with NULL workspace_path and no board
+    default_workdir still fails resolution loudly (never the dispatcher CWD)."""
+    decoy_repo = tmp_path / "decoy"
+    _init_git_repo(decoy_repo)
+    monkeypatch.chdir(decoy_repo)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="ship", workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        # Simulate a legacy row created before the creation-time guard.
+        conn.execute("UPDATE tasks SET workspace_path = NULL WHERE id = ?", (t,))
+        conn.commit()
         task = kb.get_task(conn, t)
-        assert task is not None
+        assert task is not None and task.workspace_path is None
         with pytest.raises(ValueError, match="default_workdir"):
             kb.resolve_workspace(task)
 

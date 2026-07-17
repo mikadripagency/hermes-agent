@@ -2445,6 +2445,73 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _detect_registered_project_reference(
+    title: Optional[str], body: Optional[str]
+) -> Optional[dict]:
+    """Best-effort: does this task's title/body clearly reference a registered
+    project's repo?
+
+    Used by :func:`create_task` to attach an advisory ``dispatch_warning``
+    event to scratch tasks that look like they were meant to be anchored to a
+    project worktree. "Clearly" means one of, per non-archived project:
+
+    * the project's ``primary_path`` appears verbatim in the text, or
+    * the primary repo's directory basename appears as a whole word, or
+    * the project slug appears as a whole word.
+
+    Short names (< 4 chars) are skipped to avoid false positives. Any failure
+    (no projects.db, import error, malformed rows) returns ``None`` — this
+    helper must never break task creation.
+    """
+    text = " ".join(filter(None, [title or "", body or ""]))
+    if not text.strip():
+        return None
+    try:
+        from hermes_cli import projects_db as _pdb
+
+        with _pdb.connect_closing() as pconn:
+            projects = _pdb.list_projects(pconn)
+    except Exception:
+        return None
+    lowered = text.lower()
+    for project in projects:
+        try:
+            primary = str(getattr(project, "primary_path", "") or "")
+            slug = str(getattr(project, "slug", "") or "")
+            candidates: list[tuple[str, str]] = []
+            if primary:
+                candidates.append(("primary_path", primary))
+                basename = os.path.basename(primary.rstrip("/"))
+                if len(basename) >= 4:
+                    candidates.append(("repo_basename", basename))
+            if len(slug) >= 4:
+                candidates.append(("slug", slug))
+            for matched_by, needle in candidates:
+                if matched_by == "primary_path":
+                    if needle.lower() in lowered:
+                        return {
+                            "project_id": project.id,
+                            "project_slug": slug or None,
+                            "matched_by": matched_by,
+                            "matched_text": needle,
+                        }
+                    continue
+                if re.search(
+                    r"(?<![\w/])" + re.escape(needle) + r"(?![\w-])",
+                    text,
+                    re.IGNORECASE,
+                ):
+                    return {
+                        "project_id": project.id,
+                        "project_slug": slug or None,
+                        "matched_by": matched_by,
+                        "matched_text": needle,
+                    }
+        except Exception:
+            continue
+    return None
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2635,6 +2702,36 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    # Fail at creation, not at dispatch: a worktree task that has no
+    # resolvable anchor — no explicit workspace_path, no project primary
+    # repo, and no board default_workdir — can never be dispatched.
+    # ``resolve_workspace`` raises, every spawn attempt fails, and the
+    # circuit breaker eventually parks the task in blocked/gave_up without
+    # a single line of work having run (t_5ee8ac9c: workspace_kind=worktree
+    # + workspace_path=NULL + no project anchor → spawn_failed → gave_up).
+    # Reject here with an actionable message instead of persisting a row
+    # that is doomed to burn retries.
+    if workspace_kind == "worktree" and workspace_path is None and project_repo is None:
+        raise ValueError(
+            "workspace_kind='worktree' requires a workspace anchor: pass "
+            "--project <id|slug> (a registered project with a primary repo) "
+            "or an explicit --workspace worktree:<absolute-repo-path> "
+            "(or set the board's default_workdir). Without one the "
+            "dispatcher cannot resolve a repo to create the worktree in "
+            "and the task would only ever spawn_fail."
+        )
+
+    # Advisory (never rejects): a scratch task whose title/body clearly
+    # references a registered project's repo usually means the caller forgot
+    # the --project / worktree anchor — the work would land in a throwaway
+    # scratch dir and be deleted on completion. Too magical to hard-reject
+    # (prose mentions of a repo are legitimate), so we emit a
+    # ``dispatch_warning`` event on the new task instead, giving the
+    # orchestrator/dashboard a visible signal to recreate the task anchored.
+    scratch_project_hint: Optional[dict] = None
+    if workspace_kind == "scratch":
+        scratch_project_hint = _detect_registered_project_reference(title, body)
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -2742,6 +2839,23 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
+                if scratch_project_hint:
+                    _append_event(
+                        conn,
+                        task_id,
+                        "dispatch_warning",
+                        {
+                            "kind": "scratch_task_references_project",
+                            **scratch_project_hint,
+                            "hint": (
+                                "task title/body references a registered "
+                                "project's repo but workspace_kind='scratch'; "
+                                "work would land in a throwaway scratch dir. "
+                                "Recreate with --project or --workspace "
+                                "worktree:<path> if repo work is intended."
+                            ),
+                        },
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
