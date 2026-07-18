@@ -353,6 +353,27 @@ def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
         assert task.last_failure_error is None
 
 
+def test_recompute_ready_keeps_initially_blocked_task_parked(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="persistent human-ops inbox",
+            assignee="developer",
+            initial_status="blocked",
+        )
+
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "blocked"
+        assert kb.claim_task(conn, task_id, claimer="host:1") is None
+
+        assert kb.unblock_task(conn, task_id)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        assert kb.claim_task(conn, task_id, claimer="host:1") is not None
+        assert kb.claim_task(conn, task_id, claimer="host:2") is None
+
+
 def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
     with kb.connect() as conn:
         a = kb.create_task(conn, title="a")
