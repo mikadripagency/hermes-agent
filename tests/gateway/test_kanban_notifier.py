@@ -121,6 +121,20 @@ def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatc
 
     assert len(adapter1.sent) == 1
     assert adapter2.sent == []
+    conn = kb.connect()
+    try:
+        deliveries = conn.execute(
+            "SELECT state FROM completion_deliveries WHERE task_id = ?",
+            (tid,),
+        ).fetchall()
+        acknowledged = [
+            ev for ev in kb.list_events(conn, tid)
+            if ev.kind == "completion_delivery_acknowledged"
+        ]
+    finally:
+        conn.close()
+    assert [row["state"] for row in deliveries] == ["acknowledged"]
+    assert len(acknowledged) == 1
 
 
 def test_late_subscription_delivers_completion_and_records_receipt(tmp_path, monkeypatch):
@@ -167,10 +181,20 @@ def test_slack_completion_without_receipt_stays_retryable(tmp_path, monkeypatch)
     conn = kb.connect()
     try:
         sub = kb.list_notify_subs(conn, tid)[0]
+        delivery = conn.execute(
+            "SELECT state, chat_id, receipt_id FROM completion_deliveries "
+            "WHERE task_id = ?",
+            (tid,),
+        ).fetchone()
     finally:
         conn.close()
     assert sub["last_event_id"] == 0
     assert sub["last_message_id"] is None
+    assert dict(delivery) == {
+        "state": "pending",
+        "chat_id": "C123",
+        "receipt_id": None,
+    }
     assert [ev.kind for ev in _unseen_events_at(tid, "slack", "C123")] == ["completed"]
 
 
@@ -218,6 +242,57 @@ def test_slack_completion_delivery_acknowledges_ledger_row(tmp_path, monkeypatch
         assert len(acked) == 1
     finally:
         conn.close()
+
+
+def test_slack_completion_delivery_acknowledges_each_sibling_route(tmp_path, monkeypatch):
+    """Each successful destination keeps its own acknowledged receipt."""
+    db_path = tmp_path / "sibling-route-acks.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="two destinations", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="CDM")
+        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="CORCH")
+        kb.complete_task(conn, tid, summary="done")
+        event_id = next(
+            ev.id for ev in kb.list_events(conn, tid) if ev.kind == "completed"
+        )
+    finally:
+        conn.close()
+
+    class RouteReceiptAdapter(RecordingAdapter):
+        async def send(self, chat_id, text, metadata=None):
+            self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+            return SimpleNamespace(success=True, message_id=f"receipt-{chat_id}")
+
+    adapter = RouteReceiptAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter, Platform.SLACK)))
+
+    assert [item["chat_id"] for item in adapter.sent] == ["CDM", "CORCH"]
+    conn = kb.connect()
+    try:
+        rows = conn.execute(
+            "SELECT chat_id, state, receipt_id FROM completion_deliveries "
+            "WHERE event_id = ? ORDER BY chat_id",
+            (event_id,),
+        ).fetchall()
+        events = [
+            ev for ev in kb.list_events(conn, tid)
+            if ev.kind == "completion_delivery_acknowledged"
+        ]
+        reconciled = [
+            ev for ev in kb.list_events(conn, tid)
+            if ev.kind == "completion_delivery_reconciled"
+        ]
+    finally:
+        conn.close()
+    assert [dict(row) for row in rows] == [
+        {"chat_id": "CDM", "state": "acknowledged", "receipt_id": "receipt-CDM"},
+        {"chat_id": "CORCH", "state": "acknowledged", "receipt_id": "receipt-CORCH"},
+    ]
+    assert len(events) == 2
+    assert reconciled == []
 
 
 def _unseen_events_at(tid, platform, chat_id):

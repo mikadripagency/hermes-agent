@@ -121,11 +121,10 @@ def test_reconcile_completion_delivery_rejects_event_route_and_profile_mismatch(
         ).fetchone()[0] == 0
 
 
-def test_reconcile_completion_delivery_rejects_conflicting_existing_delivery(kanban_home):
+def test_reconcile_completion_delivery_preserves_sibling_route(kanban_home):
     with kb.connect_closing() as conn:
         task_id, event_id = _seed_completed_receipt(conn)
-        # Turn the done-time pending row into a conflicting acknowledged
-        # delivery on another route.
+        # Turn the done-time pending row into an acknowledged sibling route.
         conn.execute(
             "UPDATE completion_deliveries SET platform = 'slack', "
             "chat_id = 'COTHER', thread_id = '', notifier_profile = 'developer', "
@@ -134,8 +133,16 @@ def test_reconcile_completion_delivery_rejects_conflicting_existing_delivery(kan
             (event_id,),
         )
 
-        with pytest.raises(ValueError, match="conflicting"):
-            _reconcile(conn, task_id, event_id)
+        assert _reconcile(conn, task_id, event_id) == "1784203491.451939"
+        rows = conn.execute(
+            "SELECT chat_id, receipt_id FROM completion_deliveries "
+            "WHERE event_id = ? ORDER BY chat_id",
+            (event_id,),
+        ).fetchall()
+        assert [dict(row) for row in rows] == [
+            {"chat_id": "CORCH", "receipt_id": "1784203491.451939"},
+            {"chat_id": "COTHER", "receipt_id": "different-receipt"},
+        ]
 
 
 def test_reconcile_completion_delivery_rejects_task_mismatch_and_blank_receipt(kanban_home):

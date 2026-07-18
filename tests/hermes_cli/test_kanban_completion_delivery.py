@@ -11,6 +11,7 @@ upgrades to ``acknowledged`` with the real platform receipt.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -70,6 +71,53 @@ def test_complete_task_writes_pending_ledger_row_for_every_task(kanban_home):
         assert row["state"] == "pending"
         assert row["handoff_version"] == 1
         assert row["receipt_id"] is None
+
+
+def test_init_migrates_legacy_single_event_delivery_key(tmp_path, monkeypatch):
+    db_path = tmp_path / "legacy-completion-ledger.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "CREATE TABLE completion_deliveries ("
+            "event_id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, "
+            "handoff_version INTEGER NOT NULL, platform TEXT, chat_id TEXT, "
+            "thread_id TEXT, notifier_profile TEXT, "
+            "state TEXT NOT NULL DEFAULT 'pending', receipt_id TEXT, "
+            "created_at INTEGER NOT NULL, acknowledged_at INTEGER)"
+        )
+        conn.execute(
+            "INSERT INTO completion_deliveries VALUES "
+            "(42, 't_legacy', 1, 'slack', 'CDM', '', 'developer', "
+            "'acknowledged', 'legacy-receipt', 1, 2)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        pk = [
+            row["name"] for row in conn.execute(
+                "PRAGMA table_info(completion_deliveries)"
+            ) if row["pk"]
+        ]
+        preserved = conn.execute(
+            "SELECT chat_id, receipt_id FROM completion_deliveries WHERE event_id = 42"
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO completion_deliveries "
+            "(event_id, task_id, handoff_version, platform, chat_id, thread_id, "
+            "notifier_profile, state, receipt_id, created_at, acknowledged_at) "
+            "VALUES (42, 't_legacy', 1, 'slack', 'CORCH', '', 'developer', "
+            "'acknowledged', 'sibling-receipt', 1, 2)"
+        )
+        count = conn.execute(
+            "SELECT COUNT(*) FROM completion_deliveries WHERE event_id = 42"
+        ).fetchone()[0]
+    assert pk == ["event_id", "platform", "chat_id", "thread_id", "notifier_profile"]
+    assert dict(preserved) == {"chat_id": "CDM", "receipt_id": "legacy-receipt"}
+    assert count == 2
 
 
 # --- orchestration route resolution -------------------------------------------
@@ -208,7 +256,7 @@ def test_acknowledge_inserts_row_for_pre_ledger_completions(kanban_home):
         }
 
 
-def test_acknowledge_is_idempotent_and_first_receipt_wins(kanban_home):
+def test_acknowledge_is_idempotent_per_route_and_keeps_siblings_independent(kanban_home):
     with kb.connect_closing() as conn:
         tid, event_id = _complete_with_pending_row(conn)
         kwargs = dict(
@@ -226,11 +274,12 @@ def test_acknowledge_is_idempotent_and_first_receipt_wins(kanban_home):
         assert kb.acknowledge_completion_delivery(
             conn, receipt_id="first-receipt", **kwargs
         )
-        # Different receipt or route: first wins, returns False, row unchanged.
+        # A different receipt cannot overwrite this route.
         assert not kb.acknowledge_completion_delivery(
             conn, receipt_id="second-receipt", **kwargs
         )
-        assert not kb.acknowledge_completion_delivery(
+        # A sibling destination has its own receipt and audit event.
+        assert kb.acknowledge_completion_delivery(
             conn,
             task_id=tid,
             event_id=event_id,
@@ -238,16 +287,20 @@ def test_acknowledge_is_idempotent_and_first_receipt_wins(kanban_home):
             chat_id="COTHER",
             receipt_id="other-route",
         )
-        row = conn.execute(
-            "SELECT chat_id, receipt_id FROM completion_deliveries WHERE event_id = ?",
+        rows = conn.execute(
+            "SELECT chat_id, receipt_id FROM completion_deliveries "
+            "WHERE event_id = ? ORDER BY chat_id",
             (event_id,),
-        ).fetchone()
-        assert dict(row) == {"chat_id": ORCH_CHAT_ID, "receipt_id": "first-receipt"}
+        ).fetchall()
+        assert [dict(row) for row in rows] == [
+            {"chat_id": ORCH_CHAT_ID, "receipt_id": "first-receipt"},
+            {"chat_id": "COTHER", "receipt_id": "other-route"},
+        ]
         acked = [
             e for e in kb.list_events(conn, tid)
             if e.kind == "completion_delivery_acknowledged"
         ]
-        assert len(acked) == 1
+        assert len(acked) == 2
 
 
 def test_acknowledge_rejects_non_completed_event_or_wrong_task(kanban_home):
