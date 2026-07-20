@@ -148,6 +148,63 @@ def test_complete_task_installs_orchestration_subscription(kanban_home):
         assert events[0].kind == "completed"
 
 
+def test_complete_task_stamps_orchestration_route_with_closing_run_profile(kanban_home):
+    _write_channel_directory(kanban_home)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="developer delivery", assignee="developer")
+        claimed = kb.claim_task(conn, tid, claimer="developer-test")
+        assert claimed is not None
+        run_id = claimed.current_run_id
+
+        assert kb.complete_task(conn, tid, summary="done", expected_run_id=run_id)
+
+        orch = [
+            sub for sub in kb.list_notify_subs(conn, tid)
+            if sub["chat_id"] == ORCH_CHAT_ID
+        ]
+        assert len(orch) == 1
+        assert orch[0]["notifier_profile"] == "developer"
+        event_id = _completed_event_id(conn, tid)
+        delivery = conn.execute(
+            "SELECT notifier_profile, state FROM completion_deliveries "
+            "WHERE event_id = ? AND chat_id = ?",
+            (event_id, ORCH_CHAT_ID),
+        ).fetchone()
+        assert dict(delivery) == {
+            "notifier_profile": "developer",
+            "state": "pending",
+        }
+
+
+def test_completion_never_restamps_existing_receipt_as_closing_profile(kanban_home):
+    _write_channel_directory(kanban_home)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy wrong actor", assignee="developer")
+        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id=ORCH_CHAT_ID)
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_message_id = 'wrong-actor-receipt' "
+            "WHERE task_id = ? AND chat_id = ?",
+            (tid, ORCH_CHAT_ID),
+        )
+        conn.commit()
+        claimed = kb.claim_task(conn, tid, claimer="developer-test")
+        assert claimed is not None
+
+        with pytest.raises(ValueError, match="unstamped receipt"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="done",
+                expected_run_id=claimed.current_run_id,
+            )
+
+        sub = kb.list_notify_subs(conn, tid)[0]
+        task = kb.get_task(conn, tid)
+    assert sub["notifier_profile"] is None
+    assert sub["last_message_id"] == "wrong-actor-receipt"
+    assert task is not None and task.status == "running"
+
+
 def test_orchestration_subscription_is_idempotent_and_keeps_cursor(kanban_home):
     _write_channel_directory(kanban_home)
     with kb.connect_closing() as conn:

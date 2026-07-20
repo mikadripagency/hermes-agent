@@ -10,8 +10,10 @@ from hermes_cli import kanban_db as kb
 
 
 class RecordingAdapter:
-    def __init__(self):
+    def __init__(self, *, profile="default", actor="BDEFAULT"):
         self.sent = []
+        self._hermes_profile = profile
+        self._slack_auth_actors = {("TTEST", actor, f"U{actor}")}
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
@@ -565,6 +567,157 @@ def test_notifier_uses_active_profile_adapter_for_matching_owner(tmp_path, monke
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert [item["text"] for item in adapter.sent] == ["active profile fertig."]
+
+
+def test_developer_slack_completion_with_blank_profile_stays_pending(tmp_path, monkeypatch):
+    db_path = tmp_path / "blank-developer-profile.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="blank route", assignee="developer")
+        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="CORCH")
+        kb.complete_task(conn, tid, summary="done")
+        event_id = next(ev.id for ev in kb.list_events(conn, tid) if ev.kind == "completed")
+    finally:
+        conn.close()
+
+    default_adapter = RecordingAdapter(profile="default", actor="BDEFAULT")
+    runner = _make_runner(default_adapter, Platform.SLACK)
+    runner._kanban_notifier_profile = "default"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert default_adapter.sent == []
+    conn = kb.connect()
+    try:
+        delivery = conn.execute(
+            "SELECT state, notifier_profile, receipt_id FROM completion_deliveries "
+            "WHERE event_id = ? AND chat_id = 'CORCH'",
+            (event_id,),
+        ).fetchone()
+        sub = kb.list_notify_subs(conn, tid)[0]
+    finally:
+        conn.close()
+    assert dict(delivery) == {
+        "state": "pending",
+        "notifier_profile": "",
+        "receipt_id": None,
+    }
+    assert sub["last_message_id"] is None
+    assert sub["last_event_id"] == 0
+
+
+def test_developer_slack_completion_rejects_wrong_profile_actor(tmp_path, monkeypatch):
+    db_path = tmp_path / "wrong-developer-actor.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="wrong actor", assignee="developer")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="slack",
+            chat_id="CORCH",
+            notifier_profile="developer",
+        )
+        kb.complete_task(conn, tid, summary="done")
+        event_id = next(ev.id for ev in kb.list_events(conn, tid) if ev.kind == "completed")
+    finally:
+        conn.close()
+
+    wrong_adapter = RecordingAdapter(profile="default", actor="BDEFAULT")
+    runner = _make_runner(RecordingAdapter(), Platform.SLACK)
+    runner._kanban_notifier_profile = "default"
+    runner.__dict__["_profile_adapters"] = {
+        "developer": {Platform.SLACK: wrong_adapter}
+    }
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert wrong_adapter.sent == []
+    conn = kb.connect()
+    try:
+        delivery = conn.execute(
+            "SELECT state, notifier_profile, receipt_id FROM completion_deliveries "
+            "WHERE event_id = ? AND chat_id = 'CORCH'",
+            (event_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert dict(delivery) == {
+        "state": "pending",
+        "notifier_profile": "developer",
+        "receipt_id": None,
+    }
+
+
+def test_developer_slack_actor_delivers_each_sibling_exactly_once(tmp_path, monkeypatch):
+    db_path = tmp_path / "developer-sibling-actors.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="developer siblings", assignee="developer")
+        for chat_id in ("CDM", "CORCH"):
+            kb.add_notify_sub(
+                conn,
+                task_id=tid,
+                platform="slack",
+                chat_id=chat_id,
+                notifier_profile="developer",
+            )
+        kb.complete_task(conn, tid, summary="done")
+        event_id = next(ev.id for ev in kb.list_events(conn, tid) if ev.kind == "completed")
+    finally:
+        conn.close()
+
+    class RouteReceiptAdapter(RecordingAdapter):
+        async def send(self, chat_id, text, metadata=None):
+            self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+            return SimpleNamespace(success=True, message_id=f"receipt-{chat_id}")
+
+    default_adapter = RecordingAdapter(profile="default", actor="BDEFAULT")
+    developer_adapter = RouteReceiptAdapter(profile="developer", actor="BDEVELOPER")
+    runner = _make_runner(default_adapter, Platform.SLACK)
+    runner._kanban_notifier_profile = "default"
+    runner.__dict__["_profile_adapters"] = {
+        "developer": {Platform.SLACK: developer_adapter}
+    }
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert default_adapter.sent == []
+    assert [item["chat_id"] for item in developer_adapter.sent] == ["CDM", "CORCH"]
+    conn = kb.connect()
+    try:
+        rows = conn.execute(
+            "SELECT chat_id, notifier_profile, state, receipt_id "
+            "FROM completion_deliveries WHERE event_id = ? ORDER BY chat_id",
+            (event_id,),
+        ).fetchall()
+        ack_events = [
+            ev for ev in kb.list_events(conn, tid)
+            if ev.kind == "completion_delivery_acknowledged"
+        ]
+    finally:
+        conn.close()
+    assert [dict(row) for row in rows] == [
+        {
+            "chat_id": "CDM",
+            "notifier_profile": "developer",
+            "state": "acknowledged",
+            "receipt_id": "receipt-CDM",
+        },
+        {
+            "chat_id": "CORCH",
+            "notifier_profile": "developer",
+            "state": "acknowledged",
+            "receipt_id": "receipt-CORCH",
+        },
+    ]
+    assert len(ack_events) == 2
 
 
 def _unseen_terminal_events_for(tid, chat_id):
