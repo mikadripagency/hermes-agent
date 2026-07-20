@@ -32,14 +32,18 @@ def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=No
     )
 
 
+def _deliverable(title, **kwargs):
+    return {"title": title, "work_type": "independent_deliverable", **kwargs}
+
+
 def test_decompose_creates_children_and_promotes_root(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn, title="ship a feature")
         assert kb.get_task(conn, tid).status == "triage"
 
     children = [
-        {"title": "research", "body": "look at prior art", "assignee": "researcher", "parents": []},
-        {"title": "build it", "body": "write code", "assignee": "engineer", "parents": [0]},
+        _deliverable("research", body="look at prior art", assignee="researcher", parents=[]),
+        _deliverable("build it", body="write code", assignee="engineer", parents=[0]),
     ]
     with kb.connect() as conn:
         child_ids = kb.decompose_triage_task(
@@ -130,6 +134,27 @@ def test_decompose_rejects_out_of_range_parent(kanban_home):
                 children=[{"title": "x", "parents": [5]}],
                 author="me",
             )
+
+
+def test_decompose_rejects_lifecycle_phase_children(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        with pytest.raises(ValueError, match="independently ownable work"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orch",
+                children=[{
+                    "title": "QA and deploy",
+                    "work_type": "lifecycle_phase",
+                }],
+                author="me",
+            )
+
+        root = kb.get_task(conn, tid)
+        assert root is not None
+        assert root.status == "triage"
+        assert [task.id for task in kb.list_tasks(conn)] == [tid]
 
 
 def test_decompose_rejects_cyclic_parents(kanban_home):

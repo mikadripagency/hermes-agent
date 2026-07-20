@@ -82,8 +82,27 @@ def test_decompose_with_fanout_creates_children(kanban_home):
         "fanout": True,
         "rationale": "test split",
         "tasks": [
-            {"title": "research", "body": "look it up", "assignee": "researcher", "parents": []},
-            {"title": "build", "body": "code it", "assignee": "engineer", "parents": [0]},
+            {
+                "title": "ship API",
+                "body": "deliver the API",
+                "assignee": "engineer",
+                "work_type": "independent_deliverable",
+                "parents": [],
+            },
+            {
+                "title": "publish guide",
+                "body": "deliver the guide",
+                "assignee": "researcher",
+                "work_type": "independent_deliverable",
+                "parents": [],
+            },
+            {
+                "title": "validate API contract",
+                "body": "specialist contract validation",
+                "assignee": "researcher",
+                "work_type": "specialist_work",
+                "parents": [0],
+            },
         ],
     })
 
@@ -99,17 +118,77 @@ def test_decompose_with_fanout_creates_children(kanban_home):
 
     assert outcome.ok, outcome.reason
     assert outcome.fanout is True
-    assert outcome.child_ids and len(outcome.child_ids) == 2
+    assert outcome.child_ids and len(outcome.child_ids) == 3
 
     with kb.connect() as conn:
         root = kb.get_task(conn, tid)
         c0 = kb.get_task(conn, outcome.child_ids[0])
         c1 = kb.get_task(conn, outcome.child_ids[1])
+        c2 = kb.get_task(conn, outcome.child_ids[2])
     assert root.status == "todo"
     assert c0.status == "ready"
-    assert c1.status == "todo"
-    assert c0.assignee == "researcher"
-    assert c1.assignee == "engineer"
+    assert c1.status == "ready"
+    assert c2.status == "todo"
+    assert c0.assignee == "engineer"
+    assert c1.assignee == "researcher"
+    assert c2.assignee == "researcher"
+
+
+def test_decompose_keeps_delivery_lifecycle_on_canonical_card(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Ship user ticket SHI-037",
+            body="Implement and deliver the requested UI change.",
+            triage=True,
+        )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "serial delivery phases",
+        "tasks": [
+            {
+                "title": "Implement UI",
+                "body": "Build the change.",
+                "assignee": "engineer",
+                "work_type": "lifecycle_phase",
+                "parents": [],
+            },
+            {
+                "title": "QA and review",
+                "body": "Test and review the implementation.",
+                "assignee": "reviewer",
+                "work_type": "lifecycle_phase",
+                "parents": [0],
+            },
+            {
+                "title": "Correct icon colour and deploy",
+                "body": "Apply cosmetic feedback, merge, deploy, and smoke test.",
+                "assignee": "engineer",
+                "work_type": "lifecycle_phase",
+                "parents": [1],
+            },
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "engineer", "reviewer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is False
+    assert outcome.child_ids is None
+    with kb.connect() as conn:
+        projected_tasks = kb.list_tasks(conn)
+        root = kb.get_task(conn, tid)
+    assert [task.id for task in projected_tasks] == [tid]
+    assert root.status == "ready"
 
 
 def test_decompose_fanout_false_assigns_default_when_unassigned(kanban_home):
@@ -259,7 +338,13 @@ def test_decompose_unknown_assignee_falls_back_to_default(kanban_home):
         "fanout": True,
         "rationale": "test",
         "tasks": [
-            {"title": "do X", "body": "", "assignee": "made_up", "parents": []},
+            {
+                "title": "do X",
+                "body": "",
+                "assignee": "made_up",
+                "work_type": "independent_deliverable",
+                "parents": [],
+            },
         ],
     })
 
