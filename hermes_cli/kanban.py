@@ -1439,6 +1439,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
             order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id,
             current_step_key=args.current_step_key,
+            include_system=False,
         )
     if getattr(args, "json", False):
         print(json.dumps([_task_to_dict(t) for t in tasks], indent=2, ensure_ascii=False))

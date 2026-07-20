@@ -379,6 +379,7 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
 def get_board(
     tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
     include_archived: bool = Query(False),
+    include_system: bool = Query(False, description="Include system/inbox tasks"),
     board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
     workflow_template_id: Optional[str] = Query(
         None, description="Restrict to tasks using this workflow template id",
@@ -405,6 +406,7 @@ def get_board(
             include_archived=include_archived,
             workflow_template_id=workflow_template_id,
             current_step_key=current_step_key,
+            include_system=include_system,
         )
         # Pre-fetch link counts per task (cheap: one query).
         link_counts: dict[str, dict[str, int]] = {}
@@ -485,7 +487,9 @@ def get_board(
         tenants = [
             r["tenant"]
             for r in conn.execute(
-                "SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant"
+                "SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL "
+                + ("" if include_system else "AND task_kind != 'system_inbox' ")
+                + "ORDER BY tenant"
             )
         ]
         # List of distinct assignees for the lane-by-profile sub-grouping.
@@ -493,7 +497,9 @@ def get_board(
             r["assignee"]
             for r in conn.execute(
                 "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL "
-                "AND status != 'archived' ORDER BY assignee"
+                "AND status != 'archived' "
+                + ("" if include_system else "AND task_kind != 'system_inbox' ")
+                + "ORDER BY assignee"
             )
         ]
 
@@ -592,6 +598,7 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
+    task_kind: str = "delivery"
 
 
 @router.post("/tasks")
@@ -616,6 +623,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
+            task_kind=payload.task_kind,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
