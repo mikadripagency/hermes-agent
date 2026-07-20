@@ -202,6 +202,29 @@ async def test_notification_send_binds_matching_actor_and_workspace_client(adapt
     primary_client.chat_postMessage.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_notification_send_does_not_use_pending_slash_response(adapter):
+    client = AsyncMock()
+    client.chat_postMessage.return_value = {"ts": "receipt-notifier"}
+    adapter._app.client = client
+    actor = ("TPRIMARY", "BPRIMARY", "UPRIMARY")
+    adapter._team_clients = {"TPRIMARY": client}
+    adapter._primary_slack_auth_actor = actor
+    adapter._pop_slash_context = MagicMock(return_value={"response_url": "ignored"})
+    adapter._send_slash_ephemeral = AsyncMock()
+
+    result = await adapter.send(
+        "CORCH",
+        "done",
+        metadata={"_slack_auth_actor": actor},
+    )
+
+    assert result.success and result.message_id == "receipt-notifier"
+    adapter._pop_slash_context.assert_not_called()
+    adapter._send_slash_ephemeral.assert_not_awaited()
+    client.chat_postMessage.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # TestSlashCommandSessionIsolation
 # ---------------------------------------------------------------------------

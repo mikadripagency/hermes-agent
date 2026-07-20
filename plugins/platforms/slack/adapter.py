@@ -1389,12 +1389,15 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            expected_actor = (metadata or {}).get("_slack_auth_actor")
             # Check for a pending slash-command context.  When the user ran a
             # native slash command (e.g. /q, /stop, /model), the initial ack
             # already showed an ephemeral "Running /cmd…" message.  If we have
             # a stashed response_url for this channel, replace that ack with
             # the actual command reply ephemerally instead of posting publicly.
-            slash_ctx = self._pop_slash_context(chat_id)
+            # Actor-bound notifier sends must use the selected WebClient instead:
+            # a stale slash context is not the authenticated route we validated.
+            slash_ctx = None if expected_actor else self._pop_slash_context(chat_id)
             if slash_ctx:
                 return await self._send_slash_ephemeral(
                     slash_ctx,
@@ -1402,7 +1405,6 @@ class SlackAdapter(BasePlatformAdapter):
                 )
 
             client = self._get_client(chat_id)
-            expected_actor = (metadata or {}).get("_slack_auth_actor")
             if (
                 expected_actor
                 and tuple(expected_actor) != self._slack_auth_actor_for_chat(chat_id)
