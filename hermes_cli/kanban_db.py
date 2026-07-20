@@ -5093,6 +5093,19 @@ def block_task(
                 {"reason": reason, "kind": kind, "recurrences": recurrences},
                 run_id=run_id,
             )
+            # Deliver this human-facing block like a completion: install a
+            # durable #orchestration subscription (cursor just before this
+            # event) and a pending delivery-ledger row so the notifier surfaces
+            # the block question to the owner and records the receipt. Closes
+            # the "silently-parked blocked task" blind spot. Only the
+            # ``blocked``-status path is delivered; ``dependency`` (todo) and
+            # the loop-breaker (triage) are intentionally excluded.
+            blocked_event_id = int(
+                conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            )
+            _install_blocked_delivery(
+                conn, task_id, blocked_event_id, int(time.time()), run_id,
+            )
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
@@ -8873,6 +8886,81 @@ def _materialize_completion_delivery_routes(
     )
 
 
+def _install_blocked_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    blocked_event_id: int,
+    created_at: int,
+    run_id: Optional[int],
+) -> None:
+    """Give a human-facing ``blocked`` event the same durable delivery
+    guarantees :func:`complete_task` gives a ``completed`` event.
+
+    Before this, a task that transitioned to ``blocked`` emitted a ``blocked``
+    event but had **no** delivery ledger row and often **no** durable
+    ``#orchestration`` subscription, so the block question never reached the
+    owner and the task sat parked and unwatched (the "silently-parked blocked
+    task" blind spot: tasks stuck 8-39h with nothing surfacing them).
+
+    Reuses the ``completion_deliveries`` ledger **without a schema change**:
+    every reader/writer of that table is scoped by ``event_id``, and both
+    :func:`acknowledge_completion_delivery` and
+    :func:`reconcile_completion_delivery` hard-filter ``kind = 'completed'``,
+    so a blocked event's rows (keyed by the blocked event's own distinct
+    ``event_id``) can never collide with, or be consumed by, the completion
+    paths. Acknowledgement of a delivered blocked event is handled by the
+    parallel :func:`acknowledge_blocked_delivery`, which mirrors the completion
+    ack but filters ``kind = 'blocked'``.
+
+    Only called for the human-facing ``blocked``-status transition (block
+    kinds ``needs_input`` / ``capability`` / ``transient`` / un-typed). It is
+    NOT called for ``dependency`` waits (they emit ``dependency_wait`` and park
+    in ``todo`` for parent-gating, no human needed) nor for the loop-breaker
+    (``block_loop_detected`` routes to ``triage``, a different bucket).
+
+    Must run inside the caller's write transaction.
+    """
+    orchestration_route = _resolve_orchestration_completion_route()
+    notifier_profile = _intended_completion_notifier_profile(
+        conn, task_id, run_id
+    )
+    if orchestration_route is not None:
+        _assert_orchestration_route_profile(
+            conn,
+            task_id,
+            platform=orchestration_route[0],
+            chat_id=orchestration_route[1],
+            notifier_profile=notifier_profile,
+        )
+    # Durable pending placeholder for the blocked event, mirroring the
+    # done-time row complete_task writes. Consumed by the notifier once the
+    # real platform receipt lands (acknowledge_blocked_delivery).
+    conn.execute(
+        "INSERT OR IGNORE INTO completion_deliveries "
+        "(event_id, task_id, handoff_version, state, created_at) "
+        "VALUES (?, ?, ?, 'pending', ?)",
+        (
+            int(blocked_event_id),
+            task_id,
+            _task_handoff_version(conn, task_id),
+            int(created_at),
+        ),
+    )
+    if orchestration_route is not None:
+        _install_orchestration_completion_sub(
+            conn,
+            task_id,
+            blocked_event_id,
+            platform=orchestration_route[0],
+            chat_id=orchestration_route[1],
+            notifier_profile=notifier_profile,
+            created_at=int(created_at),
+        )
+    _materialize_completion_delivery_routes(
+        conn, task_id, blocked_event_id, int(created_at)
+    )
+
+
 def _resolve_orchestration_chat_id(platform: str, channel: str) -> Optional[str]:
     """Resolve the configured orchestration channel to a platform chat id.
 
@@ -9148,6 +9236,124 @@ def acknowledge_completion_delivery(
             "completion_delivery_acknowledged",
             {
                 "completed_event_id": int(event_id),
+                "platform": platform,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "notifier_profile": notifier_profile,
+                "message_id": receipt_id,
+            },
+        )
+    return True
+
+
+def acknowledge_blocked_delivery(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: str = "",
+    notifier_profile: Optional[str] = None,
+    receipt_id: str,
+) -> bool:
+    """Done-time ledger acknowledgement for a delivered ``blocked`` event.
+
+    Parallel to :func:`acknowledge_completion_delivery` but for the
+    human-facing block path: called by the gateway notifier immediately after
+    a successful send of a ``blocked`` event returned a real platform receipt.
+    Upgrades the pending ``completion_deliveries`` row
+    :func:`_install_blocked_delivery` wrote at block-time (or inserts an
+    acknowledged row when none exists). Requires the event to actually be a
+    ``blocked`` event, so it can never acknowledge a completion row by mistake
+    (and the completion ack, which requires ``kind = 'completed'``, can never
+    acknowledge a blocked row).
+
+    Idempotent per destination, and never raises on conflicts: an already
+    acknowledged route keeps its first receipt, while sibling destinations
+    record independent receipts.
+    """
+    task_id = str(task_id or "").strip()
+    platform = str(platform or "").strip().lower()
+    chat_id = str(chat_id or "").strip()
+    thread_id = str(thread_id or "").strip()
+    notifier_profile = str(notifier_profile or "").strip()
+    receipt_id = str(receipt_id or "").strip()
+    if not task_id or not chat_id or not receipt_id:
+        return False
+    now = int(time.time())
+    with write_txn(conn):
+        event = conn.execute(
+            "SELECT 1 FROM task_events WHERE id = ? AND task_id = ? "
+            "AND kind = 'blocked'",
+            (int(event_id), task_id),
+        ).fetchone()
+        if event is None:
+            return False
+        route = (platform, chat_id, thread_id, notifier_profile)
+        existing = conn.execute(
+            "SELECT * FROM completion_deliveries WHERE event_id = ? "
+            "AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND notifier_profile = ?",
+            (int(event_id), *route),
+        ).fetchone()
+        if existing is not None and existing["task_id"] != task_id:
+            return False
+        if existing is not None and existing["state"] == "acknowledged":
+            # First receipt wins independently for each destination.
+            return (existing["receipt_id"] or "") == receipt_id
+        if existing is not None and existing["state"] != "pending":
+            return False
+        if existing is None:
+            # A block created before subscriptions existed keeps one route-less
+            # pending placeholder. The first real receipt consumes it; later
+            # sibling routes insert their own independent rows.
+            generic = conn.execute(
+                "SELECT 1 FROM completion_deliveries WHERE event_id = ? "
+                "AND platform = '' AND chat_id = '' AND thread_id = '' "
+                "AND notifier_profile = '' AND state = 'pending'",
+                (int(event_id),),
+            ).fetchone()
+            if generic is not None:
+                conn.execute(
+                    "UPDATE completion_deliveries SET platform = ?, chat_id = ?, "
+                    "thread_id = ?, notifier_profile = ?, state = 'acknowledged', "
+                    "receipt_id = ?, acknowledged_at = ? WHERE event_id = ? "
+                    "AND platform = '' AND chat_id = '' AND thread_id = '' "
+                    "AND notifier_profile = '' AND state = 'pending'",
+                    (*route, receipt_id, now, int(event_id)),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO completion_deliveries "
+                    "(event_id, task_id, handoff_version, platform, chat_id, "
+                    "thread_id, notifier_profile, state, receipt_id, created_at, "
+                    "acknowledged_at) VALUES (?, ?, ?, ?, ?, ?, ?, "
+                    "'acknowledged', ?, ?, ?)",
+                    (
+                        int(event_id),
+                        task_id,
+                        _task_handoff_version(conn, task_id),
+                        *route,
+                        receipt_id,
+                        now,
+                        now,
+                    ),
+                )
+        else:
+            conn.execute(
+                "UPDATE completion_deliveries SET state = 'acknowledged', "
+                "receipt_id = ?, acknowledged_at = ? WHERE event_id = ? "
+                "AND platform = ? AND chat_id = ? AND thread_id = ? "
+                "AND notifier_profile = ? AND state = 'pending'",
+                (receipt_id, now, int(event_id), *route),
+            )
+        _append_event(
+            conn,
+            task_id,
+            "blocked_delivery_acknowledged",
+            {
+                "blocked_event_id": int(event_id),
                 "platform": platform,
                 "chat_id": chat_id,
                 "thread_id": thread_id,

@@ -410,20 +410,37 @@ class GatewayKanbanWatchersMixin:
                     # ``completed`` event — feeds the durable
                     # completion_deliveries ledger acknowledgement below.
                     completed_receipt = None
+                    # Same, for a delivered ``blocked`` event — reuses the same
+                    # ledger (rows keyed by the blocked event's own event_id)
+                    # and is acknowledged via acknowledge_blocked_delivery.
+                    blocked_receipt = None
                     for ev in d["events"]:
                         kind = ev.kind
                         # Silent-until-Done delivery profile for
                         # developer-assigned tasks: internal terminal states
-                        # (blocked/gave_up/crashed/timed_out) stay on the board
+                        # (gave_up/crashed/timed_out/status) stay on the board
                         # and are escalated to Hermes, but the creator only ever
-                        # receives the "completed" ping. This is a delivery-side
-                        # skip only: the event was already claimed by
-                        # claim_unseen_events_for_sub, and because we `continue`
-                        # (rather than `break`) the loop still reaches its else
-                        # branch and _kanban_advance clears the pending claim and
-                        # advances the cursor cleanly. Completion is unaffected,
-                        # so the Slack completion receipt still records normally.
-                        if task and task.assignee == "developer" and kind != "completed":
+                        # receives the "completed" ping. EXCEPTION: a
+                        # human-facing ``blocked`` event MUST pass through even
+                        # for developer tasks — a block asks a question that only
+                        # a human/orchestrator can answer, and suppressing it
+                        # here is exactly what silently parked blocked tasks for
+                        # 8-39h (the block question never reached the owner). The
+                        # ``blocked`` event kind is emitted only for the
+                        # blocked-status transition (needs_input / capability /
+                        # transient / un-typed); ``dependency`` waits and the
+                        # loop-breaker use different kinds and never reach here.
+                        # This is a delivery-side skip only: the event was
+                        # already claimed by claim_unseen_events_for_sub, and
+                        # because we `continue` (rather than `break`) the loop
+                        # still reaches its else branch and _kanban_advance
+                        # clears the pending claim and advances the cursor
+                        # cleanly. All other kinds stay suppressed for developer.
+                        if (
+                            task
+                            and task.assignee == "developer"
+                            and kind not in ("completed", "blocked")
+                        ):
                             continue
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
@@ -513,6 +530,8 @@ class GatewayKanbanWatchersMixin:
                                 receipt_id, receipt_event_id = str(message_id), ev.id
                             if message_id and kind == "completed":
                                 completed_receipt = (ev.id, str(message_id))
+                            if message_id and kind == "blocked":
+                                blocked_receipt = (ev.id, str(message_id))
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
@@ -588,6 +607,18 @@ class GatewayKanbanWatchersMixin:
                                 board_slug,
                                 completed_receipt[0],
                                 completed_receipt[1],
+                            )
+                        # Same durable acknowledgement for a delivered blocked
+                        # event, so the block's delivery is provably recorded
+                        # and the "silently-parked blocked task" blind spot
+                        # stays closed. Best-effort, like the completion ack.
+                        if blocked_receipt is not None:
+                            await asyncio.to_thread(
+                                self._kanban_ack_blocked,
+                                sub,
+                                board_slug,
+                                blocked_receipt[0],
+                                blocked_receipt[1],
                             )
                         # developer-assigned tasks are silent-until-Done, so
                         # only a completion is allowed to wake the creator;
@@ -731,6 +762,40 @@ class GatewayKanbanWatchersMixin:
         except Exception as exc:
             logger.warning(
                 "kanban notifier: completion ledger ack failed for %s event %s: %s",
+                sub.get("task_id"), event_id, exc,
+            )
+
+    def _kanban_ack_blocked(
+        self,
+        sub: dict,
+        board: Optional[str],
+        event_id: int,
+        receipt_id: str,
+    ) -> None:
+        """Sync helper: acknowledge a delivered ``blocked`` event in the durable
+        ``completion_deliveries`` ledger (parallel to
+        :meth:`_kanban_ack_completion`). Runs in to_thread. Best-effort — the
+        notification already delivered and the cursor advanced, so a ledger
+        bookkeeping failure must never wedge the tick."""
+        from hermes_cli import kanban_db as _kb
+        try:
+            conn = _kb.connect(board=board)
+            try:
+                _kb.acknowledge_blocked_delivery(
+                    conn,
+                    task_id=sub["task_id"],
+                    event_id=int(event_id),
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                    notifier_profile=sub.get("notifier_profile") or "",
+                    receipt_id=receipt_id,
+                )
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: blocked ledger ack failed for %s event %s: %s",
                 sub.get("task_id"), event_id, exc,
             )
 
