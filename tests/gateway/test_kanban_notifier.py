@@ -4,7 +4,10 @@ from types import SimpleNamespace
 
 
 from gateway.config import Platform
-from gateway.kanban_watchers import _format_completed_message
+from gateway.kanban_watchers import (
+    _format_completed_message,
+    _slack_notification_actor_matches,
+)
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
 
@@ -14,6 +17,9 @@ class RecordingAdapter:
         self.sent = []
         self._hermes_profile = profile
         self._slack_auth_actors = {("TTEST", actor, f"U{actor}")}
+
+    def _slack_auth_actor_for_chat(self, chat_id):
+        return next(iter(self._slack_auth_actors))
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
@@ -649,6 +655,22 @@ def test_developer_slack_completion_rejects_wrong_profile_actor(tmp_path, monkey
         "notifier_profile": "developer",
         "receipt_id": None,
     }
+
+
+def test_slack_actor_guard_uses_actor_for_selected_channel_client():
+    adapter = RecordingAdapter(profile="developer", actor="BDEVELOPER")
+    adapter._slack_auth_actors = {
+        ("TPRIMARY", "", "UWRONG"),
+        ("TDEVELOPER", "BDEVELOPER", "UDEVELOPER"),
+    }
+    adapter._slack_auth_actor_for_chat = lambda chat_id: (
+        ("TDEVELOPER", "BDEVELOPER", "UDEVELOPER")
+        if chat_id == "CMAPPED"
+        else ("TPRIMARY", "", "UWRONG")
+    )
+
+    assert _slack_notification_actor_matches(adapter, "developer", "CMAPPED")
+    assert not _slack_notification_actor_matches(adapter, "developer", "CUNMAPPED")
 
 
 def test_developer_slack_actor_delivers_each_sibling_exactly_once(tmp_path, monkeypatch):

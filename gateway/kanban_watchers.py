@@ -45,13 +45,20 @@ def _is_permanent_slack_error(err: str) -> bool:
     return any(code in low for code in _PERMANENT_SLACK_ERRORS)
 
 
-def _slack_notification_actor_matches(adapter: Any, intended_profile: str) -> bool:
-    """Require a Slack adapter authenticated inside the intended profile."""
-    actors = getattr(adapter, "_slack_auth_actors", None) or ()
+def _slack_notification_actor_matches(
+    adapter: Any, intended_profile: str, chat_id: str
+) -> bool:
+    """Require the actor of the exact Slack client selected for this channel."""
+    actor_for_chat = getattr(adapter, "_slack_auth_actor_for_chat", None)
+    actor = actor_for_chat(chat_id) if callable(actor_for_chat) else None
+    if not isinstance(actor, (tuple, list)) or len(actor) != 3:
+        return False
+    _team_id, bot_id, user_id = actor
     return (
         bool(intended_profile)
         and getattr(adapter, "_hermes_profile", None) == intended_profile
-        and any(bot_id and user_id for _team_id, bot_id, user_id in actors)
+        and bool(bot_id)
+        and bool(user_id)
     )
 
 
@@ -379,7 +386,9 @@ class GatewayKanbanWatchersMixin:
                         platform_str == "slack"
                         and any(ev.kind == "completed" for ev in d["events"])
                         and (sub_profile or (task is not None and task.assignee == "developer"))
-                        and not _slack_notification_actor_matches(adapter, sub_profile)
+                        and not _slack_notification_actor_matches(
+                            adapter, sub_profile, sub["chat_id"]
+                        )
                     ):
                         logger.warning(
                             "kanban notifier: Slack actor/profile mismatch for %s; route remains pending",
@@ -481,6 +490,14 @@ class GatewayKanbanWatchersMixin:
                                 f"{sub['platform']}:{sub['chat_id']}:{sub.get('thread_id') or ''}",
                             )),
                         }
+                        if platform_str == "slack" and kind == "completed":
+                            actor_for_chat = getattr(
+                                adapter, "_slack_auth_actor_for_chat", None
+                            )
+                            if callable(actor_for_chat):
+                                actor = actor_for_chat(sub["chat_id"])
+                                if isinstance(actor, (tuple, list)) and len(actor) == 3:
+                                    metadata["_slack_auth_actor"] = tuple(actor)
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
                         try:

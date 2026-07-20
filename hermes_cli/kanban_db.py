@@ -4248,17 +4248,6 @@ def complete_task(
     """
     now = int(time.time())
     orchestration_route = _resolve_orchestration_completion_route()
-    notifier_profile = _intended_completion_notifier_profile(
-        conn, task_id, expected_run_id
-    )
-    if orchestration_route is not None:
-        _assert_orchestration_route_profile(
-            conn,
-            task_id,
-            platform=orchestration_route[0],
-            chat_id=orchestration_route[1],
-            notifier_profile=notifier_profile,
-        )
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -4288,6 +4277,17 @@ def complete_task(
         verified_cards = []
 
     with write_txn(conn):
+        notifier_profile = _intended_completion_notifier_profile(
+            conn, task_id, expected_run_id
+        )
+        if orchestration_route is not None:
+            _assert_orchestration_route_profile(
+                conn,
+                task_id,
+                platform=orchestration_route[0],
+                chat_id=orchestration_route[1],
+                notifier_profile=notifier_profile,
+            )
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -8732,14 +8732,32 @@ def add_notify_sub(
             (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
         )
         if notifier_profile:
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET notifier_profile = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                """,
-                (notifier_profile, task_id, platform, chat_id, thread_id or ""),
-            )
+            row = conn.execute(
+                "SELECT notifier_profile, last_message_id FROM kanban_notify_subs "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+                (task_id, platform, chat_id, thread_id or ""),
+            ).fetchone()
+            owner = str(row["notifier_profile"] or "").strip() if row else ""
+            receipt = str(row["last_message_id"] or "").strip() if row else ""
+            if owner and owner != notifier_profile:
+                raise ValueError(
+                    f"notification route belongs to notifier profile {owner!r}, "
+                    f"not {notifier_profile!r}"
+                )
+            if not owner and receipt:
+                raise ValueError(
+                    "notification route has a receipt and cannot be reassigned"
+                )
+            if not owner:
+                cur = conn.execute(
+                    "UPDATE kanban_notify_subs SET notifier_profile = ? "
+                    "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+                    "AND TRIM(COALESCE(notifier_profile, '')) = '' "
+                    "AND TRIM(COALESCE(last_message_id, '')) = ''",
+                    (notifier_profile, task_id, platform, chat_id, thread_id or ""),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("notification route profile changed concurrently")
 
 
 def list_notify_subs(
@@ -8922,6 +8940,13 @@ def _install_orchestration_completion_sub(
             "AND TRIM(COALESCE(last_message_id, '')) = ''",
             (notifier_profile, task_id, platform, chat_id),
         )
+    _assert_orchestration_route_profile(
+        conn,
+        task_id,
+        platform=platform,
+        chat_id=chat_id,
+        notifier_profile=notifier_profile,
+    )
     return cur.rowcount > 0
 
 

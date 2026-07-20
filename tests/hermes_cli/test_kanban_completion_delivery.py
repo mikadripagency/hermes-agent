@@ -10,8 +10,10 @@ upgrades to ``acknowledged`` with the real platform receipt.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -203,6 +205,95 @@ def test_completion_never_restamps_existing_receipt_as_closing_profile(kanban_ho
     assert sub["notifier_profile"] is None
     assert sub["last_message_id"] == "wrong-actor-receipt"
     assert task is not None and task.status == "running"
+
+
+def test_subscribe_never_restamps_existing_receipt_as_requested_profile(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy wrong actor", assignee="developer")
+        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id=ORCH_CHAT_ID)
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_message_id = 'wrong-actor-receipt' "
+            "WHERE task_id = ? AND chat_id = ?",
+            (tid, ORCH_CHAT_ID),
+        )
+        conn.commit()
+
+        with pytest.raises(ValueError, match="receipt.*cannot be reassigned"):
+            kb.add_notify_sub(
+                conn,
+                task_id=tid,
+                platform="slack",
+                chat_id=ORCH_CHAT_ID,
+                notifier_profile="developer",
+            )
+
+        sub = kb.list_notify_subs(conn, tid)[0]
+    assert sub["notifier_profile"] is None
+    assert sub["last_message_id"] == "wrong-actor-receipt"
+
+
+def test_completion_route_profile_check_is_atomic_with_done(kanban_home, monkeypatch):
+    _write_channel_directory(kanban_home)
+    completing_conn = kb.connect()
+    writer_started = threading.Event()
+    writer_done = threading.Event()
+    writer_errors = []
+    original_write_txn = kb.write_txn
+    gate_used = False
+    armed = False
+
+    @contextmanager
+    def gated_write_txn(conn):
+        nonlocal gate_used
+        if armed and conn is completing_conn and not gate_used:
+            gate_used = True
+            writer_started.set()
+            assert writer_done.wait(timeout=5)
+        with original_write_txn(conn):
+            yield
+
+    monkeypatch.setattr(kb, "write_txn", gated_write_txn)
+    tid = kb.create_task(completing_conn, title="atomic owner", assignee="developer")
+    claimed = kb.claim_task(completing_conn, tid, claimer="developer-test")
+    assert claimed is not None
+    armed = True
+
+    def install_conflicting_route():
+        try:
+            assert writer_started.wait(timeout=5)
+            with kb.connect_closing() as conn:
+                kb.add_notify_sub(
+                    conn,
+                    task_id=tid,
+                    platform="slack",
+                    chat_id=ORCH_CHAT_ID,
+                    notifier_profile="default",
+                )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            writer_errors.append(exc)
+        finally:
+            writer_done.set()
+
+    writer = threading.Thread(target=install_conflicting_route)
+    writer.start()
+    try:
+        with pytest.raises(ValueError, match="belongs to notifier profile 'default'"):
+            kb.complete_task(
+                completing_conn,
+                tid,
+                summary="done",
+                expected_run_id=claimed.current_run_id,
+            )
+    finally:
+        writer.join(timeout=5)
+        completing_conn.close()
+
+    assert not writer.is_alive()
+    assert writer_errors == []
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "running"
+        assert not any(event.kind == "completed" for event in kb.list_events(conn, tid))
 
 
 def test_orchestration_subscription_is_idempotent_and_keeps_cursor(kanban_home):
