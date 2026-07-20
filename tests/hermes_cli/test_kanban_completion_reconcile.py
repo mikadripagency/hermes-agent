@@ -152,6 +152,7 @@ def test_reconcile_verified_legacy_sender_keeps_unstamped_route_truthful(kanban_
             chat_id="CORCH",
             notifier_profile="default",
             verified_legacy_sender_id="UDEFAULT",
+            verified_legacy_receipt_id="1784203491.451939",
         ) == "1784203491.451939"
 
         row = conn.execute(
@@ -171,6 +172,36 @@ def test_reconcile_verified_legacy_sender_keeps_unstamped_route_truthful(kanban_
         assert event.payload["notifier_profile"] == ""
         assert event.payload["verified_legacy_sender_profile"] == "default"
         assert event.payload["verified_legacy_sender_id"] == "UDEFAULT"
+
+
+def test_reconcile_legacy_receipt_change_is_rejected(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id, event_id = _seed_completed_receipt(conn)
+        conn.execute(
+            "UPDATE kanban_notify_subs SET notifier_profile = NULL WHERE task_id = ?",
+            (task_id,),
+        )
+        conn.execute(
+            "UPDATE completion_deliveries SET notifier_profile = '' WHERE event_id = ?",
+            (event_id,),
+        )
+        conn.commit()
+
+        with pytest.raises(ValueError, match="changed before reconciliation"):
+            kb.reconcile_completion_delivery(
+                conn,
+                task_id=task_id,
+                event_id=event_id,
+                platform="slack",
+                chat_id="CORCH",
+                notifier_profile="default",
+                verified_legacy_sender_id="UDEFAULT",
+                verified_legacy_receipt_id="different-receipt",
+            )
+        assert conn.execute(
+            "SELECT state FROM completion_deliveries WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()["state"] == "pending"
 
 
 @pytest.mark.parametrize(

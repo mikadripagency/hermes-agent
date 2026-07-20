@@ -2578,6 +2578,7 @@ def _verify_legacy_slack_sender(chat_id: str, message_id: str) -> str:
 
 def _cmd_notify_reconcile(args: argparse.Namespace) -> int:
     verified_sender_id = None
+    verified_receipt_id = None
     with kb.connect_closing() as conn:
         if args.legacy_unstamped:
             active_profile = get_active_profile_name() or "default"
@@ -2585,7 +2586,7 @@ def _cmd_notify_reconcile(args: argparse.Namespace) -> int:
                 raise ValueError(
                     "--legacy-unstamped must run under the claimed notifier profile"
                 )
-            message_id = kb._completion_subscription_receipt(
+            verified_receipt_id = kb._completion_subscription_receipt(
                 conn,
                 task_id=args.task_id,
                 event_id=args.event_id,
@@ -2594,7 +2595,9 @@ def _cmd_notify_reconcile(args: argparse.Namespace) -> int:
                 thread_id=args.thread_id,
                 notifier_profile="",
             )
-            verified_sender_id = _verify_legacy_slack_sender(args.chat_id, message_id)
+            verified_sender_id = _verify_legacy_slack_sender(
+                args.chat_id, verified_receipt_id
+            )
         message_id = kb.reconcile_completion_delivery(
             conn,
             task_id=args.task_id,
@@ -2604,6 +2607,7 @@ def _cmd_notify_reconcile(args: argparse.Namespace) -> int:
             thread_id=args.thread_id,
             notifier_profile=args.notifier_profile,
             verified_legacy_sender_id=verified_sender_id,
+            verified_legacy_receipt_id=verified_receipt_id,
         )
     print(
         f"Reconciled completion event {args.event_id} for {args.task_id} "

@@ -9038,6 +9038,7 @@ def reconcile_completion_delivery(
     thread_id: str = "",
     notifier_profile: str,
     verified_legacy_sender_id: Optional[str] = None,
+    verified_legacy_receipt_id: Optional[str] = None,
 ) -> str:
     """Acknowledge a historical Slack completion from its durable receipt.
 
@@ -9052,10 +9053,13 @@ def reconcile_completion_delivery(
     thread_id = str(thread_id or "").strip()
     notifier_profile = str(notifier_profile or "").strip()
     verified_legacy_sender_id = str(verified_legacy_sender_id or "").strip()
+    verified_legacy_receipt_id = str(verified_legacy_receipt_id or "").strip()
     if not task_id or not chat_id or not notifier_profile:
         raise ValueError("task, chat, and notifier profile are required")
     if platform != "slack":
         raise ValueError("completion receipt reconciliation only supports Slack")
+    if bool(verified_legacy_sender_id) != bool(verified_legacy_receipt_id):
+        raise ValueError("legacy sender and receipt verification must be provided together")
     route_profile = "" if verified_legacy_sender_id else notifier_profile
 
     now = int(time.time())
@@ -9084,6 +9088,8 @@ def reconcile_completion_delivery(
             thread_id=thread_id,
             notifier_profile=route_profile,
         )
+        if verified_legacy_receipt_id and message_id != verified_legacy_receipt_id:
+            raise ValueError("verified legacy Slack receipt changed before reconciliation")
         handoff_version = int(event["handoff_version"] or 1)
 
         route = (platform, chat_id, thread_id, route_profile)
