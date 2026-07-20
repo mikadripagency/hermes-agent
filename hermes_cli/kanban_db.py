@@ -4247,6 +4247,7 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    orchestration_route = _resolve_orchestration_completion_route()
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -4276,6 +4277,17 @@ def complete_task(
         verified_cards = []
 
     with write_txn(conn):
+        notifier_profile = _intended_completion_notifier_profile(
+            conn, task_id, expected_run_id
+        )
+        if orchestration_route is not None:
+            _assert_orchestration_route_profile(
+                conn,
+                task_id,
+                platform=orchestration_route[0],
+                chat_id=orchestration_route[1],
+                notifier_profile=notifier_profile,
+            )
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -4381,20 +4393,19 @@ def complete_task(
                 now,
             ),
         )
-    # Always resolve the shared orchestration route at done-time so the
-    # completion ping reaches the orchestration channel and not only the
-    # origin thread (t_18088232). Best-effort in its own txn: a routing
-    # failure must never un-complete the task.
-    try:
-        ensure_orchestration_completion_sub(conn, task_id, completed_event_id)
-    except Exception as exc:
-        _log.debug(
-            "orchestration completion route for %s not installed: %s",
-            task_id, exc,
+        if orchestration_route is not None:
+            _install_orchestration_completion_sub(
+                conn,
+                task_id,
+                completed_event_id,
+                platform=orchestration_route[0],
+                chat_id=orchestration_route[1],
+                notifier_profile=notifier_profile,
+                created_at=now,
+            )
+        _materialize_completion_delivery_routes(
+            conn, task_id, completed_event_id, now
         )
-    _materialize_completion_delivery_routes(
-        conn, task_id, completed_event_id, now
-    )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -8721,14 +8732,32 @@ def add_notify_sub(
             (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
         )
         if notifier_profile:
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET notifier_profile = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                """,
-                (notifier_profile, task_id, platform, chat_id, thread_id or ""),
-            )
+            row = conn.execute(
+                "SELECT notifier_profile, last_message_id FROM kanban_notify_subs "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+                (task_id, platform, chat_id, thread_id or ""),
+            ).fetchone()
+            owner = str(row["notifier_profile"] or "").strip() if row else ""
+            receipt = str(row["last_message_id"] or "").strip() if row else ""
+            if owner and owner != notifier_profile:
+                raise ValueError(
+                    f"notification route belongs to notifier profile {owner!r}, "
+                    f"not {notifier_profile!r}"
+                )
+            if not owner and receipt:
+                raise ValueError(
+                    "notification route has a receipt and cannot be reassigned"
+                )
+            if not owner:
+                cur = conn.execute(
+                    "UPDATE kanban_notify_subs SET notifier_profile = ? "
+                    "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+                    "AND TRIM(COALESCE(notifier_profile, '')) = '' "
+                    "AND TRIM(COALESCE(last_message_id, '')) = ''",
+                    (notifier_profile, task_id, platform, chat_id, thread_id or ""),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("notification route profile changed concurrently")
 
 
 def list_notify_subs(
@@ -8777,32 +8806,31 @@ def _materialize_completion_delivery_routes(
     if not routes:
         return
     handoff_version = _task_handoff_version(conn, task_id)
-    with write_txn(conn):
-        conn.execute(
-            "DELETE FROM completion_deliveries WHERE event_id = ? "
-            "AND platform = '' AND chat_id = '' AND thread_id = '' "
-            "AND notifier_profile = '' AND state = 'pending'",
-            (int(event_id),),
-        )
-        conn.executemany(
-            "INSERT OR IGNORE INTO completion_deliveries "
-            "(event_id, task_id, handoff_version, platform, chat_id, "
-            "thread_id, notifier_profile, state, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
-            [
-                (
-                    int(event_id),
-                    task_id,
-                    handoff_version,
-                    str(route["platform"] or "").strip().lower(),
-                    str(route["chat_id"] or "").strip(),
-                    str(route["thread_id"] or "").strip(),
-                    str(route["notifier_profile"] or "").strip(),
-                    int(created_at),
-                )
-                for route in routes
-            ],
-        )
+    conn.execute(
+        "DELETE FROM completion_deliveries WHERE event_id = ? "
+        "AND platform = '' AND chat_id = '' AND thread_id = '' "
+        "AND notifier_profile = '' AND state = 'pending'",
+        (int(event_id),),
+    )
+    conn.executemany(
+        "INSERT OR IGNORE INTO completion_deliveries "
+        "(event_id, task_id, handoff_version, platform, chat_id, "
+        "thread_id, notifier_profile, state, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+        [
+            (
+                int(event_id),
+                task_id,
+                handoff_version,
+                str(route["platform"] or "").strip().lower(),
+                str(route["chat_id"] or "").strip(),
+                str(route["thread_id"] or "").strip(),
+                str(route["notifier_profile"] or "").strip(),
+                int(created_at),
+            )
+            for route in routes
+        ],
+    )
 
 
 def _resolve_orchestration_chat_id(platform: str, channel: str) -> Optional[str]:
@@ -8838,25 +8866,8 @@ def _resolve_orchestration_chat_id(platform: str, channel: str) -> Optional[str]
     return None
 
 
-def ensure_orchestration_completion_sub(
-    conn: sqlite3.Connection, task_id: str, completed_event_id: int
-) -> bool:
-    """Ensure the shared orchestration channel is subscribed to *task_id*'s
-    completion.
-
-    Called from :func:`complete_task` at done-time so the terminal
-    ``completed`` event always reaches the orchestration channel, not only
-    the origin DM/thread subscription (evidence: t_18088232's completed
-    event 6582 was delivered solely to the creator's thread). The route is
-    resolved from ``kanban.orchestration_channel`` (a channel-directory name
-    or raw chat id; empty string disables) on
-    ``kanban.orchestration_platform`` (default ``slack``).
-
-    The subscription cursor starts at ``completed_event_id - 1`` so exactly
-    the completion (and nothing from the task's earlier terminal-kind
-    history) is delivered. Idempotent: an existing subscription row for the
-    same route keeps its cursor. Returns True when a new row was inserted.
-    """
+def _resolve_orchestration_completion_route() -> Optional[tuple[str, str]]:
+    """Resolve the configured orchestration destination before completion."""
     try:
         from hermes_cli.config import load_config
 
@@ -8866,22 +8877,128 @@ def ensure_orchestration_completion_sub(
         kcfg = {}
     channel = str(kcfg.get("orchestration_channel", "orchestration") or "").strip()
     if not channel:
-        return False
+        return None
     platform = str(kcfg.get("orchestration_platform", "slack") or "slack").strip().lower()
     chat_id = _resolve_orchestration_chat_id(platform, channel)
     if not chat_id:
-        return False
-    now = int(time.time())
-    with write_txn(conn):
-        cur = conn.execute(
-            """
-            INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, last_event_id, created_at)
-            VALUES (?, ?, ?, '', ?, ?)
-            """,
-            (task_id, platform, chat_id, max(0, int(completed_event_id) - 1), now),
+        return None
+    return platform, chat_id
+
+
+def _intended_completion_notifier_profile(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_run_id: Optional[int],
+) -> str:
+    """Return the profile that owns the closing run, never a blank route."""
+    row = conn.execute(
+        "SELECT r.profile, t.assignee FROM tasks t LEFT JOIN task_runs r "
+        "ON r.id = COALESCE(?, t.current_run_id) WHERE t.id = ?",
+        (expected_run_id, task_id),
+    ).fetchone()
+    if row is not None and str(row["profile"] or "").strip():
+        return str(row["profile"]).strip()
+    if row is not None and str(row["assignee"] or "").strip():
+        return str(row["assignee"]).strip()
+    return str(os.environ.get("HERMES_PROFILE") or "default").strip() or "default"
+
+
+def _install_orchestration_completion_sub(
+    conn: sqlite3.Connection,
+    task_id: str,
+    completed_event_id: int,
+    *,
+    platform: str,
+    chat_id: str,
+    notifier_profile: str,
+    created_at: int,
+) -> bool:
+    """Install or safely stamp the route inside the completion transaction."""
+    cur = conn.execute(
+        """
+        INSERT OR IGNORE INTO kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, notifier_profile,
+             last_event_id, created_at)
+        VALUES (?, ?, ?, '', ?, ?, ?)
+        """,
+        (
+            task_id,
+            platform,
+            chat_id,
+            notifier_profile,
+            max(0, int(completed_event_id) - 1),
+            int(created_at),
+        ),
+    )
+    if cur.rowcount == 0:
+        # A pre-existing, unsent route can be claimed by the closing profile.
+        # A durable receipt is immutable evidence of its actual sender.
+        conn.execute(
+            "UPDATE kanban_notify_subs SET notifier_profile = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = '' "
+            "AND TRIM(COALESCE(notifier_profile, '')) = '' "
+            "AND TRIM(COALESCE(last_message_id, '')) = ''",
+            (notifier_profile, task_id, platform, chat_id),
         )
+    _assert_orchestration_route_profile(
+        conn,
+        task_id,
+        platform=platform,
+        chat_id=chat_id,
+        notifier_profile=notifier_profile,
+    )
     return cur.rowcount > 0
+
+
+def _assert_orchestration_route_profile(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    platform: str,
+    chat_id: str,
+    notifier_profile: str,
+) -> None:
+    """Reject a commissioned route whose durable owner cannot be truthful."""
+    row = conn.execute(
+        "SELECT notifier_profile, last_message_id FROM kanban_notify_subs "
+        "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ''",
+        (task_id, platform, chat_id),
+    ).fetchone()
+    if row is None:
+        return
+    owner = str(row["notifier_profile"] or "").strip()
+    receipt = str(row["last_message_id"] or "").strip()
+    if owner and owner != notifier_profile:
+        raise ValueError(
+            f"orchestration route belongs to notifier profile {owner!r}, "
+            f"not {notifier_profile!r}"
+        )
+    if not owner and receipt:
+        raise ValueError(
+            "orchestration route has an unstamped receipt and cannot be reassigned"
+        )
+
+
+def ensure_orchestration_completion_sub(
+    conn: sqlite3.Connection,
+    task_id: str,
+    completed_event_id: int,
+    notifier_profile: str = "default",
+) -> bool:
+    """Compatibility helper for callers outside :func:`complete_task`."""
+    route = _resolve_orchestration_completion_route()
+    if route is None:
+        return False
+    with write_txn(conn):
+        return _install_orchestration_completion_sub(
+            conn,
+            task_id,
+            completed_event_id,
+            platform=route[0],
+            chat_id=route[1],
+            notifier_profile=notifier_profile.strip() or "default",
+            created_at=int(time.time()),
+        )
 
 
 def acknowledge_completion_delivery(

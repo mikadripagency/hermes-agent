@@ -126,6 +126,105 @@ def _redirect_cache(tmp_path, monkeypatch):
     )
 
 
+@pytest.mark.asyncio
+async def test_notification_send_rejects_actor_from_different_workspace(adapter):
+    primary_client = AsyncMock()
+    developer_client = AsyncMock()
+    adapter._app.client = primary_client
+    adapter._team_clients = {"TDEVELOPER": developer_client}
+    adapter._channel_team = {}
+    adapter._primary_slack_auth_actor = ("TPRIMARY", "", "UWRONG")
+    adapter._slack_auth_actors_by_team = {
+        "TDEVELOPER": ("TDEVELOPER", "BDEVELOPER", "UDEVELOPER")
+    }
+
+    result = await adapter.send(
+        "CUNMAPPED",
+        "done",
+        metadata={
+            "_slack_auth_actor": ("TDEVELOPER", "BDEVELOPER", "UDEVELOPER")
+        },
+    )
+
+    assert not result.success
+    primary_client.chat_postMessage.assert_not_awaited()
+    developer_client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_notification_send_rejects_unmapped_multi_workspace_channel(adapter):
+    primary_client = AsyncMock()
+    developer_client = AsyncMock()
+    adapter._app.client = primary_client
+    adapter._team_clients = {
+        "TPRIMARY": primary_client,
+        "TDEVELOPER": developer_client,
+    }
+    adapter._channel_team = {}
+    primary_actor = ("TPRIMARY", "BPRIMARY", "UPRIMARY")
+    adapter._primary_slack_auth_actor = primary_actor
+    adapter._slack_auth_actors_by_team = {
+        "TPRIMARY": primary_actor,
+        "TDEVELOPER": ("TDEVELOPER", "BDEVELOPER", "UDEVELOPER"),
+    }
+
+    result = await adapter.send(
+        "CUNMAPPED",
+        "done",
+        metadata={"_slack_auth_actor": primary_actor},
+    )
+
+    assert not result.success
+    primary_client.chat_postMessage.assert_not_awaited()
+    developer_client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_notification_send_binds_matching_actor_and_workspace_client(adapter):
+    primary_client = AsyncMock()
+    developer_client = AsyncMock()
+    developer_client.chat_postMessage.return_value = {"ts": "receipt-developer"}
+    adapter._app.client = primary_client
+    adapter._team_clients = {"TDEVELOPER": developer_client}
+    adapter._channel_team = {"CMAPPED": "TDEVELOPER"}
+    adapter._primary_slack_auth_actor = ("TPRIMARY", "", "UWRONG")
+    actor = ("TDEVELOPER", "BDEVELOPER", "UDEVELOPER")
+    adapter._slack_auth_actors_by_team = {"TDEVELOPER": actor}
+
+    result = await adapter.send(
+        "CMAPPED",
+        "done",
+        metadata={"_slack_auth_actor": actor},
+    )
+
+    assert result.success and result.message_id == "receipt-developer"
+    developer_client.chat_postMessage.assert_awaited_once()
+    primary_client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_notification_send_does_not_use_pending_slash_response(adapter):
+    client = AsyncMock()
+    client.chat_postMessage.return_value = {"ts": "receipt-notifier"}
+    adapter._app.client = client
+    actor = ("TPRIMARY", "BPRIMARY", "UPRIMARY")
+    adapter._team_clients = {"TPRIMARY": client}
+    adapter._primary_slack_auth_actor = actor
+    adapter._pop_slash_context = MagicMock(return_value={"response_url": "ignored"})
+    adapter._send_slash_ephemeral = AsyncMock()
+
+    result = await adapter.send(
+        "CORCH",
+        "done",
+        metadata={"_slack_auth_actor": actor},
+    )
+
+    assert result.success and result.message_id == "receipt-notifier"
+    adapter._pop_slash_context.assert_not_called()
+    adapter._send_slash_ephemeral.assert_not_awaited()
+    client.chat_postMessage.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # TestSlashCommandSessionIsolation
 # ---------------------------------------------------------------------------

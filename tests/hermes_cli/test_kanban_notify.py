@@ -26,7 +26,7 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def test_notify_subscribe_updates_explicit_notifier_identity(kanban_home):
+def test_notify_subscribe_preserves_explicit_notifier_identity(kanban_home):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="identity", assignee="default")
@@ -34,11 +34,12 @@ def test_notify_subscribe_updates_explicit_notifier_identity(kanban_home):
             conn, task_id=tid, platform="slack", chat_id="channel",
             notifier_profile="developer",
         )
-        kb.add_notify_sub(
-            conn, task_id=tid, platform="slack", chat_id="channel",
-            notifier_profile="default",
-        )
-        assert kb.list_notify_subs(conn, tid)[0]["notifier_profile"] == "default"
+        with pytest.raises(ValueError, match="belongs to notifier profile 'developer'"):
+            kb.add_notify_sub(
+                conn, task_id=tid, platform="slack", chat_id="channel",
+                notifier_profile="default",
+            )
+        assert kb.list_notify_subs(conn, tid)[0]["notifier_profile"] == "developer"
     finally:
         conn.close()
 

@@ -45,6 +45,23 @@ def _is_permanent_slack_error(err: str) -> bool:
     return any(code in low for code in _PERMANENT_SLACK_ERRORS)
 
 
+def _slack_notification_actor_matches(
+    adapter: Any, intended_profile: str, chat_id: str
+) -> bool:
+    """Require the actor of the exact Slack client selected for this channel."""
+    actor_for_chat = getattr(adapter, "_slack_auth_actor_for_chat", None)
+    actor = actor_for_chat(chat_id) if callable(actor_for_chat) else None
+    if not isinstance(actor, (tuple, list)) or len(actor) != 3:
+        return False
+    _team_id, bot_id, user_id = actor
+    return (
+        bool(intended_profile)
+        and getattr(adapter, "_hermes_profile", None) == intended_profile
+        and bool(bot_id)
+        and bool(user_id)
+    )
+
+
 def _format_completed_message(title: str, summary: str = "") -> str:
     """Render at most two short lines without internal task/commit identifiers."""
     clean_title = re.sub(r"\b(?:t_[0-9a-f]{8,}|[0-9a-f]{7,40})\b", "", title, flags=re.IGNORECASE)
@@ -283,6 +300,18 @@ class GatewayKanbanWatchersMixin:
                                         sub.get("task_id"), retry_at, sub.get("consecutive_failures"),
                                     )
                                     continue
+                                task = _kb.get_task(conn, sub["task_id"])
+                                if (
+                                    platform == "slack"
+                                    and task is not None
+                                    and task.assignee == "developer"
+                                    and not owner_profile
+                                ):
+                                    logger.debug(
+                                        "kanban notifier: unstamped developer Slack route for %s remains pending",
+                                        sub.get("task_id"),
+                                    )
+                                    continue
                                 old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                     conn,
                                     task_id=sub["task_id"],
@@ -293,7 +322,6 @@ class GatewayKanbanWatchersMixin:
                                 )
                                 if not events:
                                     continue
-                                task = _kb.get_task(conn, sub["task_id"])
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -345,6 +373,26 @@ class GatewayKanbanWatchersMixin:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
                             platform_str, sub["task_id"],
+                        )
+                        await asyncio.to_thread(
+                            self._kanban_rewind,
+                            sub,
+                            d["cursor"],
+                            d.get("old_cursor", 0),
+                            board_slug,
+                        )
+                        continue
+                    if (
+                        platform_str == "slack"
+                        and any(ev.kind == "completed" for ev in d["events"])
+                        and (sub_profile or (task is not None and task.assignee == "developer"))
+                        and not _slack_notification_actor_matches(
+                            adapter, sub_profile, sub["chat_id"]
+                        )
+                    ):
+                        logger.warning(
+                            "kanban notifier: Slack actor/profile mismatch for %s; route remains pending",
+                            sub["task_id"],
                         )
                         await asyncio.to_thread(
                             self._kanban_rewind,
@@ -442,6 +490,14 @@ class GatewayKanbanWatchersMixin:
                                 f"{sub['platform']}:{sub['chat_id']}:{sub.get('thread_id') or ''}",
                             )),
                         }
+                        if platform_str == "slack" and kind == "completed":
+                            actor_for_chat = getattr(
+                                adapter, "_slack_auth_actor_for_chat", None
+                            )
+                            if callable(actor_for_chat):
+                                actor = actor_for_chat(sub["chat_id"])
+                                if isinstance(actor, (tuple, list)) and len(actor) == 3:
+                                    metadata["_slack_auth_actor"] = tuple(actor)
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
                         try:

@@ -440,6 +440,9 @@ class SlackAdapter(BasePlatformAdapter):
         self._app: Optional[Any] = None
         self._handler: Optional[Any] = None
         self._bot_user_id: Optional[str] = None
+        self._slack_auth_actors: set[tuple[str, str, str]] = set()
+        self._slack_auth_actors_by_team: Dict[str, tuple[str, str, str]] = {}
+        self._primary_slack_auth_actor: Optional[tuple[str, str, str]] = None
         self._user_name_cache: Dict[str, str] = {}  # user_id → display name
         self._socket_mode_task: Optional[asyncio.Task] = None
         # Multi-workspace support
@@ -1047,6 +1050,9 @@ class SlackAdapter(BasePlatformAdapter):
             self._bot_user_id = None
             self._team_clients = {}
             self._team_bot_user_ids = {}
+            self._slack_auth_actors = set()
+            self._slack_auth_actors_by_team = {}
+            self._primary_slack_auth_actor = None
 
             # First token is the primary — used for AsyncApp / Socket Mode
             primary_token = bot_tokens[0]
@@ -1054,14 +1060,23 @@ class SlackAdapter(BasePlatformAdapter):
             _apply_slack_proxy(self._app.client, proxy_url)
 
             # Register each bot token and map team_id → client
-            for token in bot_tokens:
+            for index, token in enumerate(bot_tokens):
                 client = AsyncWebClient(token=token)
                 _apply_slack_proxy(client, proxy_url)
                 auth_response = await client.auth_test()
                 team_id = auth_response.get("team_id", "")
                 bot_user_id = auth_response.get("user_id", "")
+                bot_id = auth_response.get("bot_id", "")
                 bot_name = auth_response.get("user", "unknown")
                 team_name = auth_response.get("team", "unknown")
+                actor = (team_id, bot_id, bot_user_id)
+
+                if bot_user_id:
+                    self._slack_auth_actors.add(actor)
+                if team_id:
+                    self._slack_auth_actors_by_team[team_id] = actor
+                if index == 0:
+                    self._primary_slack_auth_actor = actor
 
                 self._team_clients[team_id] = client
                 self._team_bot_user_ids[team_id] = bot_user_id
@@ -1349,6 +1364,19 @@ class SlackAdapter(BasePlatformAdapter):
             return self._team_clients[team_id]
         return self._app.client  # fallback to primary
 
+    def _slack_auth_actor_for_chat(
+        self, chat_id: str
+    ) -> Optional[tuple[str, str, str]]:
+        """Return the auth.test actor for the client selected by ``_get_client``."""
+        team_id = self._channel_team.get(chat_id)
+        if team_id:
+            if team_id in self._team_clients:
+                return self._slack_auth_actors_by_team.get(team_id)
+            return None
+        if len(self._team_clients) > 1:
+            return None
+        return self._primary_slack_auth_actor
+
     async def send(
         self,
         chat_id: str,
@@ -1361,16 +1389,29 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            expected_actor = (metadata or {}).get("_slack_auth_actor")
             # Check for a pending slash-command context.  When the user ran a
             # native slash command (e.g. /q, /stop, /model), the initial ack
             # already showed an ephemeral "Running /cmd…" message.  If we have
             # a stashed response_url for this channel, replace that ack with
             # the actual command reply ephemerally instead of posting publicly.
-            slash_ctx = self._pop_slash_context(chat_id)
+            # Actor-bound notifier sends must use the selected WebClient instead:
+            # a stale slash context is not the authenticated route we validated.
+            slash_ctx = None if expected_actor else self._pop_slash_context(chat_id)
             if slash_ctx:
                 return await self._send_slash_ephemeral(
                     slash_ctx,
                     content,
+                )
+
+            client = self._get_client(chat_id)
+            if (
+                expected_actor
+                and tuple(expected_actor) != self._slack_auth_actor_for_chat(chat_id)
+            ):
+                return SendResult(
+                    success=False,
+                    error="Slack notification actor changed before send",
                 )
 
             # Convert standard markdown → Slack mrkdwn
@@ -1410,9 +1451,7 @@ class SlackAdapter(BasePlatformAdapter):
                         kwargs["reply_broadcast"] = True
 
                 try:
-                    last_result = await self._get_client(chat_id).chat_postMessage(
-                        **kwargs
-                    )
+                    last_result = await client.chat_postMessage(**kwargs)
                 except Exception as post_exc:
                     # A malformed Block Kit payload fails the whole send with
                     # ``invalid_blocks`` and would otherwise drop the message.
@@ -1425,9 +1464,7 @@ class SlackAdapter(BasePlatformAdapter):
                             post_exc,
                         )
                         kwargs.pop("blocks", None)
-                        last_result = await self._get_client(
-                            chat_id
-                        ).chat_postMessage(**kwargs)
+                        last_result = await client.chat_postMessage(**kwargs)
                     else:
                         raise
 
