@@ -9001,6 +9001,33 @@ def acknowledge_completion_delivery(
     return True
 
 
+def _completion_subscription_receipt(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    notifier_profile: str,
+) -> str:
+    receipts = conn.execute(
+        "SELECT TRIM(last_message_id) AS message_id, last_event_id, pending_event_id "
+        "FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
+        "AND chat_id = ? AND thread_id = ? "
+        "AND COALESCE(notifier_profile, '') = ? "
+        "AND last_message_event_id = ? "
+        "AND TRIM(COALESCE(last_message_id, '')) <> ''",
+        (task_id, platform, chat_id, thread_id, notifier_profile, int(event_id)),
+    ).fetchall()
+    if len(receipts) != 1:
+        raise ValueError("expected one unambiguous matching subscription receipt")
+    receipt = receipts[0]
+    if receipt["pending_event_id"] is not None or int(receipt["last_event_id"]) < int(event_id):
+        raise ValueError("subscription receipt is not durably acknowledged")
+    return str(receipt["message_id"])
+
+
 def reconcile_completion_delivery(
     conn: sqlite3.Connection,
     *,
@@ -9010,6 +9037,8 @@ def reconcile_completion_delivery(
     chat_id: str,
     thread_id: str = "",
     notifier_profile: str,
+    verified_legacy_sender_id: Optional[str] = None,
+    verified_legacy_receipt_id: Optional[str] = None,
 ) -> str:
     """Acknowledge a historical Slack completion from its durable receipt.
 
@@ -9023,10 +9052,15 @@ def reconcile_completion_delivery(
     chat_id = str(chat_id or "").strip()
     thread_id = str(thread_id or "").strip()
     notifier_profile = str(notifier_profile or "").strip()
+    verified_legacy_sender_id = str(verified_legacy_sender_id or "").strip()
+    verified_legacy_receipt_id = str(verified_legacy_receipt_id or "").strip()
     if not task_id or not chat_id or not notifier_profile:
         raise ValueError("task, chat, and notifier profile are required")
     if platform != "slack":
         raise ValueError("completion receipt reconciliation only supports Slack")
+    if bool(verified_legacy_sender_id) != bool(verified_legacy_receipt_id):
+        raise ValueError("legacy sender and receipt verification must be provided together")
+    route_profile = "" if verified_legacy_sender_id else notifier_profile
 
     now = int(time.time())
     with write_txn(conn):
@@ -9045,31 +9079,20 @@ def reconcile_completion_delivery(
         if event["kind"] != "completed" or event["status"] != "done":
             raise ValueError("reconciliation requires a completed event for a done task")
 
-        receipts = conn.execute(
-            "SELECT TRIM(last_message_id) AS message_id, last_event_id, pending_event_id "
-            "FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
-            "AND chat_id = ? AND thread_id = ? "
-            "AND COALESCE(notifier_profile, '') = ? "
-            "AND last_message_event_id = ? "
-            "AND TRIM(COALESCE(last_message_id, '')) <> ''",
-            (
-                task_id,
-                platform,
-                chat_id,
-                thread_id,
-                notifier_profile,
-                int(event_id),
-            ),
-        ).fetchall()
-        if len(receipts) != 1:
-            raise ValueError("expected one unambiguous matching subscription receipt")
-        receipt = receipts[0]
-        if receipt["pending_event_id"] is not None or int(receipt["last_event_id"]) < int(event_id):
-            raise ValueError("subscription receipt is not durably acknowledged")
-        message_id = str(receipt["message_id"])
+        message_id = _completion_subscription_receipt(
+            conn,
+            task_id=task_id,
+            event_id=event_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            notifier_profile=route_profile,
+        )
+        if verified_legacy_receipt_id and message_id != verified_legacy_receipt_id:
+            raise ValueError("verified legacy Slack receipt changed before reconciliation")
         handoff_version = int(event["handoff_version"] or 1)
 
-        route = (platform, chat_id, thread_id, notifier_profile)
+        route = (platform, chat_id, thread_id, route_profile)
         existing = conn.execute(
             "SELECT * FROM completion_deliveries WHERE event_id = ? "
             "AND platform = ? AND chat_id = ? AND thread_id = ? "
@@ -9082,7 +9105,7 @@ def reconcile_completion_delivery(
             platform,
             chat_id,
             thread_id,
-            notifier_profile,
+            route_profile,
             message_id,
         )
         if existing is not None:
@@ -9134,18 +9157,24 @@ def reconcile_completion_delivery(
                         message_id, now, now,
                     ),
                 )
+        payload = {
+            "completed_event_id": int(event_id),
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "notifier_profile": route_profile,
+            "message_id": message_id,
+        }
+        if verified_legacy_sender_id:
+            payload.update({
+                "verified_legacy_sender_profile": notifier_profile,
+                "verified_legacy_sender_id": verified_legacy_sender_id,
+            })
         _append_event(
             conn,
             task_id,
             "completion_delivery_reconciled",
-            {
-                "completed_event_id": int(event_id),
-                "platform": platform,
-                "chat_id": chat_id,
-                "thread_id": thread_id,
-                "notifier_profile": notifier_profile,
-                "message_id": message_id,
-            },
+            payload,
         )
     return message_id
 

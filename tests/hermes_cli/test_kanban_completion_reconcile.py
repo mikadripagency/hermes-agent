@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_cli import kanban as cli
 from hermes_cli import kanban_db as kb
 
 
@@ -68,6 +69,38 @@ def _reconcile(conn, task_id, completed_event_id, **overrides):
     )
 
 
+def test_verify_legacy_slack_sender_requires_receipt_author_match(monkeypatch):
+    monkeypatch.setattr(cli, "_slack_tokens_for_active_profile", lambda: ["secret"])
+
+    def fake_api(_token, method, **_params):
+        if method == "auth.test":
+            return {"ok": True, "user_id": "UDEFAULT"}
+        return {
+            "ok": True,
+            "messages": [{"ts": "1784203491.451939", "user": "UDEFAULT"}],
+        }
+
+    monkeypatch.setattr(cli, "_slack_api", fake_api)
+    assert cli._verify_legacy_slack_sender(
+        "CORCH", "1784203491.451939"
+    ) == "UDEFAULT"
+
+
+def test_verify_legacy_slack_sender_rejects_other_actor(monkeypatch):
+    monkeypatch.setattr(cli, "_slack_tokens_for_active_profile", lambda: ["secret"])
+    monkeypatch.setattr(
+        cli,
+        "_slack_api",
+        lambda _token, method, **_params: (
+            {"ok": True, "user_id": "UDEFAULT"}
+            if method == "auth.test"
+            else {"ok": True, "messages": [{"ts": "1.2", "user": "UOTHER"}]}
+        ),
+    )
+    with pytest.raises(RuntimeError, match="not authored"):
+        cli._verify_legacy_slack_sender("CORCH", "1.2")
+
+
 def test_reconcile_completion_delivery_from_authoritative_receipt_is_idempotent(kanban_home):
     with kb.connect_closing() as conn:
         task_id, event_id = _seed_completed_receipt(conn)
@@ -96,6 +129,79 @@ def test_reconcile_completion_delivery_from_authoritative_receipt_is_idempotent(
             if event.kind == "completion_delivery_reconciled"
         ]
         assert len(reconciled) == 1
+
+
+def test_reconcile_verified_legacy_sender_keeps_unstamped_route_truthful(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id, event_id = _seed_completed_receipt(conn)
+        conn.execute(
+            "UPDATE kanban_notify_subs SET notifier_profile = NULL WHERE task_id = ?",
+            (task_id,),
+        )
+        conn.execute(
+            "UPDATE completion_deliveries SET notifier_profile = '' WHERE event_id = ?",
+            (event_id,),
+        )
+        conn.commit()
+
+        assert kb.reconcile_completion_delivery(
+            conn,
+            task_id=task_id,
+            event_id=event_id,
+            platform="slack",
+            chat_id="CORCH",
+            notifier_profile="default",
+            verified_legacy_sender_id="UDEFAULT",
+            verified_legacy_receipt_id="1784203491.451939",
+        ) == "1784203491.451939"
+
+        row = conn.execute(
+            "SELECT notifier_profile, state, receipt_id FROM completion_deliveries "
+            "WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        assert dict(row) == {
+            "notifier_profile": "",
+            "state": "acknowledged",
+            "receipt_id": "1784203491.451939",
+        }
+        event = next(
+            item for item in kb.list_events(conn, task_id)
+            if item.kind == "completion_delivery_reconciled"
+        )
+        assert event.payload["notifier_profile"] == ""
+        assert event.payload["verified_legacy_sender_profile"] == "default"
+        assert event.payload["verified_legacy_sender_id"] == "UDEFAULT"
+
+
+def test_reconcile_legacy_receipt_change_is_rejected(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id, event_id = _seed_completed_receipt(conn)
+        conn.execute(
+            "UPDATE kanban_notify_subs SET notifier_profile = NULL WHERE task_id = ?",
+            (task_id,),
+        )
+        conn.execute(
+            "UPDATE completion_deliveries SET notifier_profile = '' WHERE event_id = ?",
+            (event_id,),
+        )
+        conn.commit()
+
+        with pytest.raises(ValueError, match="changed before reconciliation"):
+            kb.reconcile_completion_delivery(
+                conn,
+                task_id=task_id,
+                event_id=event_id,
+                platform="slack",
+                chat_id="CORCH",
+                notifier_profile="default",
+                verified_legacy_sender_id="UDEFAULT",
+                verified_legacy_receipt_id="different-receipt",
+            )
+        assert conn.execute(
+            "SELECT state FROM completion_deliveries WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()["state"] == "pending"
 
 
 @pytest.mark.parametrize(
