@@ -137,6 +137,7 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_TASK_KINDS = {"delivery", "system_inbox"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -950,6 +951,7 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    task_kind: str = "delivery"
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1033,6 +1035,11 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            task_kind=(
+                row["task_kind"]
+                if "task_kind" in keys and row["task_kind"] in VALID_TASK_KINDS
+                else "delivery"
             ),
         )
 
@@ -1135,6 +1142,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     body                 TEXT,
     assignee             TEXT,
     status               TEXT NOT NULL,
+    task_kind            TEXT NOT NULL DEFAULT 'delivery',
     priority             INTEGER DEFAULT 0,
     created_by           TEXT,
     created_at           INTEGER NOT NULL,
@@ -2052,6 +2060,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "task_kind" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "task_kind", "task_kind TEXT NOT NULL DEFAULT 'delivery'"
+        )
+    else:
+        conn.execute(
+            "UPDATE tasks SET task_kind = 'delivery' "
+            "WHERE task_kind IS NULL OR task_kind = '' OR task_kind = 'legacy'"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2589,6 +2607,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    task_kind: str = "delivery",
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2625,6 +2644,8 @@ def create_task(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
             f"got {workspace_kind!r}"
         )
+    if task_kind not in VALID_TASK_KINDS:
+        raise ValueError(f"task_kind must be one of {sorted(VALID_TASK_KINDS)}")
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
@@ -2843,12 +2864,12 @@ def create_task(
                 conn.execute(
                     """
                     INSERT INTO tasks (
-                        id, title, body, assignee, status, priority,
+                        id, title, body, assignee, status, task_kind, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2856,6 +2877,7 @@ def create_task(
                         body,
                         assignee,
                         task_status,
+                        task_kind,
                         priority,
                         created_by,
                         now,
@@ -2885,6 +2907,7 @@ def create_task(
                     {
                         "assignee": assignee,
                         "status": task_status,
+                        "task_kind": task_kind,
                         "parents": list(parents),
                         "tenant": tenant,
                         "branch_name": branch_name,
@@ -2962,6 +2985,7 @@ def list_tasks(
     order_by: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
+    include_system: bool = True,
 ) -> list[Task]:
     query = "SELECT * FROM tasks WHERE 1=1"
     params: list[Any] = []
@@ -2987,6 +3011,8 @@ def list_tasks(
         params.append(current_step_key)
     if not include_archived and status != "archived":
         query += " AND status != 'archived'"
+    if not include_system:
+        query += " AND task_kind != 'system_inbox'"
     if order_by is not None:
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
@@ -3032,6 +3058,20 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
         _append_event(conn, task_id, "assigned", {"assignee": profile})
+        return True
+
+
+def set_task_kind(conn: sqlite3.Connection, task_id: str, task_kind: str) -> bool:
+    """Persist a task's projection class without changing lifecycle state."""
+    if task_kind not in VALID_TASK_KINDS:
+        raise ValueError(f"task_kind must be one of {sorted(VALID_TASK_KINDS)}")
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET task_kind = ? WHERE id = ?", (task_kind, task_id)
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, "classified", {"task_kind": task_kind})
         return True
 
 

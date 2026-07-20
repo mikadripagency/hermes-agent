@@ -114,6 +114,38 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_system_inbox_is_hidden_from_board_but_available_by_id(client):
+    conn = kb.connect()
+    try:
+        inbox_id = kb.create_task(
+            conn,
+            title="process writer queue",
+            assignee="developer",
+            tenant="system",
+            initial_status="blocked",
+            task_kind="system_inbox",
+        )
+    finally:
+        conn.close()
+
+    board = client.get("/api/plugins/kanban/board").json()
+    assert all(
+        task["id"] != inbox_id
+        for column in board["columns"]
+        for task in column["tasks"]
+    )
+    assert "system" not in board["tenants"]
+    assert "developer" not in board["assignees"]
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{inbox_id}")
+    assert detail.status_code == 200
+    assert detail.json()["task"]["task_kind"] == "system_inbox"
+
+    system_board = client.get("/api/plugins/kanban/board?include_system=true").json()
+    blocked = next(column for column in system_board["columns"] if column["name"] == "blocked")
+    assert [task["id"] for task in blocked["tasks"]] == [inbox_id]
+
+
 def test_scheduled_tasks_have_their_own_column_not_todo(client):
     """Scheduled/time-delay tasks must not be silently bucketed into todo."""
 

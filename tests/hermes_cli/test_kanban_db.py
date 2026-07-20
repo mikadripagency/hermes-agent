@@ -222,6 +222,56 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
+def test_system_inbox_is_hidden_from_delivery_projection_but_keeps_lifecycle(kanban_home):
+    with kb.connect() as conn:
+        delivery = kb.create_task(conn, title="ship it")
+        inbox = kb.create_task(
+            conn,
+            title="process writer queue",
+            assignee="developer",
+            initial_status="blocked",
+            task_kind="system_inbox",
+        )
+
+        assert [task.id for task in kb.list_tasks(conn, include_system=False)] == [delivery]
+        assert kb.get_task(conn, inbox).task_kind == "system_inbox"
+        assert kb.unblock_task(conn, inbox)
+        assert kb.claim_task(conn, inbox, claimer="writer:1") is not None
+        assert kb.claim_task(conn, inbox, claimer="writer:2") is None
+        assert kb.block_task(conn, inbox, reason="parked", kind="capability")
+        assert kb.get_task(conn, inbox).status == "blocked"
+
+
+def test_task_kind_migration_preserves_legacy_rows_as_delivery(tmp_path):
+    db_path = tmp_path / "legacy-task-kind.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT, "
+        "assignee TEXT, status TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0, "
+        "created_by TEXT, created_at INTEGER NOT NULL, started_at INTEGER, "
+        "completed_at INTEGER, workspace_kind TEXT NOT NULL DEFAULT 'scratch', "
+        "workspace_path TEXT, claim_lock TEXT, claim_expires INTEGER)"
+    )
+    conn.execute(
+        "CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, "
+        "kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL)"
+    )
+    conn.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('old', 'old', 'blocked', 1)")
+    conn.commit()
+    conn.close()
+
+    with kb.connect(db_path) as migrated:
+        task = kb.get_task(migrated, "old")
+        assert kb.set_task_kind(migrated, "old", "system_inbox")
+        classified = kb.get_task(migrated, "old")
+
+    assert task is not None
+    assert task.task_kind == "delivery"
+    assert classified is not None
+    assert classified.task_kind == "system_inbox"
+    assert classified.status == "blocked"
+
+
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
     with kb.connect() as conn:
         p = kb.create_task(conn, title="parent")

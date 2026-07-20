@@ -477,6 +477,7 @@ def _handle_list(args: dict, **kw) -> str:
                 status=status,
                 tenant=tenant,
                 include_archived=include_archived,
+                include_system=False,
                 limit=limit + 1,
             )
             truncated = len(rows) > limit
