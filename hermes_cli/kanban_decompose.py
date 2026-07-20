@@ -51,9 +51,10 @@ logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """You are the Kanban decomposer for the Hermes Agent board.
 
-A user dropped a rough idea into the Triage column. Your job is to break it
-into a small graph of concrete child tasks and route each one to the best-
-matching profile from the available roster.
+A user dropped a rough idea into the Triage column. Preserve one canonical
+delivery card per user ticket. Create child tasks only for separately
+deliverable artifacts or genuine specialist work, then route each child to
+the best-matching profile from the available roster.
 
 You will be given:
   - The original task title and body
@@ -70,6 +71,7 @@ Output a single JSON object with this exact shape:
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
+        "work_type": "independent_deliverable | specialist_work",
         "parents": [<int>, ...]
       },
       ...
@@ -80,18 +82,22 @@ Rules:
   - "parents" is a list of INDICES (0-based) into this same "tasks" list,
     expressing actual data dependencies. Tasks with no parents run in
     PARALLEL. Tasks with parents wait until every parent completes.
-  - Prefer parallelism. If two tasks can be done independently, give
-    them no parents so the dispatcher fans them out at once.
-  - Use 2-6 tasks for normal work. Don't create 20 tiny tasks. Don't
-    cram everything into 1 task.
+  - Default to fanout=false. Fan out only when every child produces a
+    separately usable deliverable or requires a genuinely different
+    specialist. Set work_type accordingly; no other value is allowed.
+  - Implementation, tests, QA, review, fixes, merge, deploy, migrations,
+    E2E, and cosmetic corrections are lifecycle phases of the canonical
+    card, never child tasks. Return fanout=false for that kind of plan.
+  - Prefer parallelism among valid children. Preserve real data dependencies
+    with parents, but never express a routine delivery lifecycle as a chain.
   - Pick assignees from the roster by matching the task to the profile's
     DESCRIPTION (not just the name). When nothing matches well, use null
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
 
-When the task is genuinely a single unit of work (no useful decomposition),
-return:
+When the task is one user ticket, or otherwise has no independently
+deliverable/specialist split, return:
 
   {
     "fanout": false,
@@ -394,6 +400,36 @@ def decompose_task(
             task_id, False, "decomposer returned fanout=true with empty tasks list",
         )
 
+    if any(
+        not isinstance(entry, dict)
+        or entry.get("work_type") not in kb.DECOMPOSABLE_WORK_TYPES
+        for entry in raw_tasks
+    ):
+        # Fail closed: an unqualified graph is a delivery plan, not a set of
+        # independently ownable cards. Promote the unchanged canonical task
+        # instead of materialising lifecycle micro-tasks on the board.
+        assignee_val = default_assignee if not task.assignee else None
+        with kb.connect_closing() as conn:
+            ok = kb.specify_triage_task(
+                conn,
+                task_id,
+                title=task.title,
+                body=task.body,
+                assignee=assignee_val,
+                author=audit_author,
+            )
+        if not ok:
+            return DecomposeOutcome(
+                task_id, False, "task moved out of triage before promotion",
+            )
+        return DecomposeOutcome(
+            task_id,
+            True,
+            "single canonical delivery (unqualified child work)",
+            fanout=False,
+            new_title=task.title,
+        )
+
     # Rewrite invalid assignees to the default fallback. Never leave a
     # task with assignee=None — the user explicitly does not want that.
     children: list[dict] = []
@@ -435,6 +471,7 @@ def decompose_task(
             "title": title.strip()[:200],
             "body": body.strip(),
             "assignee": chosen,
+            "work_type": entry["work_type"],
             "parents": clean_parents,
         })
 

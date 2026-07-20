@@ -101,6 +101,10 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+DECOMPOSABLE_WORK_TYPES = frozenset({
+    "independent_deliverable",
+    "specialist_work",
+})
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -5305,6 +5309,7 @@ def decompose_triage_task(
             "title": "...",
             "body": "...",                     # optional
             "assignee": "profile-name",        # optional, None -> default fallback
+            "work_type": "independent_deliverable | specialist_work",
             "parents": [0, 2],                 # indices into this same children list
         }
 
@@ -5331,6 +5336,11 @@ def decompose_triage_task(
         title = child.get("title")
         if not isinstance(title, str) or not title.strip():
             raise ValueError(f"child[{idx}].title is required")
+        work_type = child.get("work_type")
+        if work_type is not None and work_type not in DECOMPOSABLE_WORK_TYPES:
+            raise ValueError(
+                f"child[{idx}].work_type must identify independently ownable work"
+            )
         parents_idx = child.get("parents") or []
         if not isinstance(parents_idx, list):
             raise ValueError(f"child[{idx}].parents must be a list")
