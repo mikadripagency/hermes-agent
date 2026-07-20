@@ -152,6 +152,34 @@ async def test_notification_send_rejects_actor_from_different_workspace(adapter)
 
 
 @pytest.mark.asyncio
+async def test_notification_send_rejects_unmapped_multi_workspace_channel(adapter):
+    primary_client = AsyncMock()
+    developer_client = AsyncMock()
+    adapter._app.client = primary_client
+    adapter._team_clients = {
+        "TPRIMARY": primary_client,
+        "TDEVELOPER": developer_client,
+    }
+    adapter._channel_team = {}
+    primary_actor = ("TPRIMARY", "BPRIMARY", "UPRIMARY")
+    adapter._primary_slack_auth_actor = primary_actor
+    adapter._slack_auth_actors_by_team = {
+        "TPRIMARY": primary_actor,
+        "TDEVELOPER": ("TDEVELOPER", "BDEVELOPER", "UDEVELOPER"),
+    }
+
+    result = await adapter.send(
+        "CUNMAPPED",
+        "done",
+        metadata={"_slack_auth_actor": primary_actor},
+    )
+
+    assert not result.success
+    primary_client.chat_postMessage.assert_not_awaited()
+    developer_client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_notification_send_binds_matching_actor_and_workspace_client(adapter):
     primary_client = AsyncMock()
     developer_client = AsyncMock()

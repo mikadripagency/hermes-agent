@@ -1369,8 +1369,12 @@ class SlackAdapter(BasePlatformAdapter):
     ) -> Optional[tuple[str, str, str]]:
         """Return the auth.test actor for the client selected by ``_get_client``."""
         team_id = self._channel_team.get(chat_id)
-        if team_id and team_id in self._team_clients:
-            return self._slack_auth_actors_by_team.get(team_id)
+        if team_id:
+            if team_id in self._team_clients:
+                return self._slack_auth_actors_by_team.get(team_id)
+            return None
+        if len(self._team_clients) > 1:
+            return None
         return self._primary_slack_auth_actor
 
     async def send(
