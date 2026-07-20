@@ -21,6 +21,8 @@ import os
 import shlex
 import sys
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Optional
 
@@ -732,6 +734,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_nrec.add_argument("--chat-id", required=True)
     p_nrec.add_argument("--thread-id", default="")
     p_nrec.add_argument("--notifier-profile", required=True)
+    p_nrec.add_argument(
+        "--legacy-unstamped",
+        action="store_true",
+        help=(
+            "Reconcile a legacy blank-profile route only after Slack proves the "
+            "stored receipt was authored by --notifier-profile"
+        ),
+    )
 
     # --- log ---
     p_log = sub.add_parser(
@@ -2505,8 +2515,86 @@ def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
     return 0
 
 
+def _slack_api(token: str, method: str, **params: object) -> dict:
+    request = urllib.request.Request(
+        f"https://slack.com/api/{method}",
+        data=urllib.parse.urlencode(params).encode(),
+        headers={"Authorization": f"Bearer {token}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode())
+    if not payload.get("ok"):
+        raise RuntimeError(f"Slack {method} failed: {payload.get('error', 'unknown_error')}")
+    return payload
+
+
+def _slack_tokens_for_active_profile() -> list[str]:
+    from gateway.config import Platform, load_gateway_config
+    from hermes_constants import get_hermes_home
+
+    config = load_gateway_config().platforms.get(Platform.SLACK)
+    tokens = [
+        item.strip() for item in str(config.token if config else "").split(",")
+        if item.strip()
+    ]
+    tokens_file = get_hermes_home() / "slack_tokens.json"
+    if tokens_file.exists():
+        saved = json.loads(tokens_file.read_text(encoding="utf-8"))
+        for entry in saved.values():
+            token = entry.get("token", "") if isinstance(entry, dict) else ""
+            if token and token not in tokens:
+                tokens.append(token)
+    if not tokens:
+        raise RuntimeError("active profile has no Slack bot token")
+    return tokens
+
+
+def _verify_legacy_slack_sender(chat_id: str, message_id: str) -> str:
+    matches: set[str] = set()
+    for token in _slack_tokens_for_active_profile():
+        try:
+            auth = _slack_api(token, "auth.test")
+            history = _slack_api(
+                token,
+                "conversations.history",
+                channel=chat_id,
+                oldest=message_id,
+                latest=message_id,
+                inclusive="true",
+                limit=10,
+            )
+        except RuntimeError:
+            continue
+        for message in history.get("messages", []):
+            if str(message.get("ts", "")) == message_id and message.get("user") == auth.get("user_id"):
+                matches.add(str(auth["user_id"]))
+    if len(matches) != 1:
+        raise RuntimeError(
+            "stored Slack receipt was not authored by exactly one active-profile bot"
+        )
+    return matches.pop()
+
+
 def _cmd_notify_reconcile(args: argparse.Namespace) -> int:
+    verified_sender_id = None
     with kb.connect_closing() as conn:
+        if args.legacy_unstamped:
+            active_profile = get_active_profile_name() or "default"
+            if active_profile != args.notifier_profile:
+                raise ValueError(
+                    "--legacy-unstamped must run under the claimed notifier profile"
+                )
+            message_id = kb._completion_subscription_receipt(
+                conn,
+                task_id=args.task_id,
+                event_id=args.event_id,
+                platform=args.platform,
+                chat_id=args.chat_id,
+                thread_id=args.thread_id,
+                notifier_profile="",
+            )
+            verified_sender_id = _verify_legacy_slack_sender(args.chat_id, message_id)
         message_id = kb.reconcile_completion_delivery(
             conn,
             task_id=args.task_id,
@@ -2515,6 +2603,7 @@ def _cmd_notify_reconcile(args: argparse.Namespace) -> int:
             chat_id=args.chat_id,
             thread_id=args.thread_id,
             notifier_profile=args.notifier_profile,
+            verified_legacy_sender_id=verified_sender_id,
         )
     print(
         f"Reconciled completion event {args.event_id} for {args.task_id} "
