@@ -322,6 +322,12 @@ def test_complete_surfaces_resumable_required_evidence_error(worker_env):
         )
         conn.commit()
 
+    shown = json.loads(kt._handle_show({}))
+    assert shown["task"]["required_evidence"] == ["authenticated_production_e2e"]
+    assert "Required completion evidence: authenticated_production_e2e" in shown[
+        "worker_context"
+    ]
+
     rejected = json.loads(
         kt._handle_complete(
             {

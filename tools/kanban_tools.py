@@ -353,6 +353,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
+        "required_evidence": list(task.required_evidence or []),
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -398,6 +399,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "result": t.result,
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
+                    "required_evidence": list(t.required_evidence or []),
                 }
 
             def _run_dict(r):
