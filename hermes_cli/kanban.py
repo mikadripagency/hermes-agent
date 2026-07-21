@@ -82,6 +82,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "required_evidence": list(t.required_evidence or []),
     }
 
 
@@ -362,6 +363,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument(
+        "--require-evidence",
+        action="append",
+        default=[],
+        dest="required_evidence",
+        metavar="CLASS",
+        help=(
+            "Exact evidence class required under completion metadata.evidence "
+            "(repeatable), e.g. authenticated_production_e2e."
+        ),
+    )
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -585,6 +597,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
     )
     p_unblock.add_argument("task_ids", nargs="+")
+
+    p_reopen = sub.add_parser(
+        "reopen", help="Reopen a prematurely completed task on the same card"
+    )
+    p_reopen.add_argument("task_id")
+    p_reopen.add_argument(
+        "--reason", required=True,
+        help="Audit reason explaining why the prior completion is superseded",
+    )
 
     p_promote = sub.add_parser(
         "promote",
@@ -977,6 +998,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "reopen":   _cmd_reopen,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -1369,6 +1391,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            required_evidence=getattr(args, "required_evidence", None) or None,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2038,6 +2061,25 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_reopen(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        try:
+            ok = kb.reopen_task(
+                conn,
+                args.task_id,
+                actor=_profile_author(),
+                reason=args.reason,
+            )
+        except ValueError as exc:
+            print(f"cannot reopen {args.task_id}: {exc}", file=sys.stderr)
+            return 1
+    if not ok:
+        print(f"cannot reopen {args.task_id} (not done?)", file=sys.stderr)
+        return 1
+    print(f"Reopened {args.task_id}: {args.reason}")
+    return 0
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:

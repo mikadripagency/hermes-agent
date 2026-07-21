@@ -599,6 +599,7 @@ class CreateTaskBody(BaseModel):
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
     task_kind: str = "delivery"
+    required_evidence: Optional[list[str]] = None
 
 
 @router.post("/tasks")
@@ -624,6 +625,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
             task_kind=payload.task_kind,
+            required_evidence=payload.required_evidence,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -819,6 +821,7 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    reopen_reason: Optional[str] = None
     # Structured handoff fields — forwarded to complete_task when status
     # transitions to 'done'. Dashboard parity with ``hermes kanban
     # complete --summary ... --metadata ...``.
@@ -864,7 +867,22 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             elif s == "ready":
                 # Re-open a blocked/scheduled task, or just an explicit status set.
                 current = kanban_db.get_task(conn, task_id)
-                if current and current.status in ("blocked", "scheduled"):
+                if current and current.status == "done":
+                    if not payload.reopen_reason or not payload.reopen_reason.strip():
+                        raise HTTPException(
+                            status_code=400,
+                            detail="reopen_reason is required to reopen a done task",
+                        )
+                    try:
+                        ok = kanban_db.reopen_task(
+                            conn,
+                            task_id,
+                            actor="dashboard",
+                            reason=payload.reopen_reason,
+                        )
+                    except ValueError as exc:
+                        raise HTTPException(status_code=409, detail=str(exc))
+                elif current and current.status in ("blocked", "scheduled"):
                     ok = kanban_db.unblock_task(conn, task_id)
                 else:
                     # Direct status write for drag-drop (todo -> ready etc).

@@ -91,6 +91,36 @@ def test_run_slash_create_and_list(kanban_home):
     assert "alice" in out
 
 
+def test_run_slash_create_persists_required_evidence_contract(kanban_home):
+    import re
+
+    out = kc.run_slash(
+        "create 'production flow' --assignee alice "
+        "--require-evidence authenticated_production_e2e"
+    )
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.required_evidence == ["authenticated_production_e2e"]
+
+
+def test_run_slash_reopen_recovers_same_completed_card(kanban_home):
+    import re
+
+    created = kc.run_slash("create 'premature' --assignee alice")
+    tid = re.search(r"(t_[a-f0-9]+)", created).group(1)
+    assert "Completed" in kc.run_slash(f"complete {tid} --summary premature")
+
+    reopened = kc.run_slash(
+        f"reopen {tid} --reason 'required production evidence was missing'"
+    )
+    assert f"Reopened {tid}" in reopened
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.status == "ready"
+
+
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     target = tmp_path / ".worktrees" / "t6-wire"
     target_arg = target.as_posix()

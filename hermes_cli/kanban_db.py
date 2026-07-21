@@ -952,6 +952,9 @@ class Task:
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
     task_kind: str = "delivery"
+    # Machine-checkable evidence classes required at completion. None/[]
+    # preserves legacy free-form completion behaviour.
+    required_evidence: Optional[list[str]] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -965,6 +968,14 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        required_evidence_value: Optional[list[str]] = None
+        if "required_evidence" in keys and row["required_evidence"]:
+            try:
+                parsed = json.loads(row["required_evidence"])
+                if isinstance(parsed, list):
+                    required_evidence_value = [str(item) for item in parsed]
+            except Exception:
+                required_evidence_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1041,6 +1052,7 @@ class Task:
                 if "task_kind" in keys and row["task_kind"] in VALID_TASK_KINDS
                 else "delivery"
             ),
+            required_evidence=required_evidence_value,
         )
 
 
@@ -1219,7 +1231,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Optional JSON array of exact evidence class names required in
+    -- task_runs.metadata.evidence before this task may become done.
+    -- NULL/[] keeps legacy tasks backward compatible.
+    required_evidence    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2070,6 +2086,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "WHERE task_kind IS NULL OR task_kind = '' OR task_kind = 'legacy'"
         )
 
+    if "required_evidence" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "required_evidence", "required_evidence TEXT"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2583,6 +2604,31 @@ def _detect_registered_project_reference(
     return None
 
 
+_EVIDENCE_CLASS_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def _normalize_required_evidence(
+    values: Optional[Iterable[str]],
+) -> Optional[list[str]]:
+    if values is None:
+        return None
+    if isinstance(values, str):
+        values = [values]
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        name = str(raw).strip()
+        if not _EVIDENCE_CLASS_RE.fullmatch(name):
+            raise ValueError(
+                "required evidence classes must match "
+                "[a-z][a-z0-9_]{0,63}; got " + repr(name)
+            )
+        if name not in seen:
+            seen.add(name)
+            cleaned.append(name)
+    return cleaned
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2608,6 +2654,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     task_kind: str = "delivery",
+    required_evidence: Optional[Iterable[str]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2693,6 +2740,7 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
+    required_evidence_list = _normalize_required_evidence(required_evidence)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -2746,12 +2794,24 @@ def create_task(
     # insert, at which point both rows exist but the next lookup stabilises.
     if idempotency_key:
         row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "SELECT id, required_evidence FROM tasks WHERE idempotency_key = ? "
             "AND status != 'archived' "
             "ORDER BY created_at DESC LIMIT 1",
             (idempotency_key,),
         ).fetchone()
         if row:
+            existing_required = _normalize_required_evidence(
+                json.loads(row["required_evidence"])
+                if row["required_evidence"] else None
+            )
+            if (
+                required_evidence_list is not None
+                and existing_required != required_evidence_list
+            ):
+                raise ValueError(
+                    "idempotency key already belongs to a task with a different "
+                    "required_evidence contract"
+                )
             return row["id"]
 
     now = int(time.time())
@@ -2868,8 +2928,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        required_evidence
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2893,6 +2954,10 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        (
+                            json.dumps(required_evidence_list)
+                            if required_evidence_list is not None else None
+                        ),
                     ),
                 )
                 for pid in parents:
@@ -2913,6 +2978,7 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "required_evidence": required_evidence_list or None,
                     },
                 )
                 if scratch_project_hint:
@@ -4230,6 +4296,50 @@ def _scan_prose_for_phantom_ids(
     return [m for m in unique if m not in existing]
 
 
+class MissingCompletionEvidenceError(ValueError):
+    """A task-declared evidence contract was not satisfied."""
+
+    def __init__(self, missing: list[str], task_id: str):
+        self.missing = list(missing)
+        self.task_id = task_id
+        super().__init__(
+            "completion blocked: missing required evidence classes: "
+            + ", ".join(missing)
+            + ". Retry kanban_complete on the same task with "
+            "metadata.evidence containing non-empty proof for each exact class."
+        )
+
+
+def _evidence_value_satisfies_contract(value: Any) -> bool:
+    if value is True:
+        return True
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple)):
+        return bool(value)
+    if isinstance(value, dict):
+        if not value:
+            return False
+        status = str(value.get("status", "")).strip().casefold()
+        return status not in {
+            "blocked", "failed", "missing", "n/a", "na", "pending", "skipped",
+            "unavailable",
+        }
+    return False
+
+
+def _missing_completion_evidence(
+    required: Optional[Iterable[str]], metadata: Optional[dict],
+) -> list[str]:
+    evidence = metadata.get("evidence") if isinstance(metadata, dict) else None
+    if not isinstance(evidence, dict):
+        evidence = {}
+    return [
+        name for name in (required or [])
+        if not _evidence_value_satisfies_contract(evidence.get(name))
+    ]
+
+
 class HallucinatedCardsError(ValueError):
     """Raised by ``complete_task`` when ``created_cards`` contains ids
     that don't exist or weren't created by the completing worker.
@@ -4288,6 +4398,25 @@ def complete_task(
     """
     now = int(time.time())
     orchestration_route = _resolve_orchestration_completion_route()
+
+    # Task-declared evidence is an immutable creation-time contract. Validate
+    # exact class names before any terminal write, completion event, or delivery
+    # row. The rejected-attempt event is intentionally non-terminal and gives
+    # operators a durable, resumable audit trail.
+    task = get_task(conn, task_id)
+    missing_evidence = _missing_completion_evidence(
+        task.required_evidence if task else None, metadata
+    )
+    if missing_evidence:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_evidence",
+                {"missing": missing_evidence},
+                run_id=expected_run_id,
+            )
+        raise MissingCompletionEvidenceError(missing_evidence, task_id)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -4485,6 +4614,83 @@ def complete_task(
         run_id=run_id,
         summary=(summary if summary is not None else result),
     )
+    return True
+
+
+def reopen_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: str,
+) -> bool:
+    """Safely reopen a prematurely completed task on the same card.
+
+    Completion history and delivery receipts remain immutable. Ready children
+    are demoted atomically; children that already started or completed make the
+    recovery unsafe and must be reconciled before retrying.
+    """
+    actor = str(actor or "").strip()
+    reason = str(reason or "").strip()
+    if not actor:
+        raise ValueError("reopen actor is required")
+    if not reason:
+        raise ValueError("reopen reason is required")
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None or row["status"] != "done":
+            return False
+
+        unsafe_children = conn.execute(
+            "SELECT t.id, t.status FROM tasks t "
+            "JOIN task_links l ON l.child_id = t.id "
+            "WHERE l.parent_id = ? "
+            "AND t.status NOT IN ('todo', 'ready', 'triage', 'blocked', 'scheduled', 'archived')",
+            (task_id,),
+        ).fetchall()
+        if unsafe_children:
+            detail = ", ".join(
+                f"{child['id']} ({child['status']})" for child in unsafe_children
+            )
+            raise ValueError(
+                "cannot safely reopen while dependent child tasks are active or "
+                f"done: {detail}"
+            )
+
+        completed = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'completed' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'ready', result = NULL, completed_at = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "current_run_id = NULL WHERE id = ? AND status = 'done'",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        conn.execute(
+            "UPDATE tasks SET status = 'todo' WHERE id IN ("
+            "SELECT child_id FROM task_links WHERE parent_id = ?"
+            ") AND status = 'ready'",
+            (task_id,),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "reopened",
+            {
+                "actor": actor,
+                "reason": reason,
+                "superseded_completed_event_id": (
+                    int(completed["id"]) if completed else None
+                ),
+            },
+        )
     return True
 
 
@@ -8484,6 +8690,14 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
+    if task.required_evidence:
+        lines.append(
+            "Required completion evidence: " + ", ".join(task.required_evidence)
+        )
+        lines.append(
+            "Provide each exact class under `kanban_complete` "
+            "`metadata.evidence`; weaker or differently named evidence does not count."
+        )
     lines.append("")
 
     if task.body and task.body.strip():
