@@ -459,7 +459,10 @@ def test_reopening_parent_demotes_ready_child(client):
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{parent['id']}",
-        json={"status": "todo"},
+        json={
+            "status": "todo",
+            "reopen_reason": "parent completion was premature",
+        },
     )
     assert r.status_code == 200
 
@@ -2297,3 +2300,24 @@ def test_dashboard_failed_card_highlight_class_exists():
     assert "hermes-kanban-card--failed" in js
     assert "hermes-kanban-card--failed" in css
     assert "failedIds" in js
+
+
+def test_completion_evidence_error_is_resumable_http_conflict(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "authenticated production gate",
+            "required_evidence": ["authenticated_production_e2e"],
+        },
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "done", "metadata": {"evidence": {}}},
+    )
+
+    assert response.status_code == 409
+    assert "missing required evidence classes" in response.json()["detail"]
+    assert client.get(
+        f"/api/plugins/kanban/tasks/{task['id']}"
+    ).json()["task"]["status"] == "ready"

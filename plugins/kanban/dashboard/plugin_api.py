@@ -599,6 +599,7 @@ class CreateTaskBody(BaseModel):
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
     task_kind: str = "delivery"
+    required_evidence: Optional[list[str]] = None
 
 
 @router.post("/tasks")
@@ -624,6 +625,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
             task_kind=payload.task_kind,
+            required_evidence=payload.required_evidence,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -819,6 +821,7 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    reopen_reason: Optional[str] = None
     # Structured handoff fields — forwarded to complete_task when status
     # transitions to 'done'. Dashboard parity with ``hermes kanban
     # complete --summary ... --metadata ...``.
@@ -850,13 +853,36 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.status is not None:
             s = payload.status
             ok = True
+            if task.status == "done" and s in {"ready", "todo", "triage", "scheduled"}:
+                if not payload.reopen_reason or not payload.reopen_reason.strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="reopen_reason is required to reopen a done task",
+                    )
+                try:
+                    ok = kanban_db.reopen_task(
+                        conn,
+                        task_id,
+                        actor="dashboard",
+                        reason=payload.reopen_reason,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc))
+                if not ok:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="done task changed before reopen completed",
+                    )
             if s == "done":
-                ok = kanban_db.complete_task(
-                    conn, task_id,
-                    result=payload.result,
-                    summary=payload.summary,
-                    metadata=payload.metadata,
-                )
+                try:
+                    ok = kanban_db.complete_task(
+                        conn, task_id,
+                        result=payload.result,
+                        summary=payload.summary,
+                        metadata=payload.metadata,
+                    )
+                except kanban_db.MissingCompletionEvidenceError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc))
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
@@ -1007,6 +1033,15 @@ def _set_status_direct(
         if prev is None:
             return False
 
+        # Terminal history may only be superseded through the audited
+        # kanban_db.reopen_task recovery path. A direct drag must never erase
+        # completion state or bypass its dependent-child safety checks.
+        if (
+            prev["status"] in {"done", "archived"}
+            and new_status not in {"done", "archived"}
+        ):
+            return False
+
         # Guard: don't allow promoting to 'ready' unless all parents are done.
         # Prevents the dispatcher from spawning a child whose upstream work
         # hasn't completed (e.g. T4 dispatched while T3 is still blocked).
@@ -1023,10 +1058,6 @@ def _set_status_direct(
                 return False
 
         was_running = prev["status"] == "running"
-        reopening_satisfied_parent = (
-            prev["status"] in {"done", "archived"}
-            and new_status not in {"done", "archived"}
-        )
 
         cur = conn.execute(
             "UPDATE tasks SET status = ?, "
@@ -1050,38 +1081,7 @@ def _set_status_direct(
             "VALUES (?, ?, 'status', ?, ?)",
             (task_id, run_id, json.dumps({"status": new_status}), int(time.time())),
         )
-        if reopening_satisfied_parent:
-            # A parent leaving done/archived invalidates any direct child that
-            # was sitting in ready solely because that parent used to satisfy
-            # the dependency gate. Demote those children immediately so the
-            # dashboard does not keep advertising stale-ready work.
-            for row in conn.execute(
-                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
-                (task_id,),
-            ).fetchall():
-                child_id = row["child_id"]
-                demoted = conn.execute(
-                    "UPDATE tasks SET status = 'todo' "
-                    "WHERE id = ? AND status = 'ready'",
-                    (child_id,),
-                )
-                if demoted.rowcount == 1:
-                    conn.execute(
-                        "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                        "VALUES (?, 'status', ?, ?)",
-                        (
-                            child_id,
-                            json.dumps(
-                                {
-                                    "status": "todo",
-                                    "reason": "parent_reopened",
-                                    "parent": task_id,
-                                }
-                            ),
-                            int(time.time()),
-                        ),
-                    )
-    # If we re-opened something, children may have gone stale.
+    # Recompute dependency promotion after ordinary ready/done moves.
     if new_status in {"done", "ready"}:
         kanban_db.recompute_ready(conn)
     return True
@@ -1164,6 +1164,7 @@ class BulkTaskBody(BaseModel):
     summary: Optional[str] = None
     metadata: Optional[dict] = None
     reclaim_first: bool = False
+    reopen_reason: Optional[str] = None
 
 
 @router.post("/tasks/bulk")
@@ -1188,6 +1189,26 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     entry.update(ok=False, error="not found")
                     results.append(entry)
                     continue
+                if (
+                    payload.status in {"ready", "todo", "triage", "scheduled"}
+                    and task.status == "done"
+                ):
+                    if not payload.reopen_reason or not payload.reopen_reason.strip():
+                        entry.update(
+                            ok=False,
+                            error="reopen_reason is required to reopen a done task",
+                        )
+                        results.append(entry)
+                        continue
+                    if not kanban_db.reopen_task(
+                        conn,
+                        tid,
+                        actor="dashboard",
+                        reason=payload.reopen_reason,
+                    ):
+                        entry.update(ok=False, error="done task changed during reopen")
+                        results.append(entry)
+                        continue
                 if payload.archive:
                     if not kanban_db.archive_task(conn, tid):
                         entry.update(ok=False, error="archive refused")

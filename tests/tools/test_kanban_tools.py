@@ -311,6 +311,44 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_surfaces_resumable_required_evidence_error(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET required_evidence = ? WHERE id = ?",
+            (json.dumps(["authenticated_production_e2e"]), worker_env),
+        )
+        conn.commit()
+
+    shown = json.loads(kt._handle_show({}))
+    assert shown["task"]["required_evidence"] == ["authenticated_production_e2e"]
+    assert "Required completion evidence: authenticated_production_e2e" in shown[
+        "worker_context"
+    ]
+
+    rejected = json.loads(
+        kt._handle_complete(
+            {
+                "summary": "only auth redirect checked",
+                "metadata": {
+                    "evidence": {"auth_redirect_307": {"status": "passed"}}
+                },
+            }
+        )
+    )
+    assert "authenticated_production_e2e" in rejected["error"]
+    assert "same task" in rejected["error"]
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None and task.status == "running"
+        assert not any(
+            event.kind == "completed" for event in kb.list_events(conn, worker_env)
+        )
+
+
 def test_complete_metadata_round_trips_through_show(worker_env):
     """Structured completion metadata should be visible to downstream agents."""
     from tools import kanban_tools as kt
@@ -964,6 +1002,7 @@ def test_create_happy_path(worker_env):
         "title": "child task",
         "assignee": "peer",
         "parents": [worker_env],
+        "required_evidence": ["authenticated_production_e2e"],
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -975,6 +1014,7 @@ def test_create_happy_path(worker_env):
         child = kb.get_task(conn, d["task_id"])
         assert child.title == "child task"
         assert child.assignee == "peer"
+        assert child.required_evidence == ["authenticated_production_e2e"]
     finally:
         conn.close()
 

@@ -353,6 +353,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
+        "required_evidence": list(task.required_evidence or []),
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -398,6 +399,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "result": t.result,
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
+                    "required_evidence": list(t.required_evidence or []),
                 }
 
             def _run_dict(r):
@@ -886,6 +888,15 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    required_evidence = args.get("required_evidence")
+    if isinstance(required_evidence, str):
+        required_evidence = [required_evidence]
+    if required_evidence is not None and not isinstance(
+        required_evidence, (list, tuple)
+    ):
+        return tool_error(
+            "required_evidence must be a list of evidence class names"
+        )
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -934,6 +945,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                required_evidence=required_evidence,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1234,8 +1246,10 @@ KANBAN_COMPLETE_SCHEMA = {
                 "description": (
                     "Free-form dict of structured facts about this "
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                    "\"findings\": [...]}. Surfaced to downstream "
-                    "workers alongside ``summary``."
+                    "\"findings\": [...]}. If the task declares required "
+                    "evidence classes, provide exact matching non-empty values "
+                    "under metadata.evidence. Surfaced to downstream workers "
+                    "alongside ``summary``."
                 ),
             },
             "result": {
@@ -1540,6 +1554,18 @@ KANBAN_CREATE_SCHEMA = {
                     "continuation turns the worker may take before the task "
                     "is blocked for review. Ignored unless goal_mode is "
                     "true. Defaults to the goal-engine default (20)."
+                ),
+            },
+            "required_evidence": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_]{0,63}$",
+                },
+                "description": (
+                    "Optional exact evidence class names that kanban_complete "
+                    "must receive under metadata.evidence before this task can "
+                    "become done. Omit or pass [] for legacy/N/A behaviour."
                 ),
             },
             "board": _board_schema_prop(),

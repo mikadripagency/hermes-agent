@@ -75,6 +75,155 @@ def test_complete_task_writes_pending_ledger_row_for_every_task(kanban_home):
         assert row["receipt_id"] is None
 
 
+def test_required_evidence_rejects_weaker_completion_without_done_side_effects(
+    kanban_home,
+):
+    """A local flow and auth redirect cannot satisfy authenticated Prod E2E."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn,
+            title="authenticated production export",
+            required_evidence=["authenticated_production_e2e", "png_export"],
+        )
+
+        with pytest.raises(
+            kb.MissingCompletionEvidenceError,
+            match="authenticated_production_e2e",
+        ):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="local and redirect checks passed",
+                metadata={
+                    "evidence": {
+                        "local_ui_flow": {"status": "passed"},
+                        "auth_redirect_307": {"status": "passed"},
+                        "png_export": {"status": "passed"},
+                    }
+                },
+            )
+
+        assert kb.get_task(conn, tid).status == "ready"
+        assert not any(e.kind == "completed" for e in kb.list_events(conn, tid))
+        assert conn.execute(
+            "SELECT COUNT(*) FROM completion_deliveries WHERE task_id = ?", (tid,)
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "weak_value",
+    [
+        {"note": ""},
+        [""],
+        {"status": "not_run"},
+        {"status": "pending", "receipt": "claimed"},
+    ],
+)
+def test_required_evidence_rejects_empty_or_non_passing_proof(
+    kanban_home, weak_value
+):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn,
+            title="proof quality gate",
+            required_evidence=["authenticated_production_e2e"],
+        )
+        with pytest.raises(kb.MissingCompletionEvidenceError):
+            kb.complete_task(
+                conn,
+                tid,
+                metadata={"evidence": {"authenticated_production_e2e": weak_value}},
+            )
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "ready"
+
+
+def test_required_evidence_retry_completes_exactly_once(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn,
+            title="authenticated production export",
+            required_evidence=["authenticated_production_e2e", "png_export"],
+        )
+        with pytest.raises(kb.MissingCompletionEvidenceError):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="export only",
+                metadata={"evidence": {"png_export": True}},
+            )
+
+        evidence = {
+            "authenticated_production_e2e": {
+                "status": "passed",
+                "receipt": "disposable-e2e-receipt",
+            },
+            "png_export": {"status": "passed", "artifact": "export.png"},
+        }
+        assert kb.complete_task(
+            conn, tid, summary="all required gates passed", metadata={"evidence": evidence}
+        )
+        blocked_before_duplicate = sum(
+            e.kind == "completion_blocked_evidence"
+            for e in kb.list_events(conn, tid)
+        )
+        assert not kb.complete_task(
+            conn, tid, summary="duplicate retry", metadata=None
+        )
+        completed = [e for e in kb.list_events(conn, tid) if e.kind == "completed"]
+        blocked = [
+            e
+            for e in kb.list_events(conn, tid)
+            if e.kind == "completion_blocked_evidence"
+        ]
+        deliveries = conn.execute(
+            "SELECT COUNT(*) FROM completion_deliveries WHERE task_id = ?", (tid,)
+        ).fetchone()[0]
+
+    assert len(completed) == 1
+    assert len(blocked) == blocked_before_duplicate
+    assert deliveries == 1
+
+
+@pytest.mark.parametrize("required_evidence", [None, []])
+def test_legacy_and_explicit_na_evidence_contracts_remain_compatible(
+    kanban_home, required_evidence,
+):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn,
+            title="legacy or N/A task",
+            required_evidence=required_evidence,
+        )
+        assert kb.complete_task(conn, tid, summary="done without evidence metadata")
+
+
+def test_reopen_done_task_keeps_history_and_allows_same_card_recovery(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="premature completion")
+        assert kb.complete_task(conn, tid, summary="premature")
+        first_event = _completed_event_id(conn, tid)
+
+        assert kb.reopen_task(
+            conn,
+            tid,
+            actor="operator",
+            reason="required production evidence was missing",
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "ready"
+        assert task.completed_at is None
+        assert task.result is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM completion_deliveries WHERE event_id = ?",
+            (first_event,),
+        ).fetchone()[0] == 1
+        reopened = [e for e in kb.list_events(conn, tid) if e.kind == "reopened"]
+        assert len(reopened) == 1
+        assert reopened[0].payload["superseded_completed_event_id"] == first_event
+
+
 def test_init_migrates_legacy_single_event_delivery_key(tmp_path, monkeypatch):
     db_path = tmp_path / "legacy-completion-ledger.db"
     conn = sqlite3.connect(db_path)
@@ -517,3 +666,22 @@ def test_reconcile_backstop_still_upgrades_done_time_pending_row(kanban_home):
             "state": "acknowledged",
             "receipt_id": "1784300000.000003",
         }
+
+
+def test_reopen_refuses_archived_completed_dependent(kanban_home):
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="premature parent")
+        child = kb.create_task(conn, title="completed child", parents=[parent])
+        assert kb.complete_task(conn, parent, summary="premature")
+        assert kb.complete_task(conn, child, summary="derived from parent")
+        assert kb.archive_task(conn, child)
+
+        with pytest.raises(ValueError, match="dependent child tasks"):
+            kb.reopen_task(
+                conn,
+                parent,
+                actor="operator",
+                reason="parent completion was invalid",
+            )
+        parent_task = kb.get_task(conn, parent)
+        assert parent_task is not None and parent_task.status == "done"
