@@ -2806,7 +2806,7 @@ def create_task(
             )
             if (
                 required_evidence_list is not None
-                and existing_required != required_evidence_list
+                and (existing_required or []) != required_evidence_list
             ):
                 raise ValueError(
                     "idempotency key already belongs to a task with a different "
