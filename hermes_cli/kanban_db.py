@@ -4404,6 +4404,8 @@ def complete_task(
     # row. The rejected-attempt event is intentionally non-terminal and gives
     # operators a durable, resumable audit trail.
     task = get_task(conn, task_id)
+    if task is not None and task.status not in {"running", "ready", "blocked"}:
+        return False
     missing_evidence = _missing_completion_evidence(
         task.required_evidence if task else None, metadata
     )

@@ -135,15 +135,25 @@ def test_required_evidence_retry_completes_exactly_once(kanban_home):
         assert kb.complete_task(
             conn, tid, summary="all required gates passed", metadata={"evidence": evidence}
         )
+        blocked_before_duplicate = sum(
+            e.kind == "completion_blocked_evidence"
+            for e in kb.list_events(conn, tid)
+        )
         assert not kb.complete_task(
-            conn, tid, summary="duplicate retry", metadata={"evidence": evidence}
+            conn, tid, summary="duplicate retry", metadata=None
         )
         completed = [e for e in kb.list_events(conn, tid) if e.kind == "completed"]
+        blocked = [
+            e
+            for e in kb.list_events(conn, tid)
+            if e.kind == "completion_blocked_evidence"
+        ]
         deliveries = conn.execute(
             "SELECT COUNT(*) FROM completion_deliveries WHERE task_id = ?", (tid,)
         ).fetchone()[0]
 
     assert len(completed) == 1
+    assert len(blocked) == blocked_before_duplicate
     assert deliveries == 1
 
 
