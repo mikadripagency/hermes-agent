@@ -853,6 +853,26 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.status is not None:
             s = payload.status
             ok = True
+            if task.status == "done" and s in {"ready", "todo", "triage", "scheduled"}:
+                if not payload.reopen_reason or not payload.reopen_reason.strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="reopen_reason is required to reopen a done task",
+                    )
+                try:
+                    ok = kanban_db.reopen_task(
+                        conn,
+                        task_id,
+                        actor="dashboard",
+                        reason=payload.reopen_reason,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc))
+                if not ok:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="done task changed before reopen completed",
+                    )
             if s == "done":
                 ok = kanban_db.complete_task(
                     conn, task_id,
@@ -867,22 +887,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             elif s == "ready":
                 # Re-open a blocked/scheduled task, or just an explicit status set.
                 current = kanban_db.get_task(conn, task_id)
-                if current and current.status == "done":
-                    if not payload.reopen_reason or not payload.reopen_reason.strip():
-                        raise HTTPException(
-                            status_code=400,
-                            detail="reopen_reason is required to reopen a done task",
-                        )
-                    try:
-                        ok = kanban_db.reopen_task(
-                            conn,
-                            task_id,
-                            actor="dashboard",
-                            reason=payload.reopen_reason,
-                        )
-                    except ValueError as exc:
-                        raise HTTPException(status_code=409, detail=str(exc))
-                elif current and current.status in ("blocked", "scheduled"):
+                if current and current.status in ("blocked", "scheduled"):
                     ok = kanban_db.unblock_task(conn, task_id)
                 else:
                     # Direct status write for drag-drop (todo -> ready etc).
@@ -1181,6 +1186,26 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     entry.update(ok=False, error="not found")
                     results.append(entry)
                     continue
+                if (
+                    payload.status in {"ready", "todo", "triage", "scheduled"}
+                    and task.status == "done"
+                ):
+                    if not payload.reopen_reason or not payload.reopen_reason.strip():
+                        entry.update(
+                            ok=False,
+                            error="reopen_reason is required to reopen a done task",
+                        )
+                        results.append(entry)
+                        continue
+                    if not kanban_db.reopen_task(
+                        conn,
+                        tid,
+                        actor="dashboard",
+                        reason=payload.reopen_reason,
+                    ):
+                        entry.update(ok=False, error="done task changed during reopen")
+                        results.append(entry)
+                        continue
                 if payload.archive:
                     if not kanban_db.archive_task(conn, tid):
                         entry.update(ok=False, error="archive refused")
@@ -1197,21 +1222,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         ok = kanban_db.block_task(conn, tid)
                     elif s == "ready":
                         cur = kanban_db.get_task(conn, tid)
-                        if cur and cur.status == "done":
-                            if not payload.reopen_reason or not payload.reopen_reason.strip():
-                                entry.update(
-                                    ok=False,
-                                    error="reopen_reason is required to reopen a done task",
-                                )
-                                results.append(entry)
-                                continue
-                            ok = kanban_db.reopen_task(
-                                conn,
-                                tid,
-                                actor="dashboard",
-                                reason=payload.reopen_reason,
-                            )
-                        elif cur and cur.status in ("blocked", "scheduled"):
+                        if cur and cur.status in ("blocked", "scheduled"):
                             ok = kanban_db.unblock_task(conn, tid)
                         else:
                             ok = _set_status_direct(conn, tid, "ready")

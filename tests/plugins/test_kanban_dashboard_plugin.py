@@ -459,7 +459,10 @@ def test_reopening_parent_demotes_ready_child(client):
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{parent['id']}",
-        json={"status": "todo"},
+        json={
+            "status": "todo",
+            "reopen_reason": "parent completion was premature",
+        },
     )
     assert r.status_code == 200
 
