@@ -110,6 +110,34 @@ def test_required_evidence_rejects_weaker_completion_without_done_side_effects(
         ).fetchone()[0] == 0
 
 
+@pytest.mark.parametrize(
+    "weak_value",
+    [
+        {"note": ""},
+        [""],
+        {"status": "not_run"},
+        {"status": "pending", "receipt": "claimed"},
+    ],
+)
+def test_required_evidence_rejects_empty_or_non_passing_proof(
+    kanban_home, weak_value
+):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn,
+            title="proof quality gate",
+            required_evidence=["authenticated_production_e2e"],
+        )
+        with pytest.raises(kb.MissingCompletionEvidenceError):
+            kb.complete_task(
+                conn,
+                tid,
+                metadata={"evidence": {"authenticated_production_e2e": weak_value}},
+            )
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "ready"
+
+
 def test_required_evidence_retry_completes_exactly_once(kanban_home):
     with kb.connect_closing() as conn:
         tid = kb.create_task(
@@ -638,3 +666,22 @@ def test_reconcile_backstop_still_upgrades_done_time_pending_row(kanban_home):
             "state": "acknowledged",
             "receipt_id": "1784300000.000003",
         }
+
+
+def test_reopen_refuses_archived_completed_dependent(kanban_home):
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="premature parent")
+        child = kb.create_task(conn, title="completed child", parents=[parent])
+        assert kb.complete_task(conn, parent, summary="premature")
+        assert kb.complete_task(conn, child, summary="derived from parent")
+        assert kb.archive_task(conn, child)
+
+        with pytest.raises(ValueError, match="dependent child tasks"):
+            kb.reopen_task(
+                conn,
+                parent,
+                actor="operator",
+                reason="parent completion was invalid",
+            )
+        parent_task = kb.get_task(conn, parent)
+        assert parent_task is not None and parent_task.status == "done"

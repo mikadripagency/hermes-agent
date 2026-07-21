@@ -4316,15 +4316,21 @@ def _evidence_value_satisfies_contract(value: Any) -> bool:
     if isinstance(value, str):
         return bool(value.strip())
     if isinstance(value, (list, tuple)):
-        return bool(value)
+        return any(_evidence_value_satisfies_contract(item) for item in value)
     if isinstance(value, dict):
         if not value:
             return False
-        status = str(value.get("status", "")).strip().casefold()
-        return status not in {
-            "blocked", "failed", "missing", "n/a", "na", "pending", "skipped",
-            "unavailable",
-        }
+        if "status" in value:
+            status = str(value["status"]).strip().casefold()
+            if status not in {
+                "complete", "completed", "ok", "pass", "passed", "success",
+                "succeeded", "verified",
+            }:
+                return False
+            return True
+        return any(
+            _evidence_value_satisfies_contract(item) for item in value.values()
+        )
     return False
 
 
@@ -4403,14 +4409,15 @@ def complete_task(
     # exact class names before any terminal write, completion event, or delivery
     # row. The rejected-attempt event is intentionally non-terminal and gives
     # operators a durable, resumable audit trail.
-    task = get_task(conn, task_id)
-    if task is not None and task.status not in {"running", "ready", "blocked"}:
-        return False
-    missing_evidence = _missing_completion_evidence(
-        task.required_evidence if task else None, metadata
-    )
-    if missing_evidence:
-        with write_txn(conn):
+    missing_evidence: list[str] = []
+    with write_txn(conn):
+        task = get_task(conn, task_id)
+        if task is not None and task.status not in {"running", "ready", "blocked"}:
+            return False
+        missing_evidence = _missing_completion_evidence(
+            task.required_evidence if task else None, metadata
+        )
+        if missing_evidence:
             _append_event(
                 conn,
                 task_id,
@@ -4418,6 +4425,7 @@ def complete_task(
                 {"missing": missing_evidence},
                 run_id=expected_run_id,
             )
+    if missing_evidence:
         raise MissingCompletionEvidenceError(missing_evidence, task_id)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
@@ -4650,7 +4658,7 @@ def reopen_task(
             "SELECT t.id, t.status FROM tasks t "
             "JOIN task_links l ON l.child_id = t.id "
             "WHERE l.parent_id = ? "
-            "AND t.status NOT IN ('todo', 'ready', 'triage', 'blocked', 'scheduled', 'archived')",
+            "AND t.status NOT IN ('todo', 'ready', 'triage', 'blocked', 'scheduled')",
             (task_id,),
         ).fetchall()
         if unsafe_children:

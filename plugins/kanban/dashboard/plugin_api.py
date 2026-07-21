@@ -874,12 +874,15 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                         detail="done task changed before reopen completed",
                     )
             if s == "done":
-                ok = kanban_db.complete_task(
-                    conn, task_id,
-                    result=payload.result,
-                    summary=payload.summary,
-                    metadata=payload.metadata,
-                )
+                try:
+                    ok = kanban_db.complete_task(
+                        conn, task_id,
+                        result=payload.result,
+                        summary=payload.summary,
+                        metadata=payload.metadata,
+                    )
+                except kanban_db.MissingCompletionEvidenceError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc))
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
