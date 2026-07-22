@@ -174,6 +174,7 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
 # ``HERMES_KANBAN_CLAIM_TTL_SECONDS`` to raise the default claim window for
 # long single-call MCP workflows.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
+DEFAULT_MAX_IN_PROGRESS_PER_PROJECT = 3
 
 # If a worker's PID is still alive but its ``last_heartbeat_at`` is
 # older than this when ``release_stale_claims`` runs, treat the worker
@@ -3708,12 +3709,27 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def _active_project_lane_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Count delivery lanes that still own capacity, grouped by project."""
+    return {
+        row["project_id"]: int(row["n"])
+        for row in conn.execute(
+            "SELECT project_id, COUNT(*) AS n FROM tasks "
+            "WHERE project_id IS NOT NULL AND task_kind = 'delivery' AND ("
+            "status IN ('running', 'review') OR ("
+            "status = 'blocked' AND branch_name IS NOT NULL AND TRIM(branch_name) != ''"
+            ")) GROUP BY project_id"
+        )
+    }
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    max_in_progress_per_project: Optional[int] = DEFAULT_MAX_IN_PROGRESS_PER_PROJECT,
 ) -> Optional[Task]:
     """Atomically claim Backlog or an unclaimed In Progress recovery.
 
@@ -3749,6 +3765,24 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        candidate = conn.execute(
+            "SELECT status, project_id, task_kind FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        project_cap = max_in_progress_per_project if (
+            isinstance(max_in_progress_per_project, int)
+            and max_in_progress_per_project > 0
+        ) else None
+        if (
+            candidate
+            and candidate["status"] == "ready"
+            and candidate["project_id"]
+            and candidate["task_kind"] == "delivery"
+            and project_cap is not None
+        ):
+            active = _active_project_lane_counts(conn).get(candidate["project_id"], 0)
+            if active >= project_cap:
+                return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -6303,9 +6337,9 @@ class DispatchResult:
     skipped_per_project_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their project is already at
     ``kanban.max_in_progress_per_project``. Each entry is
-    ``(task_id, project_id, current_running_count)``. Mirrors
+    ``(task_id, project_id, current_active_count)``. Mirrors
     ``skipped_per_profile_capped`` but groups by ``tasks.project_id`` — it
-    caps concurrent workers within a single project (repo / experiment lane)
+    caps active delivery lanes within a single project (repo / experiment lane)
     so one project's fan-out cannot saturate the board while others starve.
     Tasks with no project (NULL ``project_id``) are exempt and never counted.
     NOT operator-actionable — picked up on a later tick when the project has
@@ -7584,7 +7618,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
-    max_in_progress_per_project: Optional[int] = None,
+    max_in_progress_per_project: Optional[int] = DEFAULT_MAX_IN_PROGRESS_PER_PROJECT,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -7653,7 +7687,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
-    max_in_progress_per_project: Optional[int] = None,
+    max_in_progress_per_project: Optional[int] = DEFAULT_MAX_IN_PROGRESS_PER_PROJECT,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -7728,7 +7762,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, project_id FROM tasks "
+        "SELECT id, assignee, project_id, status FROM tasks "
         "WHERE status IN ('ready', 'running') AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -7776,14 +7810,9 @@ def _dispatch_once_locked(
         isinstance(max_in_progress_per_project, int)
         and max_in_progress_per_project > 0
     ) else None
-    _per_project_running: dict[str, int] = {}
+    _per_project_active: dict[str, int] = {}
     if _per_project_cap is not None:
-        for prow in conn.execute(
-            "SELECT project_id, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND claim_lock IS NOT NULL AND project_id IS NOT NULL "
-            "GROUP BY project_id"
-        ):
-            _per_project_running[prow["project_id"]] = int(prow["n"])
+        _per_project_active = _active_project_lane_counts(conn)
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -7887,8 +7916,9 @@ def _dispatch_once_locked(
         # refuse to spawn for a project already at its in-flight cap. Tasks
         # with no project (NULL project_id) are exempt.
         row_project = row["project_id"]
-        if _per_project_cap is not None and row_project:
-            current = _per_project_running.get(row_project, 0)
+        is_new_project_lane = row["status"] == "ready"
+        if _per_project_cap is not None and row_project and is_new_project_lane:
+            current = _per_project_active.get(row_project, 0)
             if current >= _per_project_cap:
                 result.skipped_per_project_capped.append(
                     (row["id"], row_project, current)
@@ -7925,14 +7955,23 @@ def _dispatch_once_locked(
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
-            if _per_project_cap is not None and row_project:
-                _per_project_running[row_project] = (
-                    _per_project_running.get(row_project, 0) + 1
+            if _per_project_cap is not None and row_project and is_new_project_lane:
+                _per_project_active[row_project] = (
+                    _per_project_active.get(row_project, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            max_in_progress_per_project=_per_project_cap,
+        )
         if claimed is None:
             continue
+        if _per_project_cap is not None and row_project and is_new_project_lane:
+            _per_project_active[row_project] = (
+                _per_project_active.get(row_project, 0) + 1
+            )
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -7983,10 +8022,6 @@ def _dispatch_once_locked(
             if _per_profile_cap is not None and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
-                )
-            if _per_project_cap is not None and getattr(claimed, "project_id", None):
-                _per_project_running[claimed.project_id] = (
-                    _per_project_running.get(claimed.project_id, 0) + 1
                 )
         except Exception as exc:
             auto = _record_spawn_failure(

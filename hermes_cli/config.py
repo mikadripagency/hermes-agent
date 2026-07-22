@@ -2740,14 +2740,14 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
-        # Per-project concurrency cap. When set to a positive int, no single
+        # Per-project concurrency cap. No single
         # project (repo / experiment lane, grouped by tasks.project_id) can
-        # have more than N workers running at once, even if the global
-        # max_in_progress / per-profile caps would allow it. Tasks with no
-        # project (NULL project_id) are exempt. Unset (None) or 0 means "no
-        # per-project cap". Useful to stop one project's fan-out from
-        # saturating the board while sibling projects starve.
-        "max_in_progress_per_project": None,
+        # own more than N active delivery lanes at once, even if the global
+        # max_in_progress / per-profile caps would allow it. Running, review,
+        # and branch-owning blocked tasks count. Tasks with no
+        # project (NULL project_id) are exempt. The default enforces the
+        # delivery policy; set to null or 0 to opt out explicitly.
+        "max_in_progress_per_project": 3,
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or
