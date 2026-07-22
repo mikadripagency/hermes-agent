@@ -1161,10 +1161,10 @@ class GatewayKanbanWatchersMixin:
                     )
 
         # Read kanban.max_in_progress_per_project — per-project concurrency
-        # cap. When set, no single project (repo / experiment lane) gets more
-        # than N workers running at once, even if the global max_in_progress /
+        # cap. No single project (repo / experiment lane) gets more than N
+        # active delivery lanes, even if the global max_in_progress /
         # per-profile caps would allow it. Tasks with no project are exempt.
-        raw_per_project = kanban_cfg.get("max_in_progress_per_project", None)
+        raw_per_project = kanban_cfg.get("max_in_progress_per_project", 3)
         max_in_progress_per_project = None
         if raw_per_project is not None:
             try:
