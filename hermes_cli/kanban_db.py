@@ -3977,9 +3977,9 @@ def release_stale_claims(
 ) -> int:
     """Reset any ``running`` task whose claim has expired.
 
-    A stale-by-TTL claim whose host-local worker PID is still alive is
-    *extended* (with a ``claim_extended`` event) instead of being
-    reclaimed. Reclaiming a live worker mid-flight produces the spawn-
+    A stale-by-TTL claim with a fresh heartbeat, or whose host-local worker
+    PID is still alive, is *extended* (with a ``claim_extended`` event) instead
+    of being reclaimed. Reclaiming a live worker mid-flight produces the spawn-
     then-immediately-reclaim loop seen on slow models that spend longer
     than ``DEFAULT_CLAIM_TTL_SECONDS`` inside a single tool-free LLM
     call (#23025): no tool calls means no ``kanban_heartbeat``, even
@@ -4022,11 +4022,15 @@ def release_stale_claims(
             hb is not None
             and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         )
+        heartbeat_fresh = hb is not None and not heartbeat_stale
         if (
-            host_local
-            and row["worker_pid"]
-            and _pid_alive(row["worker_pid"])
-            and not heartbeat_stale
+            heartbeat_fresh
+            or (
+                host_local
+                and row["worker_pid"]
+                and _pid_alive(row["worker_pid"])
+                and not heartbeat_stale
+            )
         ):
             new_expires = now + _resolve_claim_ttl_seconds()
             with write_txn(conn):
@@ -4049,8 +4053,11 @@ def release_stale_claims(
                 _append_event(
                     conn, row["id"], "claim_extended",
                     {
-                        "reason": "pid_alive",
-                        "worker_pid": int(row["worker_pid"]),
+                        "reason": "heartbeat_fresh" if heartbeat_fresh else "pid_alive",
+                        "worker_pid": (
+                            int(row["worker_pid"])
+                            if row["worker_pid"] is not None else None
+                        ),
                         "claim_lock": row["claim_lock"],
                         "claim_expires_was": int(row["claim_expires"]),
                         "claim_expires_now": new_expires,
@@ -6664,29 +6671,31 @@ def heartbeat_worker(
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
+    """Record a ``heartbeat`` event and atomically renew the active claim.
 
     Called by long-running workers as a liveness signal orthogonal to
     the PID check. A worker that forks a long-lived child (train loop,
     video encode, web crawl) can have its Python still alive while the
     actual work process is stuck; periodic heartbeats catch that.
 
-    Returns True on success, False if the task is not in a state that
-    should be heartbeating (not running, or claim expired).
+    Returns True on success, False if the task is not running or the optional
+    run fence no longer matches.
     """
     now = int(time.time())
+    claim_expires = now + _resolve_claim_ttl_seconds()
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running'",
-                (now, task_id),
+                "UPDATE tasks SET last_heartbeat_at = ?, claim_expires = ? "
+                "WHERE id = ? AND status = 'running' AND claim_lock IS NOT NULL",
+                (now, claim_expires, task_id),
             )
         else:
             cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
-                (now, task_id, int(expected_run_id)),
+                "UPDATE tasks SET last_heartbeat_at = ?, claim_expires = ? "
+                "WHERE id = ? AND status = 'running' AND claim_lock IS NOT NULL "
+                "AND current_run_id = ?",
+                (now, claim_expires, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -6697,8 +6706,8 @@ def heartbeat_worker(
         )
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
-                (now, run_id),
+                "UPDATE task_runs SET last_heartbeat_at = ?, claim_expires = ? WHERE id = ?",
+                (now, claim_expires, run_id),
             )
         _append_event(
             conn, task_id, "heartbeat",

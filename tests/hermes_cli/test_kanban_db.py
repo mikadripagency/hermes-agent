@@ -570,6 +570,114 @@ def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
         assert "reclaimed" not in kinds
 
 
+def test_expired_claim_with_fresh_heartbeat_extends_without_pid(kanban_home):
+    """A fresh heartbeat is authoritative liveness even after TTL expiry."""
+    now = int(time.time())
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="alive", assignee="worker")
+        kb.claim_task(conn, task_id, claimer="remote-host:worker")
+        claimed = kb.get_task(conn, task_id)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ?, worker_pid = NULL "
+            "WHERE id = ?",
+            (now - 1, now, task_id),
+        )
+
+        killed: list[int] = []
+        reclaimed = kb.release_stale_claims(
+            conn, signal_fn=lambda _pid, sig: killed.append(sig),
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert reclaimed == 0
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id == run_id
+        assert task.claim_expires is not None
+        assert task.claim_expires > now
+        assert killed == []
+        assert "reclaimed" not in [event.kind for event in kb.list_events(conn, task_id)]
+
+
+def test_heartbeat_worker_renews_task_and_run_claim_atomically(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="alive", assignee="worker")
+        kb.claim_task(conn, task_id, claimer="remote-host:worker")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.current_run_id is not None
+        run_id = task.current_run_id
+        conn.execute("UPDATE tasks SET claim_expires = 1 WHERE id = ?", (task_id,))
+        conn.execute("UPDATE task_runs SET claim_expires = 1 WHERE id = ?", (run_id,))
+
+        assert not kb.heartbeat_worker(conn, task_id, expected_run_id=run_id + 1)
+        assert conn.execute(
+            "SELECT claim_expires FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()["claim_expires"] == 1
+
+        assert kb.heartbeat_worker(conn, task_id, expected_run_id=run_id)
+
+        task_expiry = conn.execute(
+            "SELECT claim_expires FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()["claim_expires"]
+        run_expiry = conn.execute(
+            "SELECT claim_expires FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()["claim_expires"]
+        assert task_expiry == run_expiry
+        assert task_expiry > int(time.time())
+
+
+def test_fresh_heartbeat_prevents_reclaim_repeatedly_then_stale_control_reclaims(
+    kanban_home,
+):
+    """Repeated expiry scans preserve one live run; a stale control reclaims once."""
+    now = int(time.time())
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="race", assignee="worker")
+        kb.claim_task(conn, task_id, claimer="remote-host:worker")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        run_id = task.current_run_id
+
+        def heartbeat_once() -> bool:
+            with kb.connect() as heartbeat_conn:
+                return kb.heartbeat_worker(
+                    heartbeat_conn, task_id, expected_run_id=run_id,
+                )
+
+        def reclaim_once() -> int:
+            with kb.connect() as reclaim_conn:
+                return kb.release_stale_claims(reclaim_conn)
+
+        for _ in range(50):
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? WHERE id = ?",
+                (now - 1, now, task_id),
+            )
+            conn.commit()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                heartbeat_result = pool.submit(heartbeat_once)
+                reclaim_result = pool.submit(reclaim_once)
+                assert heartbeat_result.result() is True
+                assert reclaim_result.result() == 0
+            current = kb.get_task(conn, task_id)
+            assert current is not None
+            assert current.current_run_id == run_id
+
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? WHERE id = ?",
+            (
+                now - 1,
+                now - kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS - 1,
+                task_id,
+            ),
+        )
+        assert kb.release_stale_claims(conn) == 1
+        assert kb.release_stale_claims(conn) == 0
+
+
 def test_stale_claim_with_live_pid_uses_env_ttl_override(
     kanban_home, monkeypatch,
 ):
@@ -778,7 +886,7 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
         kb.claim_task(conn, t, claimer=f"{host}:worker")
         kb._set_worker_pid(conn, t, 12345)
         old_expires = int(time.time()) - 3600
-        hb_at = int(time.time()) - 1800
+        hb_at = int(time.time()) - 7200
         conn.execute(
             "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
             "WHERE id = ?",
