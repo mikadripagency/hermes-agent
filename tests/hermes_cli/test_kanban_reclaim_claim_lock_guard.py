@@ -109,5 +109,10 @@ def test_genuine_crash_still_reclaims(conn):
 
     crashed = kb.detect_crashed_workers(conn)
     assert tid in crashed
-    final = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
-    assert final["status"] in ("ready", "blocked", "todo")
+    final = conn.execute(
+        "SELECT status, claim_lock, current_run_id FROM tasks WHERE id=?", (tid,)
+    ).fetchone()
+    assert final["status"] == "running"
+    assert final["claim_lock"] is None
+    assert final["current_run_id"] is None
+    assert kb.claim_task(conn, tid, claimer=f"{host}:retry") is not None
