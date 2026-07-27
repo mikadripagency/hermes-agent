@@ -138,6 +138,10 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 VALID_TASK_KINDS = {"delivery", "system_inbox"}
+MAX_EVIDENCE_NA_REASON_CHARS = 500
+LEGACY_DECOMPOSE_EVIDENCE_NA_REASON = (
+    "legacy decompose child (contract fields unavailable)"
+)
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -953,9 +957,12 @@ class Task:
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
     task_kind: str = "delivery"
-    # Machine-checkable evidence classes required at completion. None/[]
-    # preserves legacy free-form completion behaviour.
+    # Machine-checkable evidence classes required at completion. None/[] may
+    # exist on legacy rows; new delivery tasks must declare this or an N/A reason.
     required_evidence: Optional[list[str]] = None
+    # Explicit reason why a newly-created delivery task has no machine-checkable
+    # completion evidence. NULL on legacy rows and evidence-backed tasks.
+    evidence_contract_na_reason: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1054,6 +1061,12 @@ class Task:
                 else "delivery"
             ),
             required_evidence=required_evidence_value,
+            evidence_contract_na_reason=(
+                row["evidence_contract_na_reason"]
+                if "evidence_contract_na_reason" in keys
+                and row["evidence_contract_na_reason"]
+                else None
+            ),
         )
 
 
@@ -1235,8 +1248,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
     -- Optional JSON array of exact evidence class names required in
     -- task_runs.metadata.evidence before this task may become done.
-    -- NULL/[] keeps legacy tasks backward compatible.
-    required_evidence    TEXT
+    -- NULL/[] keeps existing legacy rows backward compatible; new delivery
+    -- tasks must declare this or evidence_contract_na_reason.
+    required_evidence    TEXT,
+    -- Explicit, auditable N/A reason for new delivery tasks that intentionally
+    -- have no machine-checkable completion evidence. NULL on legacy rows.
+    evidence_contract_na_reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2092,6 +2109,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "required_evidence", "required_evidence TEXT"
         )
 
+    if "evidence_contract_na_reason" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "evidence_contract_na_reason",
+            "evidence_contract_na_reason TEXT",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2630,6 +2655,22 @@ def _normalize_required_evidence(
     return cleaned
 
 
+def _normalize_evidence_contract_na_reason(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("evidence_contract_na_reason must be a string")
+    reason = value.strip()
+    if not reason:
+        raise ValueError("evidence_contract_na_reason must not be blank")
+    if len(reason) > MAX_EVIDENCE_NA_REASON_CHARS:
+        raise ValueError(
+            "evidence_contract_na_reason must be at most "
+            f"{MAX_EVIDENCE_NA_REASON_CHARS} characters"
+        )
+    return reason
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2654,8 +2695,9 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
-    task_kind: str = "delivery",
+    task_kind: Optional[str] = None,
     required_evidence: Optional[Iterable[str]] = None,
+    evidence_contract_na_reason: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2679,8 +2721,15 @@ def create_task(
     each name to ``hermes --skills ...``. Use this to pin a task to a
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
+
+    Public create surfaces pass ``task_kind`` explicitly. Omitting it is the
+    backward-compatible Python API path and persists a structured legacy N/A
+    reason instead of silently storing an empty evidence contract.
     """
     assignee = _canonical_assignee(assignee)
+    legacy_create_api = task_kind is None
+    if task_kind is None:
+        task_kind = "delivery"
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -2742,6 +2791,22 @@ def create_task(
 
     parents = tuple(p for p in parents if p)
     required_evidence_list = _normalize_required_evidence(required_evidence)
+    evidence_na_reason = _normalize_evidence_contract_na_reason(
+        evidence_contract_na_reason
+    )
+    if legacy_create_api and not required_evidence_list and not evidence_na_reason:
+        evidence_na_reason = "legacy create_task caller (task_kind omitted)"
+    if required_evidence_list and evidence_na_reason:
+        raise ValueError(
+            "delivery evidence contract must choose required_evidence or "
+            "evidence_contract_na_reason, not both"
+        )
+    if task_kind == "delivery" and not required_evidence_list and not evidence_na_reason:
+        raise ValueError(
+            "delivery task requires an explicit evidence contract: provide at least "
+            "one required_evidence class or evidence_contract_na_reason for an "
+            "auditable N/A decision"
+        )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -2795,7 +2860,8 @@ def create_task(
     # insert, at which point both rows exist but the next lookup stabilises.
     if idempotency_key:
         row = conn.execute(
-            "SELECT id, required_evidence FROM tasks WHERE idempotency_key = ? "
+            "SELECT id, required_evidence, evidence_contract_na_reason FROM tasks "
+            "WHERE idempotency_key = ? "
             "AND status != 'archived' "
             "ORDER BY created_at DESC LIMIT 1",
             (idempotency_key,),
@@ -2813,6 +2879,16 @@ def create_task(
                     "idempotency key already belongs to a task with a different "
                     "required_evidence contract"
                 )
+            existing_na_reason = row["evidence_contract_na_reason"] or None
+            if evidence_na_reason is not None and existing_na_reason != evidence_na_reason:
+                # Old Python callers omitted task_kind before evidence contracts
+                # existed. Their idempotent retries must still resolve an
+                # existing pre-migration row whose reason is NULL.
+                if not (legacy_create_api and existing_na_reason is None):
+                    raise ValueError(
+                        "idempotency key already belongs to a task with a different "
+                        "evidence_contract_na_reason"
+                    )
             return row["id"]
 
     now = int(time.time())
@@ -2930,8 +3006,8 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
-                        required_evidence
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        required_evidence, evidence_contract_na_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2959,6 +3035,7 @@ def create_task(
                             json.dumps(required_evidence_list)
                             if required_evidence_list is not None else None
                         ),
+                        evidence_na_reason,
                     ),
                 )
                 for pid in parents:
@@ -2980,6 +3057,7 @@ def create_task(
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "required_evidence": required_evidence_list or None,
+                        "evidence_contract_na_reason": evidence_na_reason,
                     },
                 )
                 if scratch_project_hint:
@@ -5746,9 +5824,10 @@ def decompose_triage_task(
                 child_ws_path = None
             conn.execute(
                 "INSERT INTO tasks "
-                "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                "(id, title, body, assignee, status, task_kind, workspace_kind, "
+                " workspace_path, tenant, created_at, created_by, "
+                " evidence_contract_na_reason) "
+                "VALUES (?, ?, ?, ?, 'todo', 'delivery', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -5759,11 +5838,17 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    LEGACY_DECOMPOSE_EVIDENCE_NA_REASON,
                 ),
             )
             _append_event(
                 conn, new_id, "created",
-                {"by": author or "decomposer", "from_decompose_of": task_id},
+                {
+                    "by": author or "decomposer",
+                    "from_decompose_of": task_id,
+                    "task_kind": "delivery",
+                    "evidence_contract_na_reason": LEGACY_DECOMPOSE_EVIDENCE_NA_REASON,
+                },
             )
             child_ids.append(new_id)
 
@@ -6937,6 +7022,9 @@ def detect_stale_running(
                     created_by="kanban-stall-escalation",
                     priority=100,
                     idempotency_key=f"stall-recovery:{tid}",
+                    evidence_contract_na_reason=(
+                        "orchestration recovery control card; no terminal delivery gate"
+                    ),
                 )
             with write_txn(conn):
                 already_escalated = conn.execute(
@@ -8749,8 +8837,13 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             "Required completion evidence: " + ", ".join(task.required_evidence)
         )
         lines.append(
-            "Provide each exact class under `kanban_complete` "
-            "`metadata.evidence`; weaker or differently named evidence does not count."
+            "Provide each exact class under `kanban_complete` `metadata.evidence`; "
+            "weaker or differently named evidence does not count."
+        )
+    elif task.evidence_contract_na_reason:
+        lines.append(
+            "Completion evidence contract: N/A — "
+            + task.evidence_contract_na_reason
         )
     lines.append("")
 

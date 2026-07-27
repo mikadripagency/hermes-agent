@@ -61,12 +61,19 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
         c0 = kb.get_task(conn, child_ids[0])
         c1 = kb.get_task(conn, child_ids[1])
 
+    assert c0 is not None
+    assert c1 is not None
     # Root flipped to todo with orchestrator assignee, gated by children.
     assert root.status == "todo"
     assert root.assignee == "orchestrator"
     # First child has no internal parents → ready on recompute_ready.
     assert c0.status == "ready"
     assert c0.assignee == "researcher"
+    assert c0.task_kind == "delivery"
+    assert (
+        c0.evidence_contract_na_reason
+        == kb.LEGACY_DECOMPOSE_EVIDENCE_NA_REASON
+    )
     # Second child has parents=[0] → stays in todo until c0 completes.
     assert c1.status == "todo"
     assert c1.assignee == "engineer"

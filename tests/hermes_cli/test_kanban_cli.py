@@ -24,6 +24,24 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+@pytest.fixture(autouse=True)
+def explicit_evidence_contract_for_unrelated_cli_tests(monkeypatch):
+    """Keep unrelated CLI create tests explicit about their N/A contract."""
+    original = kc.run_slash
+
+    def run_slash_with_contract(command):
+        stripped = command.strip()
+        if (
+            stripped.startswith("create ")
+            and "--require-evidence" not in stripped
+            and "--evidence-na-reason" not in stripped
+        ):
+            command += " --evidence-na-reason 'unrelated CLI test fixture'"
+        return original(command)
+
+    monkeypatch.setattr(kc, "run_slash", run_slash_with_contract)
+
+
 # ---------------------------------------------------------------------------
 # Workspace flag parsing
 # ---------------------------------------------------------------------------
@@ -318,6 +336,7 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
 
     def worker(board: str, title: str) -> None:
         args = parser.parse_args(["kanban", "--board", board, "create", title])
+        args.evidence_contract_na_reason = "unrelated CLI concurrency test fixture"
         rc = kc.kanban_command(args)
         if rc != 0:
             failures.append(f"{board}:{rc}")

@@ -14,6 +14,26 @@ import os
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def explicit_evidence_contract_for_unrelated_create_tests(monkeypatch):
+    """Keep unrelated handler tests explicit about their N/A evidence contract."""
+    from tools import kanban_tools as kt
+
+    original = kt._handle_create
+
+    def create_with_contract(args, **kwargs):
+        args = dict(args)
+        if (
+            "task_kind" not in args
+            and not args.get("required_evidence")
+            and not args.get("evidence_contract_na_reason")
+        ):
+            args["evidence_contract_na_reason"] = "unrelated tool test fixture"
+        return original(args, **kwargs)
+
+    monkeypatch.setattr(kt, "_handle_create", create_with_contract)
+
+
 # ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------
@@ -163,7 +183,12 @@ def worker_env(monkeypatch, tmp_path):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
+        tid = kb.create_task(
+            conn,
+            title="worker-test",
+            assignee="test-worker",
+            evidence_contract_na_reason="test fixture",
+        )
         kb.claim_task(conn, tid)
     finally:
         conn.close()
@@ -1017,6 +1042,52 @@ def test_create_happy_path(worker_env):
         assert child.required_evidence == ["authenticated_production_e2e"]
     finally:
         conn.close()
+
+
+def test_create_rejects_missing_delivery_evidence_contract(worker_env):
+    from tools import kanban_tools as kt
+
+    result = json.loads(
+        kt._handle_create(
+            {
+                "title": "missing contract",
+                "assignee": "peer",
+                "task_kind": "delivery",
+            }
+        )
+    )
+
+    assert "explicit evidence contract" in result["error"]
+
+
+def test_create_accepts_explicit_na_evidence_contract(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    result = json.loads(
+        kt._handle_create(
+            {
+                "title": "analysis only",
+                "assignee": "peer",
+                "evidence_contract_na_reason": "no terminal runtime gate",
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, result["task_id"])
+    assert task is not None
+    assert task.evidence_contract_na_reason == "no terminal runtime gate"
+
+
+def test_create_schema_exposes_the_same_evidence_contract_choices():
+    from tools.kanban_tools import KANBAN_CREATE_SCHEMA
+
+    properties = KANBAN_CREATE_SCHEMA["parameters"]["properties"]
+    assert properties["required_evidence"]["minItems"] == 1
+    assert properties["evidence_contract_na_reason"]["minLength"] == 1
+    assert properties["task_kind"]["enum"] == ["delivery", "system_inbox"]
 
 
 def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):

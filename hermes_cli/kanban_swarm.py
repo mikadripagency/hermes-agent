@@ -124,6 +124,7 @@ def create_swarm(
         idempotency_key=idempotency_key,
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
+        evidence_contract_na_reason="swarm topology anchor; no terminal delivery gate",
     )
 
     # If idempotency returned an existing non-archived root, do not duplicate the
@@ -169,6 +170,9 @@ def create_swarm(
             workspace_path=workspace_path,
             skills=spec.skills or None,
             max_runtime_seconds=spec.max_runtime_seconds,
+            evidence_contract_na_reason=(
+                "specialist swarm output is gated by the downstream verifier"
+            ),
         )
         worker_ids.append(worker_id)
 
@@ -190,6 +194,7 @@ def create_swarm(
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
         skills=["requesting-code-review"],
+        evidence_contract_na_reason="swarm verifier output; no terminal delivery gate",
     )
 
     synthesizer_body = (
@@ -209,6 +214,7 @@ def create_swarm(
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
         skills=["humanizer"],
+        evidence_contract_na_reason="swarm synthesis output; no terminal delivery gate",
     )
 
     created = SwarmCreated(root, worker_ids, verifier, synthesizer)

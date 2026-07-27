@@ -353,7 +353,9 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
+        "task_kind": task.task_kind,
         "required_evidence": list(task.required_evidence or []),
+        "evidence_contract_na_reason": task.evidence_contract_na_reason,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -399,7 +401,9 @@ def _handle_show(args: dict, **kw) -> str:
                     "result": t.result,
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
+                    "task_kind": t.task_kind,
                     "required_evidence": list(t.required_evidence or []),
+                    "evidence_contract_na_reason": t.evidence_contract_na_reason,
                 }
 
             def _run_dict(r):
@@ -888,7 +892,9 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    task_kind = args.get("task_kind") or "delivery"
     required_evidence = args.get("required_evidence")
+    evidence_contract_na_reason = args.get("evidence_contract_na_reason")
     if isinstance(required_evidence, str):
         required_evidence = [required_evidence]
     if required_evidence is not None and not isinstance(
@@ -945,7 +951,9 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                task_kind=str(task_kind),
                 required_evidence=required_evidence,
+                evidence_contract_na_reason=evidence_contract_na_reason,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1558,15 +1566,31 @@ KANBAN_CREATE_SCHEMA = {
             },
             "required_evidence": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                     "type": "string",
                     "pattern": "^[a-z][a-z0-9_]{0,63}$",
                 },
                 "description": (
-                    "Optional exact evidence class names that kanban_complete "
-                    "must receive under metadata.evidence before this task can "
-                    "become done. Omit or pass [] for legacy/N/A behaviour."
+                    "Exact evidence class names that kanban_complete must receive "
+                    "under metadata.evidence before a delivery task can become done. "
+                    "A delivery task requires this or evidence_contract_na_reason."
                 ),
+            },
+            "evidence_contract_na_reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500,
+                "description": (
+                    "Explicit auditable reason why a delivery task has no "
+                    "machine-checkable completion evidence. Mutually exclusive "
+                    "with required_evidence."
+                ),
+            },
+            "task_kind": {
+                "type": "string",
+                "enum": ["delivery", "system_inbox"],
+                "description": "Task projection class. Defaults to delivery.",
             },
             "board": _board_schema_prop(),
         },

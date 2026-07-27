@@ -82,7 +82,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "task_kind": t.task_kind,
         "required_evidence": list(t.required_evidence or []),
+        "evidence_contract_na_reason": t.evidence_contract_na_reason,
     }
 
 
@@ -373,6 +375,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "Exact evidence class required under completion metadata.evidence "
             "(repeatable), e.g. authenticated_production_e2e."
         ),
+    )
+    p_create.add_argument(
+        "--evidence-na-reason",
+        dest="evidence_contract_na_reason",
+        metavar="REASON",
+        help=(
+            "Explicit auditable reason why this delivery task has no "
+            "machine-checkable completion evidence."
+        ),
+    )
+    p_create.add_argument(
+        "--task-kind",
+        choices=sorted(kb.VALID_TASK_KINDS),
+        default="delivery",
+        help="Task projection class (default: delivery).",
     )
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
@@ -1391,7 +1408,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
-            required_evidence=getattr(args, "required_evidence", None) or None,
+            task_kind=getattr(args, "task_kind", "delivery"),
+            required_evidence=getattr(args, "required_evidence", None),
+            evidence_contract_na_reason=getattr(
+                args, "evidence_contract_na_reason", None
+            ),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
