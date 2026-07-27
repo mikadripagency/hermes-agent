@@ -30,6 +30,8 @@ if str(_WORKTREE) not in sys.path:
 
 from hermes_cli import kanban_db as kb
 
+pytestmark = pytest.mark.usefixtures("explicit_delivery_contract_for_kanban_fixtures")
+
 
 # ---------------------------------------------------------------------------
 # Fixture
@@ -514,9 +516,21 @@ class TestCLI:
         assert _cli(["boards", "create", "projB"], env_extra=env).returncode == 0
 
         # Create one task on each via --board.
-        r = _cli(["--board", "projA", "create", "Task A", "--assignee", "dev"], env_extra=env)
+        r = _cli(
+            [
+                "--board", "projA", "create", "Task A", "--assignee", "dev",
+                "--evidence-na-reason", "test fixture; no terminal delivery gate",
+            ],
+            env_extra=env,
+        )
         assert r.returncode == 0, r.stderr
-        r = _cli(["--board", "projB", "create", "Task B", "--assignee", "dev"], env_extra=env)
+        r = _cli(
+            [
+                "--board", "projB", "create", "Task B", "--assignee", "dev",
+                "--evidence-na-reason", "test fixture; no terminal delivery gate",
+            ],
+            env_extra=env,
+        )
         assert r.returncode == 0, r.stderr
 
         # list on each board only shows its own.

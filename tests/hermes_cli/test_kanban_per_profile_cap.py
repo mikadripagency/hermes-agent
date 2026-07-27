@@ -25,6 +25,20 @@ def isolated_kanban_home_with_profiles(monkeypatch):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
             del sys.modules[mod]
     from hermes_cli import kanban_db
+
+    original_create_task = kanban_db.create_task
+
+    def create_with_contract(conn, **kwargs):
+        kwargs = dict(kwargs)
+        if not kwargs.get("required_evidence") and not kwargs.get(
+            "evidence_contract_na_reason"
+        ):
+            kwargs["evidence_contract_na_reason"] = (
+                "test fixture; no terminal delivery gate"
+            )
+        return original_create_task(conn, **kwargs)
+
+    monkeypatch.setattr(kanban_db, "create_task", create_with_contract)
     yield kanban_db
 
 
