@@ -1725,12 +1725,19 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
                 agent._client_log_context(),
             )
             return client
-    # Inject TCP keepalives so the kernel detects dead provider connections
-    # instead of letting them sit silently in CLOSE-WAIT (#10324).  Without
-    # this, a peer that drops mid-stream leaves the socket in a state where
-    # epoll_wait never fires, ``httpx`` read timeout may not trigger, and
-    # the agent hangs until manually killed.  Probes after 30s idle, retry
-    # every 10s, give up after 3 → dead peer detected within ~60s.
+    # Attach a pooled-keepalive ``httpx.Client`` (``keepalive_expiry=20s``,
+    # ``read=None``) so idle pooled connections are reaped before a reverse
+    # proxy drops them — no socket options are touched; see
+    # ``_build_keepalive_http_client``.  NOTE: the earlier socket-level TCP
+    # keepalive dead-peer probes (#10324) were REMOVED (#54049, #12952)
+    # because the custom ``socket_options`` (``SO_KEEPALIVE`` / ``TCP_KEEPIDLE``
+    # …) broke streaming behind reverse proxies and stripped ``TCP_NODELAY``.
+    # There is therefore NO kernel/read-timeout that trips when a peer drops
+    # mid-stream (``read`` is ``None``); recovery from a silently stalled SSE
+    # stream is the app-level stale-stream watchdog in the conversation /
+    # chat-completion loop (``_compute_non_stream_stale_timeout`` plus
+    # ``_consecutive_stale_streams`` / ``HERMES_STREAM_STALE_GIVEUP``), which
+    # aborts the stalled call and fails over to the next provider.
     #
     # Safety against #10933: the ``client_kwargs = dict(client_kwargs)``
     # above means this injection only lands in the local per-call copy,
