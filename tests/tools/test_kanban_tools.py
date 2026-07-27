@@ -18,8 +18,10 @@ import pytest
 def explicit_evidence_contract_for_unrelated_create_tests(monkeypatch):
     """Keep unrelated handler tests explicit about their N/A evidence contract."""
     from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
 
     original = kt._handle_create
+    original_create_task = kb.create_task
 
     def create_with_contract(args, **kwargs):
         args = dict(args)
@@ -32,6 +34,18 @@ def explicit_evidence_contract_for_unrelated_create_tests(monkeypatch):
         return original(args, **kwargs)
 
     monkeypatch.setattr(kt, "_handle_create", create_with_contract)
+
+    def create_fixture_task(conn, **kwargs):
+        kwargs = dict(kwargs)
+        if (
+            "task_kind" not in kwargs
+            and not kwargs.get("required_evidence")
+            and not kwargs.get("evidence_contract_na_reason")
+        ):
+            kwargs["evidence_contract_na_reason"] = "unrelated tool test fixture"
+        return original_create_task(conn, **kwargs)
+
+    monkeypatch.setattr(kb, "create_task", create_fixture_task)
 
 
 # ---------------------------------------------------------------------------
@@ -1087,7 +1101,29 @@ def test_create_schema_exposes_the_same_evidence_contract_choices():
     properties = KANBAN_CREATE_SCHEMA["parameters"]["properties"]
     assert properties["required_evidence"]["minItems"] == 1
     assert properties["evidence_contract_na_reason"]["minLength"] == 1
-    assert properties["task_kind"]["enum"] == ["delivery", "system_inbox"]
+    assert "task_kind" not in properties
+
+
+def test_create_cannot_select_system_inbox(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    result = json.loads(
+        kt._handle_create(
+            {
+                "title": "untrusted inbox attempt",
+                "assignee": "peer",
+                "task_kind": "system_inbox",
+                "evidence_contract_na_reason": "test-only task",
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, result["task_id"])
+    assert task is not None
+    assert task.task_kind == "delivery"
 
 
 def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):

@@ -28,6 +28,7 @@ def kanban_home(tmp_path, monkeypatch):
 def explicit_evidence_contract_for_unrelated_cli_tests(monkeypatch):
     """Keep unrelated CLI create tests explicit about their N/A contract."""
     original = kc.run_slash
+    original_create_task = kb.create_task
 
     def run_slash_with_contract(command):
         stripped = command.strip()
@@ -40,6 +41,18 @@ def explicit_evidence_contract_for_unrelated_cli_tests(monkeypatch):
         return original(command)
 
     monkeypatch.setattr(kc, "run_slash", run_slash_with_contract)
+
+    def create_with_contract(conn, **kwargs):
+        kwargs = dict(kwargs)
+        if (
+            "task_kind" not in kwargs
+            and not kwargs.get("required_evidence")
+            and not kwargs.get("evidence_contract_na_reason")
+        ):
+            kwargs["evidence_contract_na_reason"] = "unrelated CLI test fixture"
+        return original_create_task(conn, **kwargs)
+
+    monkeypatch.setattr(kb, "create_task", create_with_contract)
 
 
 # ---------------------------------------------------------------------------

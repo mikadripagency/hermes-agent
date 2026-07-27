@@ -25,6 +25,8 @@ from agent.image_routing import (
     extract_image_refs,
 )
 
+pytestmark = pytest.mark.usefixtures("explicit_delivery_contract_for_kanban_fixtures")
+
 
 # Tiny 1×1 transparent PNG used to back any path the tests stick into a
 # task body. extract_image_refs validates the path exists on disk, so the

@@ -13,6 +13,8 @@ import tempfile
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("explicit_delivery_contract_for_kanban_fixtures")
+
 
 @pytest.fixture()
 def isolated_kanban_home(monkeypatch):
@@ -24,6 +26,20 @@ def isolated_kanban_home(monkeypatch):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
             del sys.modules[mod]
     from hermes_cli import kanban_db
+
+    original_create_task = kanban_db.create_task
+
+    def create_with_contract(conn, **kwargs):
+        kwargs = dict(kwargs)
+        if not kwargs.get("required_evidence") and not kwargs.get(
+            "evidence_contract_na_reason"
+        ):
+            kwargs["evidence_contract_na_reason"] = (
+                "test fixture; no terminal delivery gate"
+            )
+        return original_create_task(conn, **kwargs)
+
+    monkeypatch.setattr(kanban_db, "create_task", create_with_contract)
     yield kanban_db, test_home
     # Cleanup is best-effort; tempfile dir survives but pytest isolation
     # gives each test its own monkeypatched HERMES_HOME so no cross-test

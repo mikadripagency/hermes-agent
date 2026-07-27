@@ -17,6 +17,24 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+@pytest.fixture(autouse=True)
+def explicit_evidence_contract_for_unrelated_create_tests(monkeypatch):
+    """Keep unrelated DB fixtures explicit about their N/A evidence contract."""
+    original = kb.create_task
+
+    def create_with_contract(conn, **kwargs):
+        kwargs = dict(kwargs)
+        if (
+            "task_kind" not in kwargs
+            and not kwargs.get("required_evidence")
+            and not kwargs.get("evidence_contract_na_reason")
+        ):
+            kwargs["evidence_contract_na_reason"] = "unrelated DB test fixture"
+        return original(conn, **kwargs)
+
+    monkeypatch.setattr(kb, "create_task", create_with_contract)
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
@@ -230,12 +248,11 @@ def test_create_task_no_parents_is_ready(kanban_home):
 def test_system_inbox_is_hidden_from_delivery_projection_but_keeps_lifecycle(kanban_home):
     with kb.connect() as conn:
         delivery = kb.create_task(conn, title="ship it")
-        inbox = kb.create_task(
+        inbox = kb.create_system_inbox_task(
             conn,
             title="process writer queue",
             assignee="developer",
             initial_status="blocked",
-            task_kind="system_inbox",
         )
 
         assert [task.id for task in kb.list_tasks(conn, include_system=False)] == [delivery]

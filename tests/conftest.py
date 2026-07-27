@@ -32,6 +32,28 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+@pytest.fixture
+def explicit_delivery_contract_for_kanban_fixtures(monkeypatch):
+    """Give unrelated Kanban fixtures an explicit no-delivery-gate decision."""
+    from hermes_cli import kanban_db as kb
+
+    original_create_task = kb.create_task
+
+    def create_task_with_contract(conn, *args, **kwargs):
+        if (
+            kwargs.get("task_kind", "delivery") == "delivery"
+            and not kwargs.get("required_evidence")
+            and not kwargs.get("evidence_contract_na_reason")
+        ):
+            kwargs = dict(kwargs)
+            kwargs["evidence_contract_na_reason"] = (
+                "test fixture; no terminal delivery gate"
+            )
+        return original_create_task(conn, *args, **kwargs)
+
+    monkeypatch.setattr(kb, "create_task", create_task_with_contract)
+
+
 # ── Per-file process isolation ──────────────────────────────────────────────
 # Tests run via ``scripts/run_tests_parallel.py``, which spawns a fresh
 # ``python -m pytest <file>`` subprocess per test file. Cross-file state

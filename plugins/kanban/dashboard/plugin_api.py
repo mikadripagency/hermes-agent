@@ -598,7 +598,6 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
-    task_kind: str = "delivery"
     required_evidence: Optional[list[str]] = None
     evidence_contract_na_reason: Optional[str] = Field(default=None, max_length=500)
 
@@ -625,7 +624,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
-            task_kind=payload.task_kind,
+            task_kind="delivery",
             required_evidence=payload.required_evidence,
             evidence_contract_na_reason=payload.evidence_contract_na_reason,
         )

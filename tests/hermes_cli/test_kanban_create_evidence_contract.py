@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import re
+import shutil
+import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -72,25 +76,25 @@ def test_delivery_create_persists_explicit_na_reason_in_readback_and_event(kanba
     assert created.payload["evidence_contract_na_reason"] == task.evidence_contract_na_reason
 
 
-def test_system_inbox_create_remains_exempt(kanban_home):
+def test_trusted_system_inbox_create_remains_exempt(kanban_home):
     with kb.connect_closing() as conn:
-        task_id = kb.create_task(
+        task_id = kb.create_system_inbox_task(
             conn,
             title="process writer queue",
-            task_kind="system_inbox",
             initial_status="blocked",
         )
 
     assert task_id.startswith("t_")
 
 
-def test_legacy_python_create_caller_gets_auditable_compatibility_reason(kanban_home):
+def test_python_create_without_contract_fails_closed(kanban_home):
     with kb.connect_closing() as conn:
-        task_id = kb.create_task(conn, title="legacy internal caller")
-        task = kb.get_task(conn, task_id)
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        with pytest.raises(ValueError, match="explicit evidence contract"):
+            kb.create_task(conn, title="new internal caller")
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
 
-    assert task is not None
-    assert task.evidence_contract_na_reason == "legacy create_task caller (task_kind omitted)"
+    assert after == before
 
 
 def test_legacy_python_idempotent_retry_resolves_pre_contract_row(kanban_home):
@@ -109,6 +113,111 @@ def test_legacy_python_idempotent_retry_resolves_pre_contract_row(kanban_home):
         )
 
     assert task_id == "t_legacy_retry"
+
+
+def test_idempotent_retry_cannot_omit_an_existing_contract(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="contracted",
+            idempotency_key="contracted-key",
+            required_evidence=["regression_test"],
+        )
+        with pytest.raises(ValueError, match="must provide the existing task"):
+            kb.create_task(
+                conn,
+                title="contracted retry",
+                idempotency_key="contracted-key",
+            )
+
+    assert task_id.startswith("t_")
+
+
+def test_copied_legacy_db_keeps_null_contract_and_idempotent_readback(
+    kanban_home, tmp_path,
+):
+    source = tmp_path / "source.db"
+    copied = tmp_path / "copied.db"
+    conn = sqlite3.connect(source)
+    conn.execute(
+        "CREATE TABLE tasks ("
+        "id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT, assignee TEXT, "
+        "status TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0, "
+        "created_by TEXT, created_at INTEGER NOT NULL, started_at INTEGER, "
+        "completed_at INTEGER, workspace_kind TEXT NOT NULL DEFAULT 'scratch', "
+        "workspace_path TEXT, claim_lock TEXT, claim_expires INTEGER, "
+        "idempotency_key TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE task_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, "
+        "kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO tasks "
+        "(id, title, status, created_at, idempotency_key) "
+        "VALUES ('t_copied_legacy', 'legacy', 'ready', 1, 'copy-key')"
+    )
+    conn.commit()
+    conn.close()
+    shutil.copy2(source, copied)
+
+    with kb.connect(copied) as conn:
+        task = kb.get_task(conn, "t_copied_legacy")
+        assert task is not None
+        retry_id = kb.create_task(
+            conn,
+            title="legacy retry",
+            idempotency_key="copy-key",
+        )
+        completed = kb.complete_task(conn, task.id, summary="legacy copy complete")
+        completed_task = kb.get_task(conn, task.id)
+
+    assert task.required_evidence is None
+    assert task.evidence_contract_na_reason is None
+    assert retry_id == task.id
+    assert completed is True
+    assert completed_task is not None and completed_task.status == "done"
+
+
+def test_concurrent_idempotent_creates_write_one_task_and_event(
+    kanban_home, monkeypatch,
+):
+    barrier = threading.Barrier(2)
+    original_new_task_id = kb._new_task_id
+
+    def synchronized_new_task_id():
+        task_id = original_new_task_id()
+        barrier.wait(timeout=5)
+        return task_id
+
+    monkeypatch.setattr(kb, "_new_task_id", synchronized_new_task_id)
+
+    def create_once():
+        with kb.connect_closing() as conn:
+            return kb.create_task(
+                conn,
+                title="one logical request",
+                idempotency_key="concurrent-contract-create",
+                required_evidence=["regression_test"],
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        task_ids = list(pool.map(lambda _: create_once(), range(2)))
+
+    with kb.connect_closing() as conn:
+        task_count = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?",
+            ("concurrent-contract-create",),
+        ).fetchone()[0]
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'created'",
+            (task_ids[0],),
+        ).fetchone()[0]
+
+    assert task_ids[0] == task_ids[1]
+    assert task_count == 1
+    assert event_count == 1
 
 
 def test_delivery_contract_rejects_ambiguous_or_malformed_na_reason(kanban_home):
@@ -155,3 +264,18 @@ def test_cli_accepts_and_reads_back_explicit_na_contract(kanban_home):
         task = kb.get_task(conn, match.group(1))
     assert task is not None
     assert task.evidence_contract_na_reason == "no runtime side effects"
+
+
+def test_cli_cannot_select_system_inbox(kanban_home):
+    with kb.connect_closing() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    output = kc.run_slash(
+        "create 'untrusted inbox attempt' --assignee alice "
+        "--task-kind system_inbox --evidence-na-reason test-only"
+    )
+
+    with kb.connect_closing() as conn:
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    assert "unrecognized arguments: --task-kind system_inbox" in output
+    assert after == before

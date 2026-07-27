@@ -16,6 +16,10 @@ from __future__ import annotations
 import json
 import subprocess
 
+import pytest
+
+pytestmark = pytest.mark.usefixtures("explicit_delivery_contract_for_kanban_fixtures")
+
 
 def _make_task(kb, *, assignee: str = "w", task_id: str = "t_paseo", workspace_kind: str = "dir"):
     return kb.Task(

@@ -22,6 +22,8 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 
+pytestmark = pytest.mark.usefixtures("explicit_delivery_contract_for_kanban_fixtures")
+
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):

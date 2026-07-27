@@ -24,6 +24,8 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban import run_slash
 
+pytestmark = pytest.mark.usefixtures("explicit_delivery_contract_for_kanban_fixtures")
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -2269,7 +2271,9 @@ def test_cli_create_on_fresh_home_auto_inits(tmp_path, monkeypatch):
            "PYTHONPATH": str(worktree_root)}
     r = _sp.run(
         [_sys.executable, "-m", "hermes_cli.main", "kanban",
-         "create", "smoke", "--assignee", "worker", "--json"],
+         "create", "smoke", "--assignee", "worker",
+         "--evidence-na-reason", "test fixture; no terminal delivery gate",
+         "--json"],
         capture_output=True, text=True, env=env,
     )
     assert r.returncode == 0, f"rc={r.returncode} stderr={r.stderr}"

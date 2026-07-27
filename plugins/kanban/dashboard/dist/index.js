@@ -2782,7 +2782,7 @@
         assignee: assignee.trim() || null,
         priority: Number(priority) || 0,
         triage: props.columnName === "triage",
-        task_kind: "delivery",
+
       };
       if (evidenceClasses.length > 0) body.required_evidence = evidenceClasses;
       else body.evidence_contract_na_reason = naReason;
