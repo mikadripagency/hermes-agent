@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import re
 import shutil
+import sqlite3
 import threading
 from pathlib import Path
 from typing import Any
@@ -137,28 +138,46 @@ def test_copied_legacy_db_keeps_null_contract_and_idempotent_readback(
 ):
     source = tmp_path / "source.db"
     copied = tmp_path / "copied.db"
-    with kb.connect(source) as conn:
-        conn.execute(
-            "INSERT INTO tasks "
-            "(id, title, status, task_kind, created_at, idempotency_key) "
-            "VALUES ('t_copied_legacy', 'legacy', 'ready', 'delivery', 1, 'copy-key')"
-        )
-        conn.commit()
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn = sqlite3.connect(source)
+    conn.execute(
+        "CREATE TABLE tasks ("
+        "id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT, assignee TEXT, "
+        "status TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0, "
+        "created_by TEXT, created_at INTEGER NOT NULL, started_at INTEGER, "
+        "completed_at INTEGER, workspace_kind TEXT NOT NULL DEFAULT 'scratch', "
+        "workspace_path TEXT, claim_lock TEXT, claim_expires INTEGER, "
+        "idempotency_key TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE task_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, "
+        "kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO tasks "
+        "(id, title, status, created_at, idempotency_key) "
+        "VALUES ('t_copied_legacy', 'legacy', 'ready', 1, 'copy-key')"
+    )
+    conn.commit()
+    conn.close()
     shutil.copy2(source, copied)
 
     with kb.connect(copied) as conn:
         task = kb.get_task(conn, "t_copied_legacy")
+        assert task is not None
         retry_id = kb.create_task(
             conn,
             title="legacy retry",
             idempotency_key="copy-key",
         )
+        completed = kb.complete_task(conn, task.id, summary="legacy copy complete")
+        completed_task = kb.get_task(conn, task.id)
 
-    assert task is not None
     assert task.required_evidence is None
     assert task.evidence_contract_na_reason is None
     assert retry_id == task.id
+    assert completed is True
+    assert completed_task is not None and completed_task.status == "done"
 
 
 def test_concurrent_idempotent_creates_write_one_task_and_event(
