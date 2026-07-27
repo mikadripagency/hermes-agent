@@ -139,6 +139,9 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 VALID_TASK_KINDS = {"delivery", "system_inbox"}
 MAX_EVIDENCE_NA_REASON_CHARS = 500
+LEGACY_DECOMPOSE_EVIDENCE_NA_REASON = (
+    "legacy decompose child (contract fields unavailable)"
+)
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -5817,9 +5820,10 @@ def decompose_triage_task(
                 child_ws_path = None
             conn.execute(
                 "INSERT INTO tasks "
-                "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                "(id, title, body, assignee, status, task_kind, workspace_kind, "
+                " workspace_path, tenant, created_at, created_by, "
+                " evidence_contract_na_reason) "
+                "VALUES (?, ?, ?, ?, 'todo', 'delivery', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -5830,11 +5834,17 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    LEGACY_DECOMPOSE_EVIDENCE_NA_REASON,
                 ),
             )
             _append_event(
                 conn, new_id, "created",
-                {"by": author or "decomposer", "from_decompose_of": task_id},
+                {
+                    "by": author or "decomposer",
+                    "from_decompose_of": task_id,
+                    "task_kind": "delivery",
+                    "evidence_contract_na_reason": LEGACY_DECOMPOSE_EVIDENCE_NA_REASON,
+                },
             )
             child_ids.append(new_id)
 
