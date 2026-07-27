@@ -56,7 +56,26 @@ def kanban_home(tmp_path, monkeypatch):
 def client(kanban_home):
     app = FastAPI()
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
-    return TestClient(app)
+    test_client = TestClient(app)
+    original_post = test_client.post
+
+    def post_with_contract(url, *args, **kwargs):
+        payload = kwargs.get("json")
+        if (
+            url == "/api/plugins/kanban/tasks"
+            and isinstance(payload, dict)
+            and "task_kind" not in payload
+            and not payload.get("required_evidence")
+            and not payload.get("evidence_contract_na_reason")
+        ):
+            kwargs["json"] = {
+                **payload,
+                "evidence_contract_na_reason": "unrelated dashboard test fixture",
+            }
+        return original_post(url, *args, **kwargs)
+
+    test_client.post = post_with_contract
+    return test_client
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +111,7 @@ def test_create_task_appears_on_board(client):
             "assignee": "researcher",
             "priority": 3,
             "tenant": "acme",
+            "required_evidence": ["research_report"],
         },
     )
     assert r.status_code == 200, r.text
@@ -112,6 +132,41 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_create_delivery_rejects_missing_evidence_contract_without_row(client):
+    with kb.connect_closing() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "missing contract",
+            "assignee": "researcher",
+            "task_kind": "delivery",
+        },
+    )
+
+    with kb.connect_closing() as conn:
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    assert response.status_code == 400
+    assert "explicit evidence contract" in response.json()["detail"]
+    assert after == before
+
+
+def test_create_delivery_accepts_explicit_na_contract(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "analysis only",
+            "assignee": "researcher",
+            "evidence_contract_na_reason": "no runtime side effects",
+        },
+    )
+
+    assert response.status_code == 200
+    task = response.json()["task"]
+    assert task["evidence_contract_na_reason"] == "no runtime side effects"
 
 
 def test_system_inbox_is_hidden_from_board_but_available_by_id(client):

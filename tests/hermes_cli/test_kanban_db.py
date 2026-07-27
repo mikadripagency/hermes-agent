@@ -202,8 +202,10 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
     assert "required_evidence" in task_columns
+    assert "evidence_contract_na_reason" in task_columns
     assert "run_id" in event_columns
     assert legacy_task is not None and legacy_task.required_evidence is None
+    assert legacy_task.evidence_contract_na_reason is None
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes

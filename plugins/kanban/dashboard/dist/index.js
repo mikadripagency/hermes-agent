@@ -2745,6 +2745,9 @@
     const [priority, setPriority] = useState(0);
     const [parent, setParent] = useState("");
     const [skills, setSkills] = useState("");
+    const [requiredEvidence, setRequiredEvidence] = useState("");
+    const [evidenceNaReason, setEvidenceNaReason] = useState("");
+    const [contractError, setContractError] = useState("");
     // Workspace controls. `scratch` (default) ignores path; `worktree` optionally
     // takes a path (dispatcher derives one from the assignee profile otherwise);
     // `dir` requires a path. Backend enforces the rule — we only hide/show the
@@ -2762,12 +2765,27 @@
     const submit = function () {
       const trimmed = title.trim();
       if (!trimmed) return;
+      const evidenceClasses = requiredEvidence
+        .split(",")
+        .map(function (item) { return item.trim(); })
+        .filter(function (item) { return item.length > 0; });
+      const naReason = evidenceNaReason.trim();
+      if ((evidenceClasses.length > 0) === !!naReason) {
+        setContractError(
+          "Declare evidence classes or an N/A reason (exactly one is required)."
+        );
+        return;
+      }
+      setContractError("");
       const body = {
         title: trimmed,
         assignee: assignee.trim() || null,
         priority: Number(priority) || 0,
         triage: props.columnName === "triage",
+        task_kind: "delivery",
       };
+      if (evidenceClasses.length > 0) body.required_evidence = evidenceClasses;
+      else body.evidence_contract_na_reason = naReason;
       if (parent) body.parents = [parent];
       // Parse comma-separated skills into a clean list. Blank = no
       // extras (omit key so backend leaves it null). The dispatcher
@@ -2793,6 +2811,7 @@
       }
       props.onSubmit(body);
       setTitle(""); setAssignee(""); setPriority(0); setParent(""); setSkills("");
+      setRequiredEvidence(""); setEvidenceNaReason(""); setContractError("");
       setWorkspaceKind("scratch"); setWorkspacePath("");
       setGoalMode(false); setGoalMaxTurns("");
     };
@@ -2851,6 +2870,24 @@
         title: "Force-load these skills into the worker (in addition to the built-in kanban-worker).",
         className: "h-7 text-xs",
       }),
+      h(Input, {
+        value: requiredEvidence,
+        onChange: function (e) { setRequiredEvidence(e.target.value); },
+        placeholder: "required evidence (comma-separated): regression_test, merge_receipt",
+        title: "Exact evidence classes required at completion. Use this or an N/A reason below, not both.",
+        className: "h-7 text-xs",
+      }),
+      h(Input, {
+        value: evidenceNaReason,
+        onChange: function (e) { setEvidenceNaReason(e.target.value); },
+        placeholder: "evidence N/A reason (only when no objective gate applies)",
+        title: "Auditable reason why this delivery task has no machine-checkable completion evidence.",
+        className: "h-7 text-xs",
+      }),
+      contractError ? h("div", {
+        role: "alert",
+        className: "text-xs text-destructive",
+      }, contractError) : null,
       h("div", { className: "flex gap-2 items-center" },
         h("label", {
           className: "flex items-center gap-1.5 text-xs cursor-pointer select-none",

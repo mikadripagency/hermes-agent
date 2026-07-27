@@ -600,6 +600,7 @@ class CreateTaskBody(BaseModel):
     goal_max_turns: Optional[int] = None
     task_kind: str = "delivery"
     required_evidence: Optional[list[str]] = None
+    evidence_contract_na_reason: Optional[str] = Field(default=None, max_length=500)
 
 
 @router.post("/tasks")
@@ -626,6 +627,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             goal_max_turns=payload.goal_max_turns,
             task_kind=payload.task_kind,
             required_evidence=payload.required_evidence,
+            evidence_contract_na_reason=payload.evidence_contract_na_reason,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
