@@ -385,12 +385,6 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "machine-checkable completion evidence."
         ),
     )
-    p_create.add_argument(
-        "--task-kind",
-        choices=sorted(kb.VALID_TASK_KINDS),
-        default="delivery",
-        help="Task projection class (default: delivery).",
-    )
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -1408,7 +1402,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
-            task_kind=getattr(args, "task_kind", "delivery"),
+            task_kind="delivery",
             required_evidence=getattr(args, "required_evidence", None),
             evidence_contract_na_reason=getattr(
                 args, "evidence_contract_na_reason", None

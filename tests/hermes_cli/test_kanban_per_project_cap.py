@@ -27,6 +27,22 @@ def isolated_kanban_home_with_profiles(monkeypatch):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
             del sys.modules[mod]
     from hermes_cli import kanban_db
+
+    original_create_task = kanban_db.create_task
+
+    def create_with_contract(conn, **kwargs):
+        kwargs = dict(kwargs)
+        if (
+            "task_kind" not in kwargs
+            and not kwargs.get("required_evidence")
+            and not kwargs.get("evidence_contract_na_reason")
+        ):
+            kwargs["evidence_contract_na_reason"] = (
+                "unrelated project-cap test fixture"
+            )
+        return original_create_task(conn, **kwargs)
+
+    monkeypatch.setattr(kanban_db, "create_task", create_with_contract)
     yield kanban_db
 
 
@@ -283,12 +299,11 @@ def test_system_inbox_does_not_consume_project_slot(
             task_id = kb.create_task(conn, title=f"active-{i}", assignee="alpha")
             _set_project(kb, conn, task_id, "project-a")
             kb.claim_task(conn, task_id)
-        inbox = kb.create_task(
+        inbox = kb.create_system_inbox_task(
             conn,
             title="inbox",
             assignee="alpha",
             initial_status="blocked",
-            task_kind="system_inbox",
         )
         candidate = kb.create_task(conn, title="candidate", assignee="alpha")
         for task_id in (inbox, candidate):

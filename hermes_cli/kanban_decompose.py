@@ -72,7 +72,9 @@ Output a single JSON object with this exact shape:
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
         "work_type": "independent_deliverable | specialist_work",
-        "parents": [<int>, ...]
+        "parents": [<int>, ...],
+        "required_evidence": ["<machine-checkable evidence class>"],
+        "evidence_contract_na_reason": null
       },
       ...
     ]
@@ -95,6 +97,9 @@ Rules:
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+  - Every child must make exactly one evidence decision: either a non-empty
+    required_evidence list of lowercase snake_case classes, or a concrete
+    evidence_contract_na_reason when no machine-checkable gate exists.
 
 When the task is one user ticket, or otherwise has no independently
 deliverable/specialist split, return:
@@ -473,6 +478,10 @@ def decompose_task(
             "assignee": chosen,
             "work_type": entry["work_type"],
             "parents": clean_parents,
+            "required_evidence": entry.get("required_evidence"),
+            "evidence_contract_na_reason": entry.get(
+                "evidence_contract_na_reason"
+            ),
         })
 
     try:

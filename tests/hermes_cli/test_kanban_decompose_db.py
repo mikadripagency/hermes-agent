@@ -29,11 +29,17 @@ def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=No
         assignee=assignee,
         tenant=tenant,
         triage=True,
+        evidence_contract_na_reason="triage fixture; no terminal delivery gate",
     )
 
 
 def _deliverable(title, **kwargs):
-    return {"title": title, "work_type": "independent_deliverable", **kwargs}
+    return {
+        "title": title,
+        "work_type": "independent_deliverable",
+        "required_evidence": ["deliverable_receipt"],
+        **kwargs,
+    }
 
 
 def test_decompose_creates_children_and_promotes_root(kanban_home):
@@ -70,10 +76,8 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
     assert c0.status == "ready"
     assert c0.assignee == "researcher"
     assert c0.task_kind == "delivery"
-    assert (
-        c0.evidence_contract_na_reason
-        == kb.LEGACY_DECOMPOSE_EVIDENCE_NA_REASON
-    )
+    assert c0.required_evidence == ["deliverable_receipt"]
+    assert c0.evidence_contract_na_reason is None
     # Second child has parents=[0] → stays in todo until c0 completes.
     assert c1.status == "todo"
     assert c1.assignee == "engineer"
@@ -85,7 +89,7 @@ def test_decompose_returns_none_when_task_missing(kanban_home):
             conn,
             "nonexistent",
             root_assignee="orch",
-            children=[{"title": "x"}],
+            children=[_deliverable("x")],
             author="me",
         )
     assert result is None
@@ -93,12 +97,16 @@ def test_decompose_returns_none_when_task_missing(kanban_home):
 
 def test_decompose_returns_none_when_task_not_in_triage(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="already a real task")  # not triage
+        tid = kb.create_task(
+            conn,
+            title="already a real task",
+            evidence_contract_na_reason="test fixture; no terminal delivery gate",
+        )  # not triage
         result = kb.decompose_triage_task(
             conn,
             tid,
             root_assignee="orch",
-            children=[{"title": "x"}],
+            children=[_deliverable("x")],
             author="me",
         )
     assert result is None
@@ -117,6 +125,29 @@ def test_decompose_empty_children_returns_none(kanban_home):
     assert result is None
 
 
+def test_decompose_rejects_child_without_evidence_contract_atomically(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        with pytest.raises(ValueError, match=r"child\[0\].*evidence contract"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orch",
+                children=[{
+                    "title": "executable child",
+                    "work_type": "independent_deliverable",
+                }],
+                author="me",
+            )
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        root = kb.get_task(conn, tid)
+
+    assert after == before
+    assert root is not None
+    assert root.status == "triage"
+
+
 def test_decompose_rejects_self_parent(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn)
@@ -125,7 +156,7 @@ def test_decompose_rejects_self_parent(kanban_home):
                 conn,
                 tid,
                 root_assignee="orch",
-                children=[{"title": "x", "parents": [0]}],
+                children=[_deliverable("x", parents=[0])],
                 author="me",
             )
 
@@ -138,7 +169,7 @@ def test_decompose_rejects_out_of_range_parent(kanban_home):
                 conn,
                 tid,
                 root_assignee="orch",
-                children=[{"title": "x", "parents": [5]}],
+                children=[_deliverable("x", parents=[5])],
                 author="me",
             )
 
@@ -173,8 +204,8 @@ def test_decompose_rejects_cyclic_parents(kanban_home):
                 tid,
                 root_assignee="orch",
                 children=[
-                    {"title": "A", "parents": [1]},
-                    {"title": "B", "parents": [0]},
+                    _deliverable("A", parents=[1]),
+                    _deliverable("B", parents=[0]),
                 ],
                 author="me",
             )
@@ -187,7 +218,7 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
             conn,
             tid,
             root_assignee="orch",
-            children=[{"title": "task A", "assignee": "researcher"}],
+            children=[_deliverable("task A", assignee="researcher")],
             author="alice",
         )
     assert child_ids is not None
@@ -207,10 +238,11 @@ def test_decompose_children_inherit_dir_workspace(kanban_home):
         tid = kb.create_task(
             conn, title="codegen root", assignee="worker",
             workspace_kind="dir", workspace_path=proj, triage=True,
+            evidence_contract_na_reason="triage fixture; no terminal delivery gate",
         )
         child_ids = kb.decompose_triage_task(
             conn, tid, root_assignee="orchestrator",
-            children=[{"title": "part A"}, {"title": "part B", "parents": [0]}],
+            children=[_deliverable("part A"), _deliverable("part B", parents=[0])],
             author="decomposer",
         )
     assert child_ids and len(child_ids) == 2
@@ -227,10 +259,11 @@ def test_decompose_children_stay_scratch_when_root_scratch(kanban_home):
         tid = kb.create_task(
             conn, title="scratch root", assignee="worker",
             workspace_kind="scratch", triage=True,
+            evidence_contract_na_reason="triage fixture; no terminal delivery gate",
         )
         child_ids = kb.decompose_triage_task(
             conn, tid, root_assignee="orchestrator",
-            children=[{"title": "s1"}], author="decomposer",
+            children=[_deliverable("s1")], author="decomposer",
         )
     with kb.connect() as conn:
         t = kb.get_task(conn, child_ids[0])
@@ -245,13 +278,14 @@ def test_decompose_per_child_workspace_override(kanban_home):
         tid = kb.create_task(
             conn, title="root", assignee="worker",
             workspace_kind="dir", workspace_path=proj, triage=True,
+            evidence_contract_na_reason="triage fixture; no terminal delivery gate",
         )
         child_ids = kb.decompose_triage_task(
             conn, tid, root_assignee="orchestrator",
             children=[
-                {"title": "override", "workspace_kind": "dir",
-                 "workspace_path": "/other/repo"},
-                {"title": "inherit"},
+                _deliverable("override", workspace_kind="dir",
+                             workspace_path="/other/repo"),
+                _deliverable("inherit"),
             ],
             author="decomposer",
         )

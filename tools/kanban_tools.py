@@ -892,7 +892,6 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
-    task_kind = args.get("task_kind") or "delivery"
     required_evidence = args.get("required_evidence")
     evidence_contract_na_reason = args.get("evidence_contract_na_reason")
     if isinstance(required_evidence, str):
@@ -951,7 +950,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
-                task_kind=str(task_kind),
+                task_kind="delivery",
                 required_evidence=required_evidence,
                 evidence_contract_na_reason=evidence_contract_na_reason,
             )
@@ -1586,11 +1585,6 @@ KANBAN_CREATE_SCHEMA = {
                     "machine-checkable completion evidence. Mutually exclusive "
                     "with required_evidence."
                 ),
-            },
-            "task_kind": {
-                "type": "string",
-                "enum": ["delivery", "system_inbox"],
-                "description": "Task projection class. Defaults to delivery.",
             },
             "board": _board_schema_prop(),
         },

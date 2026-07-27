@@ -139,9 +139,7 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 VALID_TASK_KINDS = {"delivery", "system_inbox"}
 MAX_EVIDENCE_NA_REASON_CHARS = 500
-LEGACY_DECOMPOSE_EVIDENCE_NA_REASON = (
-    "legacy decompose child (contract fields unavailable)"
-)
+_SYSTEM_INBOX_CREATE_CAPABILITY = object()
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -2671,6 +2669,56 @@ def _normalize_evidence_contract_na_reason(value: Optional[str]) -> Optional[str
     return reason
 
 
+def _existing_idempotent_task(
+    conn: sqlite3.Connection,
+    idempotency_key: str,
+    task_kind: str,
+    required_evidence: Optional[list[str]],
+    evidence_na_reason: Optional[str],
+) -> Optional[str]:
+    """Return a compatible live retry target, or reject a changed contract."""
+    row = conn.execute(
+        "SELECT id, task_kind, required_evidence, evidence_contract_na_reason FROM tasks "
+        "WHERE idempotency_key = ? AND status != 'archived' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (idempotency_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    if (row["task_kind"] or "delivery") != task_kind:
+        raise ValueError(
+            "idempotency key already belongs to a task with a different task_kind"
+        )
+
+    existing_required = _normalize_required_evidence(
+        json.loads(row["required_evidence"])
+        if row["required_evidence"] else None
+    )
+    if (
+        required_evidence is not None
+        and (existing_required or []) != required_evidence
+    ):
+        raise ValueError(
+            "idempotency key already belongs to a task with a different "
+            "required_evidence contract"
+        )
+    existing_na_reason = row["evidence_contract_na_reason"] or None
+    if (
+        required_evidence is None
+        and evidence_na_reason is None
+        and (existing_required or existing_na_reason)
+    ):
+        raise ValueError(
+            "idempotent retry must provide the existing task's evidence contract"
+        )
+    if evidence_na_reason is not None and existing_na_reason != evidence_na_reason:
+        raise ValueError(
+            "idempotency key already belongs to a task with a different "
+            "evidence_contract_na_reason"
+        )
+    return str(row["id"])
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2695,9 +2743,10 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
-    task_kind: Optional[str] = None,
+    task_kind: str = "delivery",
     required_evidence: Optional[Iterable[str]] = None,
     evidence_contract_na_reason: Optional[str] = None,
+    _system_inbox_capability: Optional[object] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2722,14 +2771,11 @@ def create_task(
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
 
-    Public create surfaces pass ``task_kind`` explicitly. Omitting it is the
-    backward-compatible Python API path and persists a structured legacy N/A
-    reason instead of silently storing an empty evidence contract.
+    New delivery rows require an explicit evidence decision. Existing
+    pre-contract rows remain readable, and an idempotent retry may still
+    resolve one without creating or rewriting anything.
     """
     assignee = _canonical_assignee(assignee)
-    legacy_create_api = task_kind is None
-    if task_kind is None:
-        task_kind = "delivery"
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -2743,6 +2789,13 @@ def create_task(
         )
     if task_kind not in VALID_TASK_KINDS:
         raise ValueError(f"task_kind must be one of {sorted(VALID_TASK_KINDS)}")
+    if (
+        task_kind == "system_inbox"
+        and _system_inbox_capability is not _SYSTEM_INBOX_CREATE_CAPABILITY
+    ):
+        raise ValueError(
+            "system_inbox is reserved for the trusted internal constructor"
+        )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
@@ -2794,13 +2847,21 @@ def create_task(
     evidence_na_reason = _normalize_evidence_contract_na_reason(
         evidence_contract_na_reason
     )
-    if legacy_create_api and not required_evidence_list and not evidence_na_reason:
-        evidence_na_reason = "legacy create_task caller (task_kind omitted)"
     if required_evidence_list and evidence_na_reason:
         raise ValueError(
             "delivery evidence contract must choose required_evidence or "
             "evidence_contract_na_reason, not both"
         )
+    if idempotency_key and not required_evidence_list and not evidence_na_reason:
+        existing_task_id = _existing_idempotent_task(
+            conn,
+            idempotency_key,
+            task_kind,
+            required_evidence_list,
+            evidence_na_reason,
+        )
+        if existing_task_id is not None:
+            return existing_task_id
     if task_kind == "delivery" and not required_evidence_list and not evidence_na_reason:
         raise ValueError(
             "delivery task requires an explicit evidence contract: provide at least "
@@ -2853,43 +2914,18 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
+    # Keep the ordinary retry fast, but only after validating all supplied
+    # create arguments. A second lookup under the write lock closes the race.
     if idempotency_key:
-        row = conn.execute(
-            "SELECT id, required_evidence, evidence_contract_na_reason FROM tasks "
-            "WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            existing_required = _normalize_required_evidence(
-                json.loads(row["required_evidence"])
-                if row["required_evidence"] else None
-            )
-            if (
-                required_evidence_list is not None
-                and (existing_required or []) != required_evidence_list
-            ):
-                raise ValueError(
-                    "idempotency key already belongs to a task with a different "
-                    "required_evidence contract"
-                )
-            existing_na_reason = row["evidence_contract_na_reason"] or None
-            if evidence_na_reason is not None and existing_na_reason != evidence_na_reason:
-                # Old Python callers omitted task_kind before evidence contracts
-                # existed. Their idempotent retries must still resolve an
-                # existing pre-migration row whose reason is NULL.
-                if not (legacy_create_api and existing_na_reason is None):
-                    raise ValueError(
-                        "idempotency key already belongs to a task with a different "
-                        "evidence_contract_na_reason"
-                    )
-            return row["id"]
+        existing_task_id = _existing_idempotent_task(
+            conn,
+            idempotency_key,
+            task_kind,
+            required_evidence_list,
+            evidence_na_reason,
+        )
+        if existing_task_id is not None:
+            return existing_task_id
 
     now = int(time.time())
 
@@ -2948,6 +2984,18 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                # Repeat the optimistic lookup under BEGIN IMMEDIATE so two
+                # concurrent first creates serialize into one task/event.
+                if idempotency_key:
+                    existing_task_id = _existing_idempotent_task(
+                        conn,
+                        idempotency_key,
+                        task_kind,
+                        required_evidence_list,
+                        evidence_na_reason,
+                    )
+                    if existing_task_id is not None:
+                        return existing_task_id
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -3084,6 +3132,21 @@ def create_task(
             # Retry with a fresh id.
             continue
     raise RuntimeError("unreachable")
+
+
+def create_system_inbox_task(
+    conn: sqlite3.Connection,
+    **kwargs: Any,
+) -> str:
+    """Create a system inbox through the trusted, non-public projection seam."""
+    if "task_kind" in kwargs:
+        raise TypeError("create_system_inbox_task sets task_kind internally")
+    return create_task(
+        conn,
+        task_kind="system_inbox",
+        _system_inbox_capability=_SYSTEM_INBOX_CREATE_CAPABILITY,
+        **kwargs,
+    )
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
@@ -5710,6 +5773,7 @@ def decompose_triage_task(
             "assignee": "profile-name",        # optional, None -> default fallback
             "work_type": "independent_deliverable | specialist_work",
             "parents": [0, 2],                 # indices into this same children list
+            "required_evidence": ["receipt"],  # or evidence_contract_na_reason
         }
 
     Returns the list of created child task ids (in input order) on
@@ -5729,6 +5793,7 @@ def decompose_triage_task(
 
     # Pre-validate the children list shape outside the txn. Cheap checks
     # that don't need DB access. Bad input aborts before we touch the DB.
+    child_contracts: list[tuple[Optional[list[str]], Optional[str]]] = []
     for idx, child in enumerate(children):
         if not isinstance(child, dict):
             raise ValueError(f"child[{idx}] is not a dict")
@@ -5740,6 +5805,26 @@ def decompose_triage_task(
             raise ValueError(
                 f"child[{idx}].work_type must identify independently ownable work"
             )
+        try:
+            child_required = _normalize_required_evidence(
+                child.get("required_evidence")
+            )
+            child_na_reason = _normalize_evidence_contract_na_reason(
+                child.get("evidence_contract_na_reason")
+            )
+        except ValueError as exc:
+            raise ValueError(f"child[{idx}].{exc}") from exc
+        if child_required and child_na_reason:
+            raise ValueError(
+                f"child[{idx}].evidence contract must choose required_evidence "
+                "or evidence_contract_na_reason, not both"
+            )
+        if not child_required and not child_na_reason:
+            raise ValueError(
+                f"child[{idx}].evidence contract requires at least one "
+                "required_evidence class or evidence_contract_na_reason"
+            )
+        child_contracts.append((child_required, child_na_reason))
         parents_idx = child.get("parents") or []
         if not isinstance(parents_idx, list):
             raise ValueError(f"child[{idx}].parents must be a list")
@@ -5806,6 +5891,7 @@ def decompose_triage_task(
         # sees a coherent state, and recompute_ready() at the end
         # promotes parent-free children to 'ready'.
         for idx, child in enumerate(children):
+            child_required, child_na_reason = child_contracts[idx]
             new_id = _new_task_id()
             title = child["title"].strip()
             body = child.get("body")
@@ -5826,8 +5912,8 @@ def decompose_triage_task(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, task_kind, workspace_kind, "
                 " workspace_path, tenant, created_at, created_by, "
-                " evidence_contract_na_reason) "
-                "VALUES (?, ?, ?, ?, 'todo', 'delivery', ?, ?, ?, ?, ?, ?)",
+                " required_evidence, evidence_contract_na_reason) "
+                "VALUES (?, ?, ?, ?, 'todo', 'delivery', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -5838,7 +5924,8 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
-                    LEGACY_DECOMPOSE_EVIDENCE_NA_REASON,
+                    json.dumps(child_required) if child_required is not None else None,
+                    child_na_reason,
                 ),
             )
             _append_event(
@@ -5847,7 +5934,8 @@ def decompose_triage_task(
                     "by": author or "decomposer",
                     "from_decompose_of": task_id,
                     "task_kind": "delivery",
-                    "evidence_contract_na_reason": LEGACY_DECOMPOSE_EVIDENCE_NA_REASON,
+                    "required_evidence": child_required or None,
+                    "evidence_contract_na_reason": child_na_reason,
                 },
             )
             child_ids.append(new_id)

@@ -53,11 +53,26 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def client(kanban_home):
+def client(kanban_home, monkeypatch):
     app = FastAPI()
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
     test_client = TestClient(app)
     original_post = test_client.post
+    original_create_task = kb.create_task
+
+    def create_fixture_task(conn, **kwargs):
+        kwargs = dict(kwargs)
+        if (
+            "task_kind" not in kwargs
+            and not kwargs.get("required_evidence")
+            and not kwargs.get("evidence_contract_na_reason")
+        ):
+            kwargs["evidence_contract_na_reason"] = (
+                "unrelated dashboard test fixture"
+            )
+        return original_create_task(conn, **kwargs)
+
+    monkeypatch.setattr(kb, "create_task", create_fixture_task)
 
     def post_with_contract(url, *args, **kwargs):
         payload = kwargs.get("json")
@@ -169,16 +184,30 @@ def test_create_delivery_accepts_explicit_na_contract(client):
     assert task["evidence_contract_na_reason"] == "no runtime side effects"
 
 
+def test_create_cannot_select_system_inbox(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "untrusted inbox attempt",
+            "assignee": "researcher",
+            "task_kind": "system_inbox",
+            "evidence_contract_na_reason": "test-only task",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["task"]["task_kind"] == "delivery"
+
+
 def test_system_inbox_is_hidden_from_board_but_available_by_id(client):
     conn = kb.connect()
     try:
-        inbox_id = kb.create_task(
+        inbox_id = kb.create_system_inbox_task(
             conn,
             title="process writer queue",
             assignee="developer",
             tenant="system",
             initial_status="blocked",
-            task_kind="system_inbox",
         )
     finally:
         conn.close()
@@ -949,14 +978,22 @@ def test_ws_events_board_query_param_default_overrides_current_board_pointer(tmp
 
     default_conn = kb.connect()
     try:
-        default_task = kb.create_task(default_conn, title="default-live")
+        default_task = kb.create_task(
+            default_conn,
+            title="default-live",
+            evidence_contract_na_reason="websocket board-selection fixture",
+        )
     finally:
         default_conn.close()
 
     kb.create_board("other")
     other_conn = kb.connect(board="other")
     try:
-        other_task = kb.create_task(other_conn, title="other-live")
+        other_task = kb.create_task(
+            other_conn,
+            title="other-live",
+            evidence_contract_na_reason="websocket board-selection fixture",
+        )
     finally:
         other_conn.close()
 
