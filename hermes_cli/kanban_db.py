@@ -2881,10 +2881,14 @@ def create_task(
                 )
             existing_na_reason = row["evidence_contract_na_reason"] or None
             if evidence_na_reason is not None and existing_na_reason != evidence_na_reason:
-                raise ValueError(
-                    "idempotency key already belongs to a task with a different "
-                    "evidence_contract_na_reason"
-                )
+                # Old Python callers omitted task_kind before evidence contracts
+                # existed. Their idempotent retries must still resolve an
+                # existing pre-migration row whose reason is NULL.
+                if not (legacy_create_api and existing_na_reason is None):
+                    raise ValueError(
+                        "idempotency key already belongs to a task with a different "
+                        "evidence_contract_na_reason"
+                    )
             return row["id"]
 
     now = int(time.time())

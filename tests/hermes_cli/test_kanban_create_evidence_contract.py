@@ -93,6 +93,24 @@ def test_legacy_python_create_caller_gets_auditable_compatibility_reason(kanban_
     assert task.evidence_contract_na_reason == "legacy create_task caller (task_kind omitted)"
 
 
+def test_legacy_python_idempotent_retry_resolves_pre_contract_row(kanban_home):
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "INSERT INTO tasks "
+            "(id, title, status, task_kind, created_at, idempotency_key) "
+            "VALUES ('t_legacy_retry', 'legacy', 'ready', 'delivery', 1, 'legacy-key')"
+        )
+        conn.commit()
+
+        task_id = kb.create_task(
+            conn,
+            title="legacy retry",
+            idempotency_key="legacy-key",
+        )
+
+    assert task_id == "t_legacy_retry"
+
+
 def test_delivery_contract_rejects_ambiguous_or_malformed_na_reason(kanban_home):
     malformed_reason: Any = {"reason": "not applicable"}
     with kb.connect_closing() as conn:
