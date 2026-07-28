@@ -203,11 +203,22 @@ def worker_env(monkeypatch, tmp_path):
             assignee="test-worker",
             evidence_contract_na_reason="test fixture",
         )
-        kb.claim_task(conn, tid)
+        task = kb.claim_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
     return tid
+
+
+def _completion_summary(task_id: str, text: str, *, board=None) -> str:
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect(board=board) as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None and task.current_run_id is not None
+    return f"{task_id}/run {task.current_run_id} · {text}"
 
 
 def test_show_defaults_to_env_task_id(worker_env):
@@ -331,8 +342,9 @@ def test_list_rejects_bad_include_archived(monkeypatch, worker_env):
 
 def test_complete_happy_path(worker_env):
     from tools import kanban_tools as kt
+    summary = _completion_summary(worker_env, "got the thing done")
     out = kt._handle_complete({
-        "summary": "got the thing done",
+        "summary": summary,
         "metadata": {"files": 2},
     })
     d = json.loads(out)
@@ -344,7 +356,7 @@ def test_complete_happy_path(worker_env):
     try:
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
-        assert run.summary == "got the thing done"
+        assert run.summary == summary
         assert run.metadata == {"files": 2}
     finally:
         conn.close()
@@ -370,7 +382,7 @@ def test_complete_surfaces_resumable_required_evidence_error(worker_env):
     rejected = json.loads(
         kt._handle_complete(
             {
-                "summary": "only auth redirect checked",
+                "summary": _completion_summary(worker_env, "only auth redirect checked"),
                 "metadata": {
                     "evidence": {"auth_redirect_307": {"status": "passed"}}
                 },
@@ -401,8 +413,9 @@ def test_complete_metadata_round_trips_through_show(worker_env):
         "residual_risk": ["dashboard rendering not exercised"],
     }
 
+    summary = _completion_summary(worker_env, "finished with structured evidence")
     complete_out = kt._handle_complete({
-        "summary": "finished with structured evidence",
+        "summary": summary,
         "metadata": handoff,
     })
     assert json.loads(complete_out)["ok"] is True
@@ -410,7 +423,7 @@ def test_complete_metadata_round_trips_through_show(worker_env):
     show_out = kt._handle_show({"task_id": worker_env})
     shown = json.loads(show_out)
     assert shown["task"]["status"] == "done"
-    assert shown["runs"][-1]["summary"] == "finished with structured evidence"
+    assert shown["runs"][-1]["summary"] == summary
     assert shown["runs"][-1]["metadata"] == handoff
 
 
@@ -421,7 +434,7 @@ def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
     metadata = {"files": 2, "worker_session_id": "user-spoof"}
 
     out = kt._handle_complete({
-        "summary": "done by scoped worker",
+        "summary": _completion_summary(worker_env, "done by scoped worker"),
         "metadata": metadata,
     })
     assert json.loads(out)["ok"] is True
@@ -449,7 +462,7 @@ def test_complete_does_not_stamp_worker_session_id_without_scoped_task(
 
     out = kt._handle_complete({
         "task_id": worker_env,
-        "summary": "done outside worker scope",
+        "summary": _completion_summary(worker_env, "done outside worker scope"),
         "metadata": {"files": 2, "worker_session_id": "user-provided"},
     })
     assert json.loads(out)["ok"] is True
@@ -467,9 +480,11 @@ def test_complete_does_not_stamp_worker_session_id_without_scoped_task(
 
 
 def test_complete_with_result_only(worker_env):
-    """`result` alone (without summary) is accepted for legacy compat."""
+    """`result` remains the effective summary when it carries the identity."""
     from tools import kanban_tools as kt
-    out = kt._handle_complete({"result": "legacy result"})
+    out = kt._handle_complete({
+        "result": _completion_summary(worker_env, "result-only handoff")
+    })
     d = json.loads(out)
     assert d["ok"] is True
 
@@ -482,7 +497,7 @@ def test_complete_with_artifacts_lands_in_event_payload(worker_env):
     from tools import kanban_tools as kt
 
     out = kt._handle_complete({
-        "summary": "rendered the chart",
+        "summary": _completion_summary(worker_env, "rendered the chart"),
         "artifacts": ["/tmp/q3-revenue.png", "/tmp/q3-report.pdf"],
     })
     assert json.loads(out)["ok"] is True
@@ -514,7 +529,7 @@ def test_complete_artifacts_accepts_single_string(worker_env):
     from tools import kanban_tools as kt
 
     out = kt._handle_complete({
-        "summary": "one chart",
+        "summary": _completion_summary(worker_env, "one chart"),
         "artifacts": "/tmp/chart.png",
     })
     assert json.loads(out)["ok"] is True
@@ -534,7 +549,7 @@ def test_complete_artifacts_merges_with_explicit_metadata_field(worker_env):
     from tools import kanban_tools as kt
 
     out = kt._handle_complete({
-        "summary": "merged",
+        "summary": _completion_summary(worker_env, "merged"),
         "metadata": {"artifacts": ["/tmp/a.png"], "other": "fact"},
         "artifacts": ["/tmp/b.pdf", "/tmp/a.png"],
     })
@@ -584,7 +599,7 @@ def test_complete_phantom_card_message_advertises_retry(worker_env):
     from tools import kanban_tools as kt
 
     out = kt._handle_complete({
-        "summary": "oops claimed a phantom",
+        "summary": _completion_summary(worker_env, "oops claimed a phantom"),
         "created_cards": ["t_phantomdeadbeef"],
     })
     err = json.loads(out).get("error", "")
@@ -617,14 +632,14 @@ def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
 
     # Hit the gate first.
     rejected = json.loads(kt._handle_complete({
-        "summary": "oops",
+        "summary": _completion_summary(worker_env, "oops"),
         "created_cards": ["t_phantomdeadbeef"],
     }))
     assert rejected.get("error")
 
     # Retry with the escape hatch.
     ok = json.loads(kt._handle_complete({
-        "summary": "retry without claims",
+        "summary": _completion_summary(worker_env, "retry without claims"),
         "created_cards": [],
     }))
     assert ok.get("ok") is True
@@ -653,7 +668,7 @@ def test_complete_retry_with_corrected_created_cards_succeeds(worker_env):
 
     # First attempt mixes real + phantom — gate rejects.
     rejected = json.loads(kt._handle_complete({
-        "summary": "oops",
+        "summary": _completion_summary(worker_env, "oops"),
         "created_cards": [real_id, "t_phantomdeadbeef"],
     }))
     assert rejected.get("error")
@@ -661,7 +676,7 @@ def test_complete_retry_with_corrected_created_cards_succeeds(worker_env):
 
     # Retry with corrected list.
     ok = json.loads(kt._handle_complete({
-        "summary": "retry with corrected list",
+        "summary": _completion_summary(worker_env, "retry with corrected list"),
         "created_cards": [real_id],
     }))
     assert ok.get("ok") is True
@@ -759,7 +774,9 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
     monkeypatch.setattr("tools.kanban_tools.judge_goal", fail_if_called)
     monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: False)
 
-    out = kt._handle_complete({"summary": "done enough"})
+    out = kt._handle_complete({
+        "summary": _completion_summary(goal_task_id, "done enough")
+    })
     d = json.loads(out)
     assert d.get("ok") is True
 
@@ -1484,7 +1501,7 @@ def test_worker_lifecycle_through_tools(worker_env):
 
     # 5. complete with structured handoff
     comp = json.loads(kt._handle_complete({
-        "summary": "implemented + spawned QA follow-up",
+        "summary": _completion_summary(worker_env, "implemented + spawned QA follow-up"),
         "metadata": {"child_task": child_out["task_id"]},
     }))
     assert comp["ok"]
@@ -1759,7 +1776,10 @@ def test_worker_complete_own_task_still_works(worker_env):
     """The ownership check doesn't break the normal own-task happy path."""
     from tools import kanban_tools as kt
     # Both implicit (no task_id arg) and explicit (matching env) must work.
-    out = kt._handle_complete({"task_id": worker_env, "summary": "explicit own"})
+    out = kt._handle_complete({
+        "task_id": worker_env,
+        "summary": _completion_summary(worker_env, "explicit own"),
+    })
     d = json.loads(out)
     assert d.get("ok") is True and d.get("task_id") == worker_env
 
@@ -1793,7 +1813,8 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
 
     from tools import kanban_tools as kt
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run1.id))
-    out = kt._handle_complete({"summary": "late stale completion"})
+    summary = _completion_summary(worker_env, "completion from stale worker")
+    out = kt._handle_complete({"summary": summary})
     d = json.loads(out)
     assert d.get("ok") is not True
 
@@ -1806,7 +1827,7 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
         conn.close()
 
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run2.id))
-    out = kt._handle_complete({"summary": "current completion"})
+    out = kt._handle_complete({"summary": summary})
     d = json.loads(out)
     assert d.get("ok") is True
 
@@ -2013,7 +2034,7 @@ def test_board_param_routes_complete_to_alt_board(multi_board_env):
 
     out = kt._handle_complete({
         "task_id": alt_seed,
-        "summary": "alt close",
+        "summary": _completion_summary(alt_seed, "alt close", board="alt"),
         "board": "alt",
     })
     d = json.loads(out)
