@@ -4673,6 +4673,14 @@ def complete_task(
         verified_cards = []
 
     with write_txn(conn):
+        # Re-read under the terminal write lock. A dashboard/API caller has no
+        # expected_run_id CAS token, so the claimed run may have changed since
+        # the side-effect-free preflight above.
+        locked_task = get_task(conn, task_id)
+        if locked_task is not None:
+            _validate_completion_identity(
+                locked_task, summary if summary is not None else result
+            )
         notifier_profile = _intended_completion_notifier_profile(
             conn, task_id, expected_run_id
         )

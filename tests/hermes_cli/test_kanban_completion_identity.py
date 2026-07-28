@@ -94,6 +94,55 @@ def test_claimed_delivery_accepts_authoritative_canonical_identity(kanban_home):
     assert completed[0].payload["summary"] == summary
 
 
+def test_dashboard_style_completion_revalidates_identity_under_terminal_lock(
+    kanban_home, monkeypatch,
+):
+    with kb.connect_closing() as conn:
+        task_id, old_run_id = _claimed_delivery(conn)
+        old_summary = f"{task_id}/run {old_run_id} · stale dashboard submission"
+
+        def replace_run_between_preflight_and_terminal_lock(*_args):
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE task_runs SET status='reclaimed', outcome='reclaimed', "
+                    "ended_at=2 WHERE id=?",
+                    (old_run_id,),
+                )
+                cursor = conn.execute(
+                    "INSERT INTO task_runs "
+                    "(task_id, profile, status, started_at) "
+                    "VALUES (?, 'developer', 'running', 3)",
+                    (task_id,),
+                )
+                conn.execute(
+                    "UPDATE tasks SET current_run_id=? WHERE id=?",
+                    (cursor.lastrowid, task_id),
+                )
+            return [], []
+
+        monkeypatch.setattr(
+            kb, "_verify_created_cards", replace_run_between_preflight_and_terminal_lock
+        )
+
+        with pytest.raises(ValueError, match=f"{task_id}/run {old_run_id + 1}"):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary=old_summary,
+                created_cards=["trigger-between-locks"],
+            )
+
+        task = kb.get_task(conn, task_id)
+        completed = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "completed"
+        ]
+
+    assert task is not None and task.status == "running"
+    assert task.current_run_id == old_run_id + 1
+    assert completed == []
+
+
 def test_unclaimed_and_system_inbox_completions_remain_compatible(kanban_home):
     with kb.connect_closing() as conn:
         legacy_id = kb.create_task(
