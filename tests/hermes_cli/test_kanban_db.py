@@ -46,6 +46,12 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+def _claimed_summary(conn, task_id: str, text: str = "ok") -> str:
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.current_run_id is not None
+    return f"{task_id}/run {task.current_run_id} · {text}"
+
+
 def _init_git_repo(repo: Path) -> None:
     repo.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
@@ -406,7 +412,7 @@ def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
         )
         # Complete the parent
         kb.claim_task(conn, parent)
-        kb.complete_task(conn, parent, result="ok")
+        kb.complete_task(conn, parent, result=_claimed_summary(conn, parent))
         # Manually block the child with zero failures (simulates a
         # dependency block, not a circuit-breaker block).
         conn.execute(
@@ -1415,7 +1421,9 @@ def test_recompute_ready_skips_tasks_at_failure_limit(kanban_home):
                                parents=[parent])
         # Complete the parent so the child's dependencies are satisfied.
         kb.claim_task(conn, parent)
-        kb.complete_task(conn, parent, summary="done")
+        kb.complete_task(
+            conn, parent, summary=_claimed_summary(conn, parent, "done")
+        )
 
         # Simulate the child having exhausted its budget twice,
         # hitting the default failure limit (2).
@@ -1595,7 +1603,9 @@ def test_claim_succeeds_once_parents_done(kanban_home):
             conn, title="child", assignee="a", parents=[parent],
         )
         kb.claim_task(conn, parent)
-        assert kb.complete_task(conn, parent, result="ok")
+        assert kb.complete_task(
+            conn, parent, result=_claimed_summary(conn, parent)
+        )
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "ready"
         claimed = kb.claim_task(conn, child, claimer="host:1")
@@ -1619,7 +1629,7 @@ def test_create_with_parents_stays_todo_until_parents_done(kanban_home):
         # Complete parent; complete_task internally runs recompute_ready,
         # which promotes the child to 'ready'.
         kb.claim_task(conn, parent)
-        kb.complete_task(conn, parent, result="ok")
+        kb.complete_task(conn, parent, result=_claimed_summary(conn, parent))
         assert kb.get_task(conn, child).status == "ready"
 
 
@@ -1645,7 +1655,7 @@ def test_unblock_with_pending_parents_goes_to_todo(kanban_home):
         assert kb.get_task(conn, child).status == "todo"
         # After parent completes + recompute, the child is ready.
         kb.claim_task(conn, parent)
-        kb.complete_task(conn, parent, result="ok")
+        kb.complete_task(conn, parent, result=_claimed_summary(conn, parent))
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "ready"
 
@@ -1817,7 +1827,7 @@ def test_events_capture_lifecycle(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         kb.claim_task(conn, t)
-        kb.complete_task(conn, t, result="ok")
+        kb.complete_task(conn, t, result=_claimed_summary(conn, t))
         events = kb.list_events(conn, t)
     kinds = [e.kind for e in events]
     assert "created" in kinds

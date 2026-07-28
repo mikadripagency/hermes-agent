@@ -4478,6 +4478,37 @@ def _scan_prose_for_phantom_ids(
     return [m for m in unique if m not in existing]
 
 
+class InvalidCompletionIdentityError(ValueError):
+    """A claimed delivery summary does not identify its owning task/run."""
+
+    def __init__(self, task_id: str, run_id: int):
+        self.task_id = task_id
+        self.run_id = int(run_id)
+        self.expected = f"{task_id}/run {run_id}"
+        super().__init__(
+            "completion blocked: summary must start with the authoritative "
+            f"completion identity {self.expected!r}"
+        )
+
+
+def _validate_completion_identity(task: Task, summary: Optional[str]) -> None:
+    """Fail closed for dispatcher-owned delivery completions.
+
+    Manual/unclaimed closes and the persistent system inbox keep their legacy
+    semantics. Claimed deliveries must identify the task/run selected from the
+    database; prose never chooses the authoritative identity.
+    """
+    if task.task_kind != "delivery" or task.current_run_id is None:
+        return
+    expected = f"{task.id}/run {task.current_run_id}"
+    normalized = (summary or "").strip()
+    if not normalized.startswith(expected) or (
+        len(normalized) > len(expected)
+        and not normalized[len(expected)].isspace()
+    ):
+        raise InvalidCompletionIdentityError(task.id, task.current_run_id)
+
+
 class MissingCompletionEvidenceError(ValueError):
     """A task-declared evidence contract was not satisfied."""
 
@@ -4596,6 +4627,10 @@ def complete_task(
         task = get_task(conn, task_id)
         if task is not None and task.status not in {"running", "ready", "blocked"}:
             return False
+        if task is not None:
+            _validate_completion_identity(
+                task, summary if summary is not None else result
+            )
         missing_evidence = _missing_completion_evidence(
             task.required_evidence if task else None, metadata
         )
