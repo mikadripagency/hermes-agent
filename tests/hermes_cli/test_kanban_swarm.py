@@ -1,3 +1,4 @@
+import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_swarm import (
@@ -6,6 +7,8 @@ from hermes_cli.kanban_swarm import (
     latest_blackboard,
     post_blackboard_update,
 )
+
+pytestmark = pytest.mark.usefixtures("claimed_completion_for_kanban_fixtures")
 
 
 def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path):

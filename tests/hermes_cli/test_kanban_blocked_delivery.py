@@ -30,7 +30,10 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 
-pytestmark = pytest.mark.usefixtures("explicit_delivery_contract_for_kanban_fixtures")
+pytestmark = pytest.mark.usefixtures(
+    "explicit_delivery_contract_for_kanban_fixtures",
+    "claimed_completion_for_kanban_fixtures",
+)
 
 
 ORCH_CHAT_ID = "C0ORCHTEST"

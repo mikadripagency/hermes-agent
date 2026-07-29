@@ -143,15 +143,22 @@ def create_swarm(
                 synthesizer_id=str(synthesizer_id),
             )
 
+    claimed_root = kb.claim_task(conn, root, claimer=created_by)
+    if claimed_root is None or claimed_root.current_run_id is None:
+        raise RuntimeError(f"could not claim swarm root {root} for completion")
     kb.complete_task(
         conn,
         root,
-        summary="Swarm topology planned; root remains the shared blackboard.",
+        summary=(
+            f"{root}/run {claimed_root.current_run_id} · "
+            "Swarm topology planned; root remains the shared blackboard."
+        ),
         metadata={
             "kind": "kanban_swarm_v1",
             "goal": goal,
             "worker_count": len(worker_specs),
         },
+        expected_run_id=claimed_root.current_run_id,
     )
 
     context_suffix = _swarm_context(root, goal)
