@@ -45,6 +45,92 @@ def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path)
         conn.close()
 
 
+def test_create_swarm_idempotent_retry_recovers_crash_after_root_claim(
+    tmp_path, monkeypatch,
+):
+    conn = kb.connect(tmp_path / "kanban.db")
+    original_complete_task = kb.complete_task
+    crashed = False
+
+    def crash_once_after_claim(*args, **kwargs):
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise RuntimeError("crash after claim")
+        return original_complete_task(*args, **kwargs)
+
+    monkeypatch.setattr(kb, "complete_task", crash_once_after_claim)
+    swarm_kwargs = {
+        "goal": "Recover one durable swarm.",
+        "workers": [
+            SwarmWorkerSpec(profile="researcher", title="Research", body="Find proof")
+        ],
+        "verifier_assignee": "reviewer",
+        "synthesizer_assignee": "writer",
+        "created_by": "orchestrator",
+        "idempotency_key": "swarm-crash-retry",
+    }
+
+    try:
+        with pytest.raises(RuntimeError, match="crash after claim"):
+            create_swarm(conn, **swarm_kwargs)
+
+        created = create_swarm(conn, **swarm_kwargs)
+
+        root = kb.get_task(conn, created.root_id)
+        assert root is not None and root.status == "done"
+        assert latest_blackboard(conn, created.root_id)["topology"] == (
+            created.as_dict() | {"goal": swarm_kwargs["goal"]}
+        )
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 4
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'claimed'",
+            (created.root_id,),
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_create_swarm_idempotent_retry_reuses_partial_graph(tmp_path, monkeypatch):
+    conn = kb.connect(tmp_path / "kanban.db")
+    original_create_task = kb.create_task
+    crashed = False
+
+    def crash_once_after_first_worker(*args, **kwargs):
+        nonlocal crashed
+        task_id = original_create_task(*args, **kwargs)
+        child_key = str(kwargs.get("idempotency_key", ""))
+        if not crashed and child_key.endswith(":worker:0"):
+            crashed = True
+            raise RuntimeError("crash after first worker")
+        return task_id
+
+    monkeypatch.setattr(kb, "create_task", crash_once_after_first_worker)
+    swarm_kwargs = {
+        "goal": "Recover one partial swarm.",
+        "workers": [
+            SwarmWorkerSpec(profile="a", title="A", body="A"),
+            SwarmWorkerSpec(profile="b", title="B", body="B"),
+        ],
+        "verifier_assignee": "reviewer",
+        "synthesizer_assignee": "writer",
+        "idempotency_key": "swarm-partial-retry",
+    }
+
+    try:
+        with pytest.raises(RuntimeError, match="crash after first worker"):
+            create_swarm(conn, **swarm_kwargs)
+
+        created = create_swarm(conn, **swarm_kwargs)
+
+        root = kb.get_task(conn, created.root_id)
+        assert root is not None and root.status == "done"
+        assert len(created.worker_ids) == len(set(created.worker_ids)) == 2
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 5
+    finally:
+        conn.close()
+
+
 def test_swarm_blackboard_merges_structured_updates(tmp_path):
     conn = kb.connect(tmp_path / "kanban.db")
     try:

@@ -74,6 +74,48 @@ def _swarm_context(root_id: str, goal: str) -> str:
     )
 
 
+def _complete_swarm_root(
+    conn: sqlite3.Connection,
+    root_id: str,
+    *,
+    goal: str,
+    worker_count: int,
+    created_by: str,
+) -> None:
+    root = kb.get_task(conn, root_id)
+    if root is None:
+        raise RuntimeError(f"swarm root {root_id} disappeared before completion")
+    if root.status == "done":
+        return
+    if root.current_run_id is None:
+        root = (
+            kb.claim_task(conn, root_id, claimer=created_by)
+            or kb.get_task(conn, root_id)
+        )
+    if root is None or root.current_run_id is None:
+        raise RuntimeError(f"could not claim swarm root {root_id} for completion")
+
+    run_id = root.current_run_id
+    completed = kb.complete_task(
+        conn,
+        root_id,
+        summary=(
+            f"{root_id}/run {run_id} · "
+            "Swarm topology planned; root remains the shared blackboard."
+        ),
+        metadata={
+            "kind": "kanban_swarm_v1",
+            "goal": goal,
+            "worker_count": worker_count,
+        },
+        expected_run_id=run_id,
+    )
+    if not completed:
+        refreshed = kb.get_task(conn, root_id)
+        if refreshed is None or refreshed.status != "done":
+            raise RuntimeError(f"could not complete swarm root {root_id}")
+
+
 def create_swarm(
     conn: sqlite3.Connection,
     *,
@@ -136,34 +178,24 @@ def create_swarm(
         verifier_id = existing.get("verifier_id")
         synthesizer_id = existing.get("synthesizer_id")
         if worker_ids and verifier_id and synthesizer_id:
-            return SwarmCreated(
+            created = SwarmCreated(
                 root_id=root,
                 worker_ids=worker_ids,
                 verifier_id=str(verifier_id),
                 synthesizer_id=str(synthesizer_id),
             )
-
-    claimed_root = kb.claim_task(conn, root, claimer=created_by)
-    if claimed_root is None or claimed_root.current_run_id is None:
-        raise RuntimeError(f"could not claim swarm root {root} for completion")
-    kb.complete_task(
-        conn,
-        root,
-        summary=(
-            f"{root}/run {claimed_root.current_run_id} · "
-            "Swarm topology planned; root remains the shared blackboard."
-        ),
-        metadata={
-            "kind": "kanban_swarm_v1",
-            "goal": goal,
-            "worker_count": len(worker_specs),
-        },
-        expected_run_id=claimed_root.current_run_id,
-    )
+            _complete_swarm_root(
+                conn,
+                root,
+                goal=goal,
+                worker_count=len(worker_specs),
+                created_by=created_by,
+            )
+            return created
 
     context_suffix = _swarm_context(root, goal)
     worker_ids: list[str] = []
-    for spec in worker_specs:
+    for index, spec in enumerate(worker_specs):
         worker_id = kb.create_task(
             conn,
             title=spec.title,
@@ -173,6 +205,7 @@ def create_swarm(
             parents=[root],
             tenant=tenant,
             priority=spec.priority or priority,
+            idempotency_key=f"kanban-swarm:{root}:worker:{index}",
             workspace_kind=workspace_kind,
             workspace_path=workspace_path,
             skills=spec.skills or None,
@@ -198,6 +231,7 @@ def create_swarm(
         parents=worker_ids,
         tenant=tenant,
         priority=priority,
+        idempotency_key=f"kanban-swarm:{root}:verifier",
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
         skills=["requesting-code-review"],
@@ -218,6 +252,7 @@ def create_swarm(
         parents=[verifier],
         tenant=tenant,
         priority=priority,
+        idempotency_key=f"kanban-swarm:{root}:synthesizer",
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
         skills=["humanizer"],
@@ -231,6 +266,13 @@ def create_swarm(
         author=created_by,
         key="topology",
         value=created.as_dict() | {"goal": goal},
+    )
+    _complete_swarm_root(
+        conn,
+        root,
+        goal=goal,
+        worker_count=len(worker_specs),
+        created_by=created_by,
     )
     return created
 
