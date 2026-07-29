@@ -13,6 +13,8 @@ import pytest
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 
+pytestmark = pytest.mark.usefixtures("claimed_completion_for_kanban_fixtures")
+
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):

@@ -6,7 +6,10 @@ from types import SimpleNamespace
 from hermes_cli import kanban_db as kb
 from unittest.mock import AsyncMock, MagicMock, patch
 
-pytestmark = pytest.mark.usefixtures("explicit_delivery_contract_for_kanban_fixtures")
+pytestmark = pytest.mark.usefixtures(
+    "explicit_delivery_contract_for_kanban_fixtures",
+    "claimed_completion_for_kanban_fixtures",
+)
 
 
 # ---------------------------------------------------------------------------

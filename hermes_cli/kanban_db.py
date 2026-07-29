@@ -4479,11 +4479,18 @@ def _scan_prose_for_phantom_ids(
 
 
 class InvalidCompletionIdentityError(ValueError):
-    """A claimed delivery summary does not identify its owning task/run."""
+    """A delivery completion has no authoritative task/run identity."""
 
-    def __init__(self, task_id: str, run_id: int):
+    def __init__(self, task_id: str, run_id: Optional[int]):
         self.task_id = task_id
-        self.run_id = int(run_id)
+        self.run_id = int(run_id) if run_id is not None else None
+        if self.run_id is None:
+            self.expected = None
+            super().__init__(
+                f"completion blocked: delivery task {task_id} must be claimed before "
+                "completion so its authoritative run identity comes from the database"
+            )
+            return
         self.expected = f"{task_id}/run {run_id}"
         super().__init__(
             "completion blocked: summary must start with the authoritative "
@@ -4492,16 +4499,18 @@ class InvalidCompletionIdentityError(ValueError):
 
 
 def _validate_completion_identity(task: Task, summary: Optional[str]) -> None:
-    """Fail closed for dispatcher-owned delivery completions.
+    """Fail closed for delivery completions without an authoritative run.
 
-    Manual/unclaimed closes and the persistent system inbox keep their legacy
-    semantics. Claimed deliveries must identify the task/run selected from the
-    database; prose never chooses the authoritative identity.
+    The persistent system inbox keeps its non-delivery semantics. Delivery
+    tasks must be claimed first and identify the task/run selected from the
+    database; prose never chooses or creates the authoritative identity.
     """
-    if task.task_kind != "delivery" or task.current_run_id is None:
+    if task.task_kind != "delivery":
         return
+    if task.current_run_id is None:
+        raise InvalidCompletionIdentityError(task.id, None)
     expected = f"{task.id}/run {task.current_run_id}"
-    normalized = (summary or "").strip()
+    normalized = summary or ""
     if not normalized.startswith(expected) or (
         len(normalized) > len(expected)
         and not normalized[len(expected)].isspace()
@@ -4589,9 +4598,8 @@ def complete_task(
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
-    Accepts a task that is merely ``ready`` too, so a manual CLI
-    completion (``hermes kanban complete <id>``) works without requiring
-    a claim/start/complete sequence.
+    Delivery tasks must already have a claimed run. Non-delivery system inbox
+    tasks may still be completed directly from ``ready`` or ``blocked``.
 
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.

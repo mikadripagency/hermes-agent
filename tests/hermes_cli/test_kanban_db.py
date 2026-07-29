@@ -16,6 +16,11 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 
+pytestmark = pytest.mark.usefixtures(
+    "explicit_delivery_contract_for_kanban_fixtures",
+    "claimed_completion_for_kanban_fixtures",
+)
+
 
 @pytest.fixture(autouse=True)
 def explicit_evidence_contract_for_unrelated_create_tests(monkeypatch):
@@ -3270,7 +3275,9 @@ def test_latest_summary_returns_summary_after_complete(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="work", assignee="alice")
         kb.complete_task(conn, t, summary=handoff)
-        assert kb.latest_summary(conn, t) == handoff
+        run = kb.latest_run(conn, t)
+        assert run is not None
+        assert kb.latest_summary(conn, t) == f"{t}/run {run.id} · {handoff}"
 
 
 def test_latest_summary_picks_newest_when_multiple_runs(kanban_home):
@@ -3292,7 +3299,11 @@ def test_latest_summary_picks_newest_when_multiple_runs(kanban_home):
         # the first (complete_task uses int(time.time())).
         time.sleep(1.05)
         kb.complete_task(conn, t, summary="second attempt — final")
-        assert kb.latest_summary(conn, t) == "second attempt — final"
+        run = kb.latest_run(conn, t)
+        assert run is not None
+        assert kb.latest_summary(conn, t) == (
+            f"{t}/run {run.id} · second attempt — final"
+        )
 
 
 def test_latest_summary_skips_empty_string(kanban_home):
@@ -3301,6 +3312,7 @@ def test_latest_summary_skips_empty_string(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="t", assignee="alice")
         kb.complete_task(conn, t, summary="real handoff")
+        completed = kb.latest_summary(conn, t)
         # Inject a later run with empty summary directly. Workers
         # writing "" instead of None is a real shape we want to ignore.
         conn.execute(
@@ -3309,7 +3321,7 @@ def test_latest_summary_skips_empty_string(kanban_home):
             (t, int(time.time()) + 1, int(time.time()) + 2, ""),
         )
         conn.commit()
-        assert kb.latest_summary(conn, t) == "real handoff"
+        assert kb.latest_summary(conn, t) == completed
 
 
 def test_latest_summaries_batch_omits_tasks_without_summary(kanban_home):
@@ -3323,7 +3335,9 @@ def test_latest_summaries_batch_omits_tasks_without_summary(kanban_home):
         kb.complete_task(conn, t1, summary="alpha")
         kb.complete_task(conn, t3, summary="charlie")
         out = kb.latest_summaries(conn, [t1, t2, t3])
-        assert out == {t1: "alpha", t3: "charlie"}
+        assert out[t1].endswith(" · alpha")
+        assert out[t3].endswith(" · charlie")
+        assert set(out) == {t1, t3}
         # Empty input → empty dict, no SQL syntax error from "IN ()".
         assert kb.latest_summaries(conn, []) == {}
 

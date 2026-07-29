@@ -19,6 +19,8 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
 
+pytestmark = pytest.mark.usefixtures("claimed_completion_for_kanban_fixtures")
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1130,9 +1132,10 @@ def test_bulk_status_done_forwards_completion_summary(client):
         for tid in (a["id"], b["id"]):
             task = kb.get_task(conn, tid)
             run = kb.latest_run(conn, tid)
+            assert task is not None and run is not None
             assert task.status == "done"
             assert task.result == "DECIDED: ship it"
-            assert run.summary == "DECIDED: ship it"
+            assert run.summary == f"{tid}/run {run.id} · DECIDED: ship it"
             assert run.metadata == {"source": "dashboard"}
     finally:
         conn.close()
@@ -1359,7 +1362,7 @@ def test_task_detail_includes_runs(client):
     run = d["runs"][0]
     assert run["outcome"] == "completed"
     assert run["profile"] == "worker"
-    assert run["summary"] == "tested on rate limiter"
+    assert run["summary"] == f"{tid}/run {run['id']} · tested on rate limiter"
     assert run["metadata"] == {"changed_files": ["limiter.py"]}
     assert run["ended_at"] is not None
 
@@ -1399,8 +1402,9 @@ def test_patch_status_done_with_summary_and_metadata(client):
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, tid)
+        assert run is not None
         assert run.outcome == "completed"
-        assert run.summary == "shipped the thing"
+        assert run.summary == f"{tid}/run {run.id} · shipped the thing"
         assert run.metadata == {"changed_files": ["a.py", "b.py"], "tests_run": 7}
     finally:
         conn.close()
@@ -1424,8 +1428,9 @@ def test_patch_status_done_without_summary_still_works(client):
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, tid)
+        assert run is not None
         assert run.outcome == "completed"
-        assert run.summary == "legacy shape"  # falls back to result
+        assert run.summary == f"{tid}/run {run.id} · legacy shape"
     finally:
         conn.close()
 
@@ -1983,13 +1988,13 @@ def test_reclaim_endpoint_releases_running_claim(client):
     assert body["ok"] is True
     assert body["task_id"] == t
 
-    # Confirm the task is back to ready.
+    # The active lifecycle stays In Progress while the claim is released.
     conn2 = kb.connect()
     try:
         row = conn2.execute(
             "SELECT status, claim_lock FROM tasks WHERE id=?", (t,),
         ).fetchone()
-        assert row["status"] == "ready"
+        assert row["status"] == "running"
         assert row["claim_lock"] is None
     finally:
         conn2.close()
@@ -2092,7 +2097,7 @@ def test_reassign_endpoint_with_reclaim_first_succeeds_on_running(client):
         row = conn2.execute(
             "SELECT status, assignee FROM tasks WHERE id=?", (t,),
         ).fetchone()
-        assert row["status"] == "ready"
+        assert row["status"] == "running"
         assert row["assignee"] == "new"
     finally:
         conn2.close()
@@ -2412,4 +2417,4 @@ def test_completion_evidence_error_is_resumable_http_conflict(client):
     assert "missing required evidence classes" in response.json()["detail"]
     assert client.get(
         f"/api/plugins/kanban/tasks/{task['id']}"
-    ).json()["task"]["status"] == "ready"
+    ).json()["task"]["status"] == "running"
