@@ -2381,31 +2381,14 @@ def terminal_tool(
             # For non-local backends: runs inside the sandbox via env.execute().
             from tools.process_registry import process_registry
 
-            if os.environ.get("HERMES_KANBAN_TASK") and (
-                env_type != "local" or effective_pty or os.name == "nt"
-            ):
+            if os.environ.get("HERMES_KANBAN_TASK"):
                 return json.dumps({
                     "output": "",
                     "exit_code": -1,
                     "error": (
-                        "Kanban workers only allow non-PTY local background "
-                        "processes; use foreground execution for remote, PTY, "
-                        "or Windows commands so run takeover can retire them."
-                    ),
-                    "status": "blocked",
-                }, ensure_ascii=False)
-
-            if (
-                os.environ.get("HERMES_KANBAN_TASK")
-                and os.name == "posix"
-                and os.getpgrp() != os.getpid()
-            ):
-                return json.dumps({
-                    "output": "",
-                    "exit_code": -1,
-                    "error": (
-                        "Kanban background processes require a worker-owned "
-                        "process group; use foreground execution in this runtime."
+                        "Kanban workers require foreground execution so run "
+                        "takeover can prove the command and every descendant "
+                        "have stopped."
                     ),
                     "status": "blocked",
                 }, ensure_ascii=False)
@@ -2424,7 +2407,6 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
-                        kanban_run_bound=bool(os.environ.get("HERMES_KANBAN_TASK")),
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(

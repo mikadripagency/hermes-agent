@@ -281,6 +281,19 @@ def _agent_has_label(agent: dict, key: str, value: str) -> bool:
     return False
 
 
+def _retire_agent_or_confirm_absent(
+    paseo_bin: str, agent_id: str, task_id: str
+) -> bool:
+    """Retire one agent or prove authoritative discovery no longer sees it."""
+    if _archive_agent(paseo_bin, agent_id, task_id, force=True):
+        return True
+    try:
+        agents = _list_task_agents(paseo_bin, task_id)
+    except RuntimeError:
+        return False
+    return all(str(agent.get("id")) != agent_id for agent in agents)
+
+
 # ---------------------------------------------------------------------------
 # Project-linked workspace resolution (repo-worktree tasks)
 # ---------------------------------------------------------------------------
@@ -841,7 +854,7 @@ def watch_worker(
         if state is not None:
             status, current_run = state
             if status != "running":
-                if _archive_agent(paseo_bin, agent_id, task_id, force=True):
+                if _retire_agent_or_confirm_absent(paseo_bin, agent_id, task_id):
                     _log.info(
                         "paseo watch: task %s left running (status=%s); "
                         "retired agent %s",
@@ -860,7 +873,7 @@ def watch_worker(
                 time.sleep(poll_seconds)
                 continue
             if run_id is not None and current_run is not None and int(current_run) != int(run_id):
-                if _archive_agent(paseo_bin, agent_id, task_id, force=True):
+                if _retire_agent_or_confirm_absent(paseo_bin, agent_id, task_id):
                     _log.info(
                         "paseo watch: task %s run superseded (%s -> %s); "
                         "retired stale agent %s",
@@ -893,14 +906,21 @@ def watch_worker(
         else:
             consecutive_bad += 1
             if consecutive_bad >= gone_threshold:
-                _log.warning(
-                    "paseo watch: agent %s gone/unreachable for %d consecutive "
-                    "polls — declaring worker dead (task %s)",
+                if _retire_agent_or_confirm_absent(paseo_bin, agent_id, task_id):
+                    _log.warning(
+                        "paseo watch: agent %s gone/unreachable for %d consecutive "
+                        "polls and retired/absent — declaring worker dead (task %s)",
+                        agent_id,
+                        consecutive_bad,
+                        task_id,
+                    )
+                    return WATCH_EXIT_WORKER_GONE
+                _log.error(
+                    "paseo watch: agent %s is unreachable but retirement/absence "
+                    "is unproved for task %s; retrying fail-closed",
                     agent_id,
-                    consecutive_bad,
                     task_id,
                 )
-                return WATCH_EXIT_WORKER_GONE
 
         # (b2) Soft-stall — an idle agent whose task heartbeat is frozen past
         # the threshold is an effectively-gone worker (the pid_alive trap).
@@ -910,24 +930,38 @@ def watch_worker(
         if stall_enabled and agent_ok and agent_status == "idle":
             hb = _read_task_heartbeat(db_path, task_id)
             if hb is not None and (time.time() - hb) > idle_stall_seconds:
-                _log.warning(
-                    "paseo watch: agent %s idle with frozen heartbeat "
-                    "(%.0fs > %.0fs) for task %s — declaring worker gone",
+                if _retire_agent_or_confirm_absent(paseo_bin, agent_id, task_id):
+                    _log.warning(
+                        "paseo watch: agent %s idle with frozen heartbeat "
+                        "(%.0fs > %.0fs) for task %s — retired",
+                        agent_id,
+                        time.time() - hb,
+                        idle_stall_seconds,
+                        task_id,
+                    )
+                    return WATCH_EXIT_WORKER_GONE
+                _log.error(
+                    "paseo watch: idle agent %s for task %s could not be retired; "
+                    "retrying fail-closed",
                     agent_id,
-                    time.time() - hb,
-                    idle_stall_seconds,
                     task_id,
                 )
-                return WATCH_EXIT_WORKER_GONE
 
         # (c) Deadline (task max_runtime + slack).
         if deadline is not None and time.time() >= deadline:
-            _log.warning(
-                "paseo watch: deadline passed for task %s (agent %s) — exiting",
+            if _retire_agent_or_confirm_absent(paseo_bin, agent_id, task_id):
+                _log.warning(
+                    "paseo watch: deadline passed for task %s; retired agent %s",
+                    task_id,
+                    agent_id,
+                )
+                return WATCH_EXIT_WORKER_GONE
+            _log.error(
+                "paseo watch: deadline passed for task %s but agent %s could not "
+                "be retired; retrying fail-closed",
                 task_id,
                 agent_id,
             )
-            return WATCH_EXIT_WORKER_GONE
 
         time.sleep(poll_seconds)
 
@@ -996,7 +1030,7 @@ def _install_watch_termination_handler(
     import signal
 
     def _terminate(signum, _frame):
-        if not _archive_agent(paseo_bin, agent_id, task_id, force=True):
+        if not _retire_agent_or_confirm_absent(paseo_bin, agent_id, task_id):
             _log.error(
                 "paseo watch: refusing SIGTERM exit while stale agent %s for "
                 "task %s could not be retired",
@@ -1067,6 +1101,17 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
     profile_arg = env.get("HERMES_PROFILE") or "kanban"
     provider_profile = str(cfg.get("profile") or "developer").strip()
     if provider_profile != profile_arg:
+        agents = _list_task_agents(paseo_bin, task.id)
+        for agent in agents:
+            agent_id = str(agent["id"])
+            if not _archive_agent(
+                paseo_bin, agent_id, task.id,
+                force=agent.get("status") in _ACTIVE_STATUSES,
+            ):
+                raise RuntimeError(
+                    f"could not retire Paseo agent {agent_id} before "
+                    f"profile fallback for task {task.id}"
+                )
         _log.info(
             "kanban paseo_spawn: provider %s belongs to profile %s, not task "
             "profile %s; using _default_spawn for task %s",
@@ -1104,8 +1149,22 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
         cfg.get("idle_stall_seconds"), int(WATCH_IDLE_STALL_SECONDS), minimum=0
     )
 
-    # Health check — automatic fallback on any daemon trouble.
+    # Discover before fallback: an unhealthy daemon must not hide an existing
+    # ACP owner and let the dispatcher start a second native worker.
+    agents = _list_task_agents(paseo_bin, task.id)
     if not _paseo_healthy(paseo_bin):
+        for agent in agents:
+            agent_id = str(agent["id"])
+            if not _archive_agent(
+                paseo_bin,
+                agent_id,
+                task.id,
+                force=agent.get("status") in _ACTIVE_STATUSES,
+            ):
+                raise RuntimeError(
+                    f"could not retire Paseo agent {agent_id} before fallback "
+                    f"for task {task.id}"
+                )
         _log.warning(
             "kanban paseo_spawn: `paseo status` failed; falling back to "
             "_default_spawn for task %s",
@@ -1134,15 +1193,19 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
         #   the kanban tools would reject them and no heartbeats would flow.
         #   Archive them (best-effort) and create a FRESH agent with the new
         #   run's env — keeping at most one non-archived agent per task.
-        agents = _list_task_agents(paseo_bin, task.id)
-        expected_run = str(getattr(task, "current_run_id", ""))
+        current_agents = _list_task_agents(
+            paseo_bin,
+            task.id,
+            run_id=getattr(task, "current_run_id", None),
+            profile=profile_arg,
+        )
+        current_ids = {str(agent["id"]) for agent in current_agents}
         active = next(
             (
                 agent
                 for agent in agents
                 if agent.get("status") in _ACTIVE_STATUSES
-                and _agent_has_label(agent, "kanban_run", expected_run)
-                and _agent_has_label(agent, "kanban_profile", profile_arg)
+                and str(agent["id"]) in current_ids
             ),
             None,
         )

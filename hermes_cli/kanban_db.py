@@ -90,7 +90,11 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
-from hermes_cli.kanban_run_lock import fence_task_transition
+from hermes_cli.kanban_run_lock import (
+    database_path,
+    fence_task_transition,
+    task_run_lock,
+)
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -7073,7 +7077,7 @@ def enforce_max_runtime(
 ) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
-    Sends SIGTERM, waits a short grace window, then SIGKILL. Emits a
+    Sends SIGTERM and advances ownership only after the worker/agent is gone. Emits a
     ``timed_out`` event and drops the task back to ``ready`` so the next
     dispatcher tick re-spawns it — unless the spawn-failure circuit
     breaker has already given up, in which case the task stays blocked
@@ -7111,58 +7115,43 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
-        killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        termination = _terminate_reclaimed_worker(
+            pid, row["claim_lock"], signal_fn=signal_fn,
         )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
-
-        with write_txn(conn):
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'running', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (tid, pid, row["claim_lock"]),
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, row["claim_lock"], now, termination,
+                reason="max_runtime_worker_alive",
             )
-            if cur.rowcount == 1:
-                payload = {
-                    "pid": pid,
-                    "elapsed_seconds": int(elapsed),
-                    "limit_seconds": int(row["max_runtime_seconds"]),
-                    "sigkill": killed,
-                }
-                run_id = _end_run(
-                    conn, tid,
-                    outcome="timed_out", status="timed_out",
-                    error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
-                    metadata=payload,
+            continue
+
+        with task_run_lock(database_path(conn), tid, exclusive=True):
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'running', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, "
+                    "last_heartbeat_at = NULL "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND worker_pid = ? AND claim_lock IS ?",
+                    (tid, pid, row["claim_lock"]),
                 )
-                _append_event(
-                    conn, tid, "timed_out", payload, run_id=run_id,
-                )
-                timed_out.append(tid)
+                if cur.rowcount == 1:
+                    payload = {
+                        "pid": pid,
+                        "elapsed_seconds": int(elapsed),
+                        "limit_seconds": int(row["max_runtime_seconds"]),
+                    }
+                    payload.update(termination)
+                    run_id = _end_run(
+                        conn, tid,
+                        outcome="timed_out", status="timed_out",
+                        error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
+                        metadata=payload,
+                    )
+                    _append_event(
+                        conn, tid, "timed_out", payload, run_id=run_id,
+                    )
+                    timed_out.append(tid)
         # Increment the unified failure counter. Outside the write_txn
         # above because ``_record_task_failure`` opens its own. If the
         # breaker trips, this flips the task ``ready → blocked`` and
@@ -7175,7 +7164,7 @@ def enforce_max_runtime(
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed},
+                event_payload_extra={"pid": pid, **termination},
             )
     return timed_out
 
@@ -7311,45 +7300,46 @@ def detect_stale_running(
             reclaimed.append(tid)
             continue
 
-        with write_txn(conn):
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'running', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ?",
-                (tid, row["claim_lock"]),
-            )
-            if cur.rowcount != 1:
-                continue
+        with task_run_lock(database_path(conn), tid, exclusive=True):
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'running', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, "
+                    "last_heartbeat_at = NULL "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND claim_lock IS ?",
+                    (tid, row["claim_lock"]),
+                )
+                if cur.rowcount != 1:
+                    continue
 
-            payload = {
-                "elapsed_seconds": int(elapsed),
-                "last_heartbeat_at": (
-                    int(last_hb) if last_hb is not None else None
-                ),
-                "heartbeat_age_seconds": (
-                    int(hb_age) if hb_age is not None else None
-                ),
-                "timeout_seconds": stale_timeout_seconds,
-                "pid": int(pid) if pid else None,
-            }
-            payload.update(termination)
+                payload = {
+                    "elapsed_seconds": int(elapsed),
+                    "last_heartbeat_at": (
+                        int(last_hb) if last_hb is not None else None
+                    ),
+                    "heartbeat_age_seconds": (
+                        int(hb_age) if hb_age is not None else None
+                    ),
+                    "timeout_seconds": stale_timeout_seconds,
+                    "pid": int(pid) if pid else None,
+                }
+                payload.update(termination)
 
-            run_id = _end_run(
-                conn, tid,
-                outcome="stale", status="stale",
-                error=(
-                    f"no heartbeat for {int(hb_age)}s "
-                    if hb_age is not None
-                    else "no heartbeat ever"
-                ) + f" after {int(elapsed)}s running",
-                metadata=payload,
-            )
-            _append_event(
-                conn, tid, "stale", payload, run_id=run_id,
-            )
-            reclaimed.append(tid)
+                run_id = _end_run(
+                    conn, tid,
+                    outcome="stale", status="stale",
+                    error=(
+                        f"no heartbeat for {int(hb_age)}s "
+                        if hb_age is not None
+                        else "no heartbeat ever"
+                    ) + f" after {int(elapsed)}s running",
+                    metadata=payload,
+                )
+                _append_event(
+                    conn, tid, "stale", payload, run_id=run_id,
+                )
+                reclaimed.append(tid)
 
         # Intentionally NOT calling _record_task_failure here. Stale reclaim
         # is dispatcher-side detection of an absent heartbeat; the task is
@@ -7492,13 +7482,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'running', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
-            )
+            with task_run_lock(
+                database_path(conn), row["id"], exclusive=True
+            ):
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'running', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND worker_pid = ? AND claim_lock IS ?",
+                    (row["id"], pid, row["claim_lock"]),
+                )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board

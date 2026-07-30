@@ -170,7 +170,9 @@ def fence_kanban_worker_tool(*, name_arg_index: int) -> Callable:
     return decorate
 
 
-def fence_kanban_worker_tool_batch(*, message_arg_index: int) -> Callable:
+def fence_kanban_worker_tool_batch(
+    *, message_arg_index: int, allow_transition: bool = True
+) -> Callable:
     """Fence a sequential tool batch before middleware/hooks/checkpoints."""
 
     def decorate(function: Callable) -> Callable:
@@ -183,16 +185,17 @@ def fence_kanban_worker_tool_batch(*, message_arg_index: int) -> Callable:
                 if len(args) > message_arg_index
                 else kwargs.get("assistant_message")
             )
+            calls = list(getattr(message, "tool_calls", None) or [])
             names = {
                 getattr(getattr(call, "function", None), "name", None)
-                for call in (getattr(message, "tool_calls", None) or [])
+                for call in calls
             }
             messages = args[2] if len(args) > 2 else kwargs.get("messages")
 
             def reject(error: str):
                 content = json.dumps({"error": error}, ensure_ascii=False)
                 if isinstance(messages, list):
-                    for call in (getattr(message, "tool_calls", None) or []):
+                    for call in calls:
                         messages.append({
                             "role": "tool",
                             "tool_call_id": getattr(call, "id", "") or "",
@@ -204,6 +207,11 @@ def fence_kanban_worker_tool_batch(*, message_arg_index: int) -> Callable:
                 return None
 
             transition = bool(names & _TRANSITIONS)
+            if transition and (not allow_transition or len(calls) != 1):
+                return reject(
+                    "Kanban lifecycle transitions must be called alone, outside "
+                    "concurrent or mixed tool batches"
+                )
             task_id = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
             db_path = str(os.environ.get("HERMES_KANBAN_DB") or "").strip()
             try:

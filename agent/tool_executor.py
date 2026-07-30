@@ -323,6 +323,7 @@ def _run_agent_tool_execution_middleware(
     return result, observed_args
 
 
+@fence_kanban_worker_tool_batch(message_arg_index=1, allow_transition=False)
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 

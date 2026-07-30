@@ -328,6 +328,91 @@ def test_sequential_path_rejects_stale_run_before_middleware(
     assert "stale kanban worker run" in messages[0]["content"]
 
 
+def test_concurrent_path_rejects_stale_run_before_middleware(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from agent import tool_executor
+
+    with kb.connect_closing() as conn:
+        task_id = _delivery(conn)
+        task = kb.claim_task(conn, task_id, execution_profile="developer")
+        assert task is not None and task.current_run_id is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id + 1))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_home / "kanban.db"))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    monkeypatch.setenv("HERMES_HOME", str(kanban_home / "profiles" / "developer"))
+    middleware_ran = False
+
+    def middleware(*args, **kwargs):
+        nonlocal middleware_ran
+        middleware_ran = True
+        return kwargs["function_args"], []
+
+    monkeypatch.setattr(
+        tool_executor, "_apply_tool_request_middleware_for_agent", middleware
+    )
+    tool_call = SimpleNamespace(
+        id="call-1",
+        function=SimpleNamespace(name="read_file", arguments='{"path":"x"}'),
+    )
+    messages = []
+    agent = MagicMock()
+    agent._interrupt_requested = False
+
+    tool_executor.execute_tool_calls_concurrent(
+        agent, SimpleNamespace(tool_calls=[tool_call]), messages, "", 0
+    )
+
+    assert middleware_ran is False
+    assert len(messages) == 1
+    assert "stale kanban worker run" in messages[0]["content"]
+
+
+def test_sequential_mixed_transition_batch_is_rejected_before_any_effect(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from agent.tool_executor import execute_tool_calls_sequential
+
+    with kb.connect_closing() as conn:
+        task_id = _delivery(conn)
+        task = kb.claim_task(conn, task_id, execution_profile="developer")
+        assert task is not None and task.current_run_id is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_home / "kanban.db"))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    monkeypatch.setenv("HERMES_HOME", str(kanban_home / "profiles" / "developer"))
+    assistant_message = SimpleNamespace(tool_calls=[
+        SimpleNamespace(
+            id="complete",
+            function=SimpleNamespace(name="kanban_complete", arguments="{}"),
+        ),
+        SimpleNamespace(
+            id="effect",
+            function=SimpleNamespace(name="terminal", arguments='{"command":"true"}'),
+        ),
+    ])
+    messages = []
+
+    execute_tool_calls_sequential(object(), assistant_message, messages, "", 0)
+
+    assert len(messages) == 2
+    assert all("must be called alone" in message["content"] for message in messages)
+    with kb.connect_closing() as conn:
+        current = kb.get_task(conn, task_id)
+    assert current is not None and current.status == "running"
+
+
 def test_run_transition_waits_until_admitted_effect_finishes(
     kanban_home: Path,
     tmp_path: Path,
@@ -396,14 +481,14 @@ def test_run_transition_waits_until_admitted_effect_finishes(
         assert blocked_task is not None and blocked_task.status == "blocked"
 
 
-def test_background_process_holds_run_lease_until_exit(
+def test_kanban_worker_rejects_background_processes(
     kanban_home: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import threading
+    import os
 
-    from tools.process_registry import ProcessRegistry
+    from tools.terminal_tool import terminal_tool
 
     with kb.connect_closing() as conn:
         task_id = _delivery(conn)
@@ -414,34 +499,20 @@ def test_background_process_holds_run_lease_until_exit(
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_home / "kanban.db"))
     monkeypatch.setenv("HERMES_PROFILE", "developer")
-    registry = ProcessRegistry()
-    session = registry.spawn_local(
-        "python3 -c 'import os,time; p=os.fork(); p and os._exit(0); "
-        "os.close(1); os.close(2); time.sleep(0.4); os._exit(0)'",
-        cwd=str(tmp_path),
-        task_id="test",
-        kanban_run_bound=True,
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setattr(os, "getpgrp", os.getpid)
+
+    result = json.loads(
+        terminal_tool(
+            "python3 -c 'import os,time; os.setsid(); time.sleep(30)'",
+            task_id="test",
+            workdir=str(tmp_path),
+            background=True,
+        )
     )
-    results = {}
 
-    def transition() -> None:
-        with kb.connect_closing() as conn:
-            results["blocked"] = kb.block_task(
-                conn,
-                task_id,
-                reason="takeover",
-                kind="capability",
-                expected_run_id=task.current_run_id,
-            )
-
-    thread = threading.Thread(target=transition)
-    thread.start()
-    assert session._completion_event.wait(timeout=1)
-    thread.join(timeout=0.1)
-    assert thread.is_alive()
-
-    thread.join(timeout=5)
-    assert results == {"blocked": True}
+    assert result["status"] == "blocked"
+    assert "foreground" in result["error"]
 
 
 def test_non_transition_tools_remain_parallel(

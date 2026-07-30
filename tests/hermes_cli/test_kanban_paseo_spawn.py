@@ -487,6 +487,36 @@ def test_active_stale_agent_archive_failure_prevents_second_worker(
     assert calls["run"] == [] and calls["popen"] == []
 
 
+def test_unhealthy_paseo_requires_authoritative_agent_discovery_before_fallback(
+    monkeypatch, tmp_path
+):
+    _profile_home(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    monkeypatch.setattr(paseo_spawn, "_paseo_healthy", lambda _bin: False)
+    monkeypatch.setattr(
+        paseo_spawn,
+        "_list_task_agents",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("discovery unavailable")
+        ),
+    )
+    fallback = []
+    monkeypatch.setattr(
+        kb,
+        "_default_spawn",
+        lambda *args, **kwargs: fallback.append((args, kwargs)) or 123,
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    with pytest.raises(RuntimeError, match="discovery unavailable"):
+        paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
+
+    assert fallback == []
+
+
 def test_superseded_run_retires_agent_before_watcher_reports_settled(monkeypatch):
     """A reclaimed Paseo agent cannot keep using native shell after run advance."""
     from hermes_cli import paseo_spawn
@@ -1327,15 +1357,20 @@ def test_watch_exits_1_when_agent_gone_consecutively(monkeypatch):
     """Agent gone for N consecutive polls while task still running → exit 1."""
     from hermes_cli import paseo_spawn
 
-    rc, polls = _watch(
+    retired = []
+    monkeypatch.setattr(
         paseo_spawn,
-        monkeypatch,
-        task_states=[("running", 1)],
-        inspect_results=[False],
-        gone_threshold=3,
+        "_archive_agent",
+        lambda *args, **kwargs: retired.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(paseo_spawn, "_read_task_run_state", lambda *_: ("running", 1))
+    monkeypatch.setattr(paseo_spawn, "_inspect_agent_ok", lambda *_: False)
+    rc = paseo_spawn.watch_worker(
+        task_id="t_w", agent_id="ag_w", db_path="unused.db", run_id=1,
+        poll_seconds=0, gone_threshold=3,
     )
     assert rc == 1
-    assert polls == 3  # exactly the consecutive threshold
+    assert len(retired) == 1
 
 
 def test_watch_transient_inspect_failures_reset(monkeypatch):
@@ -1361,14 +1396,20 @@ def test_watch_exits_1_on_deadline(monkeypatch):
 
     from hermes_cli import paseo_spawn
 
-    rc, _ = _watch(
+    retired = []
+    monkeypatch.setattr(
         paseo_spawn,
-        monkeypatch,
-        task_states=[("running", 1)],
-        inspect_results=[True],
-        deadline=time.time() - 10,
+        "_archive_agent",
+        lambda *args, **kwargs: retired.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(paseo_spawn, "_read_task_run_state", lambda *_: ("running", 1))
+    monkeypatch.setattr(paseo_spawn, "_inspect_agent_ok", lambda *_: True)
+    rc = paseo_spawn.watch_worker(
+        task_id="t_w", agent_id="ag_w", db_path="unused.db", run_id=1,
+        deadline=time.time() - 10, poll_seconds=0,
     )
     assert rc == 1
+    assert len(retired) == 1
 
 
 def test_watch_exits_0_when_run_superseded(monkeypatch):
