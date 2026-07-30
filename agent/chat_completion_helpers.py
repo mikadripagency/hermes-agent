@@ -39,6 +39,7 @@ from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
+_ITERATION_SUMMARY_TIMEOUT_CAP_SECONDS = 900.0
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
@@ -1780,6 +1781,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             summary_kwargs = {
                 "model": agent.model,
                 "messages": api_messages,
+                # This direct, non-streaming call bypasses the main stale-call
+                # watchdog. Keep provider-specific shorter limits, but never
+                # let a silent transport wedge terminal cleanup indefinitely.
+                "timeout": min(
+                    agent._resolved_api_call_timeout(),
+                    _ITERATION_SUMMARY_TIMEOUT_CAP_SECONDS,
+                ),
             }
             if _summary_temperature is not None:
                 summary_kwargs["temperature"] = _summary_temperature
@@ -1882,6 +1890,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 summary_kwargs = {
                     "model": agent.model,
                     "messages": api_messages,
+                    "timeout": min(
+                        agent._resolved_api_call_timeout(),
+                        _ITERATION_SUMMARY_TIMEOUT_CAP_SECONDS,
+                    ),
                 }
                 if _summary_temperature is not None:
                     summary_kwargs["temperature"] = _summary_temperature

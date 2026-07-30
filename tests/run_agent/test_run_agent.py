@@ -3655,6 +3655,32 @@ class TestHandleMaxIterations:
         assert len(result) > 0
         assert "summary" in result.lower()
 
+    @pytest.mark.parametrize(
+        ("provider_timeout", "expected_timeout"),
+        [(120.0, 120.0), (1200.0, 900.0)],
+    )
+    def test_summary_requests_have_bounded_timeout(
+        self, agent, monkeypatch, provider_timeout, expected_timeout
+    ):
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content=""),
+            _mock_response(content="Summary after retry"),
+        ]
+        agent._cached_system_prompt = "You are helpful."
+        monkeypatch.setattr(
+            agent, "_resolved_api_call_timeout", lambda: provider_timeout
+        )
+
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "do stuff"}], 60
+        )
+
+        assert result == "Summary after retry"
+        assert [
+            call.kwargs["timeout"]
+            for call in agent.client.chat.completions.create.call_args_list
+        ] == [expected_timeout, expected_timeout]
+
     def test_api_failure_returns_error(self, agent):
         agent.client.chat.completions.create.side_effect = Exception("API down")
         agent._cached_system_prompt = "You are helpful."
