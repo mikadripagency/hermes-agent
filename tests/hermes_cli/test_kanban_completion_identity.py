@@ -50,8 +50,9 @@ def _cardinalities(conn):
         "{task_id} · missing run identity",
         "t_wrong/run {run_id} · wrong task identity",
         "{task_id}/run 999999 · wrong run identity",
+        "  {task_id}/run {run_id} · leading whitespace",
     ],
-    ids=("missing-task", "missing-run", "wrong-task", "wrong-run"),
+    ids=("missing-task", "missing-run", "wrong-task", "wrong-run", "leading-space"),
 )
 def test_claimed_delivery_rejects_noncanonical_completion_identity_without_side_effects(
     kanban_home, summary,
@@ -143,25 +144,56 @@ def test_dashboard_style_completion_revalidates_identity_under_terminal_lock(
     assert completed == []
 
 
-def test_unclaimed_and_system_inbox_completions_remain_compatible(kanban_home):
+def test_unclaimed_delivery_completion_is_rejected_without_side_effects(
+    kanban_home,
+):
     with kb.connect_closing() as conn:
-        legacy_id = kb.create_task(
+        task_id = kb.create_task(
             conn,
-            title="legacy manual completion",
-            evidence_contract_na_reason="legacy compatibility fixture",
+            title="delivery must have an authoritative run",
+            evidence_contract_na_reason="identity contract test",
         )
+        before = _cardinalities(conn)
+
+        with pytest.raises(
+            kb.InvalidCompletionIdentityError,
+            match="must be claimed before completion",
+        ):
+            kb.complete_task(conn, task_id, summary="done")
+
+        after = _cardinalities(conn)
+        task = kb.get_task(conn, task_id)
+
+    assert after == before
+    assert task is not None and task.status == "ready"
+    assert task.current_run_id is None
+
+
+def test_system_inbox_completion_and_legacy_readback_remain_compatible(kanban_home):
+    with kb.connect_closing() as conn:
         inbox_id = kb.create_system_inbox_task(
             conn,
             title="persistent process inbox",
             initial_status="blocked",
         )
 
-        assert kb.complete_task(conn, legacy_id, summary="legacy summary without identity")
         assert kb.complete_task(conn, inbox_id, summary="inbox maintenance summary")
 
     with kb.connect_closing() as conn:
-        assert kb.latest_summary(conn, legacy_id) == "legacy summary without identity"
         assert kb.latest_summary(conn, inbox_id) == "inbox maintenance summary"
+
+
+def test_legacy_delivery_summary_readback_remains_compatible(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id, run_id = _claimed_delivery(conn)
+        assert kb.complete_task(conn, task_id, summary=f"{task_id}/run {run_id}")
+        assert kb.edit_completed_task_result(
+            conn,
+            task_id,
+            result="legacy result",
+            summary="legacy summary without identity",
+        )
+        assert kb.latest_summary(conn, task_id) == "legacy summary without identity"
 
 
 def test_cli_surfaces_claimed_delivery_identity_rejection(kanban_home):
@@ -175,6 +207,23 @@ def test_cli_surfaces_claimed_delivery_identity_rejection(kanban_home):
     assert "authoritative completion identity" in output
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, task_id).status == "running"
+
+
+def test_cli_rejects_unclaimed_delivery_completion(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="manual CLI close must not invent a run",
+            evidence_contract_na_reason="identity contract test",
+        )
+
+    output = kc.run_slash(f"complete {task_id} --summary 'done'")
+
+    assert "must be claimed before completion" in output
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        assert task.current_run_id is None
 
 
 def test_dashboard_api_returns_conflict_for_claimed_delivery_identity_rejection(
@@ -200,3 +249,30 @@ def test_dashboard_api_returns_conflict_for_claimed_delivery_identity_rejection(
     assert "authoritative completion identity" in str(exc_info.value.detail)
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, task_id).status == "running"
+
+
+def test_dashboard_api_rejects_unclaimed_delivery_completion(kanban_home):
+    pytest.importorskip("fastapi")
+    from fastapi import HTTPException
+    from plugins.kanban.dashboard import plugin_api
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="dashboard close must not invent a run",
+            evidence_contract_na_reason="identity contract test",
+        )
+
+    with pytest.raises(HTTPException) as exc_info:
+        plugin_api.update_task(
+            task_id,
+            plugin_api.UpdateTaskBody(status="done", summary="done"),
+            board="default",
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "must be claimed before completion" in str(exc_info.value.detail)
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        assert task.current_run_id is None

@@ -33,8 +33,41 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 @pytest.fixture
+def claimed_completion_for_kanban_fixtures(monkeypatch):
+    """Make unrelated completion fixtures use an attributable claimed run."""
+    from hermes_cli import kanban_db as kb
+
+    original_complete_task = kb.complete_task
+
+    def complete_claimed_fixture(conn, task_id, *args, **kwargs):
+        task = kb.get_task(conn, task_id)
+        if (
+            task is not None
+            and task.task_kind == "delivery"
+            and task.status in {"running", "ready", "blocked"}
+        ):
+            if task.current_run_id is None:
+                task = kb.claim_task(conn, task_id, claimer="pytest-delivery-fixture")
+                assert task is not None
+            expected = f"{task_id}/run {task.current_run_id}"
+            kwargs = dict(kwargs)
+            handoff = str(
+                kwargs.get("summary")
+                if kwargs.get("summary") is not None
+                else kwargs.get("result") or ""
+            ).strip()
+            if not handoff.startswith(expected):
+                kwargs["summary"] = (
+                    f"{expected} · {handoff}" if handoff else expected
+                )
+        return original_complete_task(conn, task_id, *args, **kwargs)
+
+    monkeypatch.setattr(kb, "complete_task", complete_claimed_fixture)
+
+
+@pytest.fixture
 def explicit_delivery_contract_for_kanban_fixtures(monkeypatch):
-    """Give unrelated Kanban fixtures an explicit no-delivery-gate decision."""
+    """Give unrelated Kanban fixtures an explicit evidence decision."""
     from hermes_cli import kanban_db as kb
 
     original_create_task = kb.create_task

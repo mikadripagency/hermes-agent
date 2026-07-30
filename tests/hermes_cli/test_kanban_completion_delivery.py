@@ -20,7 +20,10 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 
-pytestmark = pytest.mark.usefixtures("explicit_delivery_contract_for_kanban_fixtures")
+pytestmark = pytest.mark.usefixtures(
+    "explicit_delivery_contract_for_kanban_fixtures",
+    "claimed_completion_for_kanban_fixtures",
+)
 
 
 ORCH_CHAT_ID = "C0ORCHTEST"
@@ -105,7 +108,7 @@ def test_required_evidence_rejects_weaker_completion_without_done_side_effects(
                 },
             )
 
-        assert kb.get_task(conn, tid).status == "ready"
+        assert kb.get_task(conn, tid).status == "running"
         assert not any(e.kind == "completed" for e in kb.list_events(conn, tid))
         assert conn.execute(
             "SELECT COUNT(*) FROM completion_deliveries WHERE task_id = ?", (tid,)
@@ -137,7 +140,7 @@ def test_required_evidence_rejects_empty_or_non_passing_proof(
                 metadata={"evidence": {"authenticated_production_e2e": weak_value}},
             )
         task = kb.get_task(conn, tid)
-        assert task is not None and task.status == "ready"
+        assert task is not None and task.status == "running"
 
 
 def test_required_evidence_retry_completes_exactly_once(kanban_home):

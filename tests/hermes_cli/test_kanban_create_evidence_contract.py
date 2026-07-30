@@ -170,7 +170,13 @@ def test_copied_legacy_db_keeps_null_contract_and_idempotent_readback(
             title="legacy retry",
             idempotency_key="copy-key",
         )
-        completed = kb.complete_task(conn, task.id, summary="legacy copy complete")
+        claimed = kb.claim_task(conn, task.id, claimer="copy-db-test")
+        assert claimed is not None and claimed.current_run_id is not None
+        completed = kb.complete_task(
+            conn,
+            task.id,
+            summary=f"{task.id}/run {claimed.current_run_id} · legacy copy complete",
+        )
         completed_task = kb.get_task(conn, task.id)
 
     assert task.required_evidence is None

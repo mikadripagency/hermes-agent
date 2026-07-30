@@ -1832,9 +1832,8 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
     assert d.get("ok") is True
 
 
-def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
-    """Orchestrator profiles (no HERMES_KANBAN_TASK) can still complete
-    any task via explicit task_id. The check only applies to workers."""
+def test_orchestrator_cannot_complete_unclaimed_delivery(monkeypatch, tmp_path):
+    """An explicit task id does not create an authoritative delivery run."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -1856,7 +1855,15 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     from tools import kanban_tools as kt
     out = kt._handle_complete({"task_id": tid, "summary": "orchestrator close"})
     d = json.loads(out)
-    assert d.get("ok") is True and d.get("task_id") == tid
+    assert d.get("ok") is not True
+    assert "must be claimed before completion" in d["error"]
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "ready"
+        assert task.current_run_id is None
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
