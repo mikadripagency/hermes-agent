@@ -7374,7 +7374,7 @@ def _release_crashed_worker(
     *,
     pid: int,
     claim_lock: str,
-) -> Optional[tuple[bool, bool, str]]:
+) -> Optional[tuple[bool, bool, str, bool]]:
     """End one dead run while holding the same exclusive fence as takeover."""
     kind, code = _classify_worker_exit(pid)
     rate_limited_exit = kind == "rate_limited"
@@ -7433,13 +7433,26 @@ def _release_crashed_worker(
                 "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                 (error_text[:500], task_id),
             )
-    return rate_limited_exit, protocol_violation, error_text
+    auto_blocked = False
+    if not rate_limited_exit:
+        auto_blocked = _record_task_failure(
+            conn,
+            task_id,
+            error=error_text,
+            outcome="crashed",
+            failure_limit=1 if protocol_violation else DEFAULT_FAILURE_LIMIT,
+            release_claim=False,
+            end_run=False,
+            event_payload_extra={"pid": pid, "claimer": claim_lock},
+        )
+    return rate_limited_exit, protocol_violation, error_text, auto_blocked
 
 
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim dead host-local workers without advancing past live effects."""
     crashed: list[str] = []
     rate_limited: list[str] = []
+    auto_blocked: list[str] = []
     crash_details: list[tuple[str, int, str, bool, str]] = []
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     rows = conn.execute(
@@ -7468,7 +7481,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
         )
         if released is None:
             continue
-        rate_limited_exit, protocol_violation, error_text = released
+        rate_limited_exit, protocol_violation, error_text, was_auto_blocked = released
         if rate_limited_exit:
             rate_limited.append(row["id"])
         else:
@@ -7476,8 +7489,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             crash_details.append(
                 (row["id"], pid, claim_lock, protocol_violation, error_text)
             )
+            if was_auto_blocked:
+                auto_blocked.append(row["id"])
 
-    auto_blocked: list[str] = []
     if crash_details:
         fingerprint_counts: dict[str, int] = {}
         for _, _, _, _, error_text in crash_details:
@@ -7488,12 +7502,14 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 not protocol_violation
                 and fingerprint_counts.get(_error_fingerprint(error_text), 0) >= 3
             )
+            if not is_systemic:
+                continue
             if _record_task_failure(
                 conn,
                 tid,
                 error=error_text,
                 outcome="crashed",
-                failure_limit=1 if (protocol_violation or is_systemic) else None,
+                failure_limit=1,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},

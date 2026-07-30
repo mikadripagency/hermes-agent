@@ -530,7 +530,7 @@ def test_kanban_worker_rejects_background_processes(
 
     nested = json.loads(execute_code("import os; os.fork()"))
     assert nested["status"] == "blocked"
-    assert "cannot spawn or detach" in nested["error"]
+    assert "cannot use execute_code" in nested["error"]
 
     marker = tmp_path / "escaped"
     script = tmp_path / "detach.py"
