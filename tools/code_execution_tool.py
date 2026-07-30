@@ -1162,7 +1162,8 @@ def execute_code(
         if re.search(
             r"\bos\.(?:fork|forkpty|setsid|daemon)\s*\("
             r"|start_new_session\s*=\s*True"
-            r"|\b(?:subprocess|multiprocessing)\b",
+            r"|\b(?:subprocess|multiprocessing)\b"
+            r"|\bos\.environ\b|\b(?:putenv|unsetenv)\s*\(",
             code,
         ):
             return json.dumps({

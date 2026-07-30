@@ -2718,7 +2718,6 @@ def terminal_tool(
                     active_env = locals().get("env")
                     assert active_env is not None
                     effect_token = None
-                    baseline_pids = set()
                     previous_effect_token = None
                     if (
                         os.environ.get("HERMES_KANBAN_TASK")
@@ -2726,9 +2725,6 @@ def terminal_tool(
                         and hasattr(active_env, "env")
                     ):
                         effect_token = f"{os.getpid()}-{time.time_ns()}"
-                        import psutil
-
-                        baseline_pids = set(psutil.pids())
                         previous_effect_token = active_env.env.get("HERMES_KANBAN_EFFECT_TOKEN")
                         active_env.env["HERMES_KANBAN_EFFECT_TOKEN"] = effect_token
                     try:
@@ -2756,12 +2752,9 @@ def terminal_tool(
                         escaped = []
                         for candidate in psutil.process_iter(["pid"]):
                             try:
-                                if (
-                                    candidate.pid not in baseline_pids
-                                    or candidate.environ().get(
-                                        "HERMES_KANBAN_EFFECT_TOKEN"
-                                    ) == effect_token
-                                ):
+                                if candidate.environ().get(
+                                    "HERMES_KANBAN_EFFECT_TOKEN"
+                                ) == effect_token:
                                     escaped.append(candidate)
                             except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
                                 continue
