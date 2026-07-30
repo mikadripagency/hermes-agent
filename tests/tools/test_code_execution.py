@@ -102,6 +102,11 @@ class TestHermesToolsGeneration(unittest.TestCase):
         self.assertIn("def terminal(", src)
         self.assertNotIn("def vision_analyze(", src)
 
+    def test_lifecycle_transitions_are_not_sandbox_tools(self):
+        self.assertTrue(
+            {"kanban_block", "kanban_complete"}.isdisjoint(SANDBOX_ALLOWED_TOOLS)
+        )
+
     def test_rpc_infrastructure_present(self):
         src = generate_hermes_tools_module(["terminal"])
         self.assertIn("HERMES_RPC_SOCKET", src)

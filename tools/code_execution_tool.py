@@ -548,6 +548,20 @@ def _rpc_server_loop(
                 tool_name = request.get("tool", "")
                 tool_args = request.get("args", {})
 
+                # Lifecycle transitions must remain direct model-tool calls.
+                # An execute_code RPC waits for this listener while the outer
+                # call owns the Kanban effect lease; admitting a transition
+                # here would wait on its own lease and deadlock.
+                if tool_name in {"kanban_block", "kanban_complete"}:
+                    resp = json.dumps({
+                        "error": (
+                            f"Tool '{tool_name}' cannot run inside execute_code; "
+                            "call it directly after execute_code returns."
+                        )
+                    })
+                    conn.sendall((resp + "\n").encode())
+                    continue
+
                 # Enforce the allow-list
                 if tool_name not in allowed_tools:
                     available = ", ".join(sorted(allowed_tools))

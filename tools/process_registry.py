@@ -136,6 +136,7 @@ class ProcessSession:
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
+    _kanban_lease_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
 
 
@@ -687,6 +688,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        kanban_run_bound: bool = False,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -705,6 +707,11 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+        )
+        kanban_task_id = (
+            str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+            if kanban_run_bound
+            else ""
         )
 
         if use_pty:
@@ -760,6 +767,21 @@ class ProcessRegistry:
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        kanban_group_baseline: set[int] = set()
+        if kanban_task_id and os.name == "posix":
+            try:
+                import psutil
+
+                owner_pgid = os.getpgrp()
+                for candidate in psutil.process_iter(["pid"]):
+                    pid = int(candidate.info["pid"])
+                    try:
+                        if os.getpgid(pid) == owner_pgid:
+                            kanban_group_baseline.add(pid)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        continue
+            except Exception:
+                kanban_group_baseline = {os.getpid()}
 
         proc = subprocess.Popen(
             [user_shell, "-lic", f"set +m; {command}"],
@@ -771,7 +793,7 @@ class ProcessRegistry:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            start_new_session=True,
+            start_new_session=not bool(kanban_task_id),
             **_popen_kwargs,
         )
 
@@ -795,12 +817,68 @@ class ProcessRegistry:
                 self._running[session.id] = session
 
             self._write_checkpoint()
+            if kanban_task_id:
+                from hermes_cli.kanban_run_lock import task_run_lock
+
+                ready = threading.Event()
+                lease_errors: list[Exception] = []
+                owner_pid = os.getpid()
+                owner_pgid = os.getpgrp() if os.name == "posix" else None
+
+                def group_has_effects() -> bool:
+                    if owner_pgid is None:
+                        return not session.exited
+                    try:
+                        import psutil
+
+                        for candidate in psutil.process_iter(["pid"]):
+                            pid = int(candidate.info["pid"])
+                            if pid == owner_pid or pid in kanban_group_baseline:
+                                continue
+                            try:
+                                if os.getpgid(pid) == owner_pgid:
+                                    return True
+                            except (ProcessLookupError, PermissionError, OSError):
+                                continue
+                    except Exception:
+                        return not session.exited
+                    return False
+
+                def hold_run_lease() -> None:
+                    try:
+                        with task_run_lock(
+                            str(os.environ.get("HERMES_KANBAN_DB") or ""),
+                            kanban_task_id,
+                            exclusive=False,
+                        ):
+                            ready.set()
+                            # The shell can exit after detaching a child. Hold
+                            # the run lease until the worker-owned process group
+                            # has no effect process left, not merely until the
+                            # shell process exits.
+                            while group_has_effects():
+                                time.sleep(0.05)
+                    except Exception as exc:
+                        lease_errors.append(exc)
+                        ready.set()
+
+                lease_thread = threading.Thread(
+                    target=hold_run_lease,
+                    daemon=True,
+                    name=f"proc-kanban-lease-{session.id}",
+                )
+                lease_thread.start()
+                if not ready.wait(timeout=5) or lease_errors:
+                    raise RuntimeError(
+                        "could not bind background process to Kanban run lease"
+                    ) from (lease_errors[0] if lease_errors else None)
+                session._kanban_lease_thread = lease_thread
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
             # leak as untracked background processes.
             try:
-                if not _IS_WINDOWS:
+                if not _IS_WINDOWS and not kanban_task_id:
                     try:
                         kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
                         os.killpg(os.getpgid(proc.pid), kill_signal)  # windows-footgun: ok - guarded by _IS_WINDOWS above

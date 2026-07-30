@@ -45,6 +45,35 @@ def conn(kanban_home):
         yield c
 
 
+def test_termination_retires_group_after_worker_leader_crash(monkeypatch):
+    import signal
+
+    state = {"group_alive": True}
+    signals = []
+
+    monkeypatch.setattr(kb, "_claimer_id", lambda: "local:dispatcher")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        kb.os,
+        "getpgid",
+        lambda _pid: (_ for _ in ()).throw(ProcessLookupError()),
+    )
+
+    def fake_killpg(pgid, sig):
+        if not state["group_alive"]:
+            raise ProcessLookupError()
+        signals.append((pgid, sig))
+        if sig == signal.SIGTERM:
+            state["group_alive"] = False
+
+    monkeypatch.setattr(kb.os, "killpg", fake_killpg)
+
+    result = kb._terminate_reclaimed_worker(4321, "local:claim")
+
+    assert result["terminated"] is True
+    assert (4321, signal.SIGTERM) in signals
+
+
 def test_stale_crash_reset_rejected_for_reclaimed_task(conn):
     """A reset carrying an OLD worker's claim_lock must NOT clobber a task
     that has since been re-claimed by a new worker."""

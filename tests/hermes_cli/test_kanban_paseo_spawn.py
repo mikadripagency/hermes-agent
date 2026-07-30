@@ -83,6 +83,7 @@ def _install_fake_paseo(
     *,
     status_rc: int = 0,
     ls_agents=None,
+    ls_rc: int = 0,
     run_stdout=None,
     run_stderr="Created workspace ws_abc123 - repo (main)\n",
     run_rc: int = 0,
@@ -102,7 +103,11 @@ def _install_fake_paseo(
             return _CompletedRun(returncode=status_rc)
         if sub == "ls":
             calls["ls"].append(list(cmd))
-            return _CompletedRun(returncode=0, stdout=json.dumps(ls_agents or []))
+            return _CompletedRun(
+                returncode=ls_rc,
+                stdout=json.dumps(ls_agents or []),
+                stderr="" if ls_rc == 0 else "ls failed",
+            )
         if sub == "archive":
             calls["archive"].append(list(cmd))
             return _CompletedRun(returncode=archive_rc, stderr="" if archive_rc == 0 else "archive failed")
@@ -404,7 +409,12 @@ def test_actively_working_agent_reattaches_without_second_run(monkeypatch, tmp_p
     monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
     calls = _install_fake_paseo(
         monkeypatch,
-        ls_agents=[{"id": "ag_existing1", "status": "running", "shortId": "ag_exis"}],
+        ls_agents=[{
+            "id": "ag_existing1",
+            "status": "running",
+            "shortId": "ag_exis",
+            "labels": ["kanban_run=7", "kanban_profile=w"],
+        }],
     )
     workspace = tmp_path / "ws"
     workspace.mkdir()
@@ -469,7 +479,7 @@ def test_active_stale_agent_archive_failure_prevents_second_worker(
     workspace = tmp_path / "ws"
     workspace.mkdir()
 
-    with pytest.raises(RuntimeError, match="could not retire active stale"):
+    with pytest.raises(RuntimeError, match="could not retire stale Paseo agent"):
         paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
 
     assert len(calls["archive"]) == 1
@@ -599,8 +609,8 @@ def test_errored_agent_archived_and_fresh_agent_spawned(monkeypatch, tmp_path):
     assert len(calls["run"]) == 1  # fresh agent created
 
 
-def test_archive_failure_still_spawns_fresh_agent(monkeypatch, tmp_path):
-    """`paseo archive` failing must not block the fresh spawn."""
+def test_archive_failure_blocks_fresh_agent(monkeypatch, tmp_path):
+    """A failed retirement cannot create a second native-shell owner."""
     _profile_home(tmp_path, monkeypatch)
     from hermes_cli import kanban_db as kb
     from hermes_cli import paseo_spawn
@@ -614,12 +624,29 @@ def test_archive_failure_still_spawns_fresh_agent(monkeypatch, tmp_path):
     workspace = tmp_path / "ws"
     workspace.mkdir()
 
-    pid = paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
+    with pytest.raises(RuntimeError, match="could not retire stale Paseo agent"):
+        paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
 
     assert len(calls["archive"]) == 1  # attempted
-    assert len(calls["run"]) == 1  # fresh agent still launched
-    assert len(calls["popen"]) == 1  # watcher still spawned
-    assert pid == 9999
+    assert calls["run"] == []
+    assert calls["popen"] == []
+
+
+def test_agent_discovery_failure_blocks_spawn(monkeypatch, tmp_path):
+    _profile_home(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    calls = _install_fake_paseo(monkeypatch, ls_rc=1)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    with pytest.raises(RuntimeError, match="agent discovery failed"):
+        paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
+
+    assert len(calls["ls"]) == 1
+    assert calls["run"] == [] and calls["popen"] == []
 
 
 def test_mode_omitted_when_configured_empty(monkeypatch, tmp_path):
@@ -720,7 +747,11 @@ def test_mixed_agents_prefers_active_over_stale(monkeypatch, tmp_path):
         monkeypatch,
         ls_agents=[
             {"id": "ag_old_idle", "status": "idle"},
-            {"id": "ag_working", "status": "running"},
+            {
+                "id": "ag_working",
+                "status": "running",
+                "labels": ["kanban_run=7", "kanban_profile=w"],
+            },
         ],
     )
     workspace = tmp_path / "ws"
@@ -728,7 +759,8 @@ def test_mixed_agents_prefers_active_over_stale(monkeypatch, tmp_path):
 
     paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
     assert calls["run"] == []
-    assert calls["archive"] == []  # active agent found → no archiving pass
+    assert len(calls["archive"]) == 1
+    assert calls["archive"][0][2] == "ag_old_idle"
     watch_cmd = calls["popen"][0]
     assert watch_cmd[watch_cmd.index("--agent") + 1] == "ag_working"
 
@@ -1218,6 +1250,7 @@ def _watch(paseo_spawn, monkeypatch, *, task_states, inspect_results, deadline=N
 
     monkeypatch.setattr(paseo_spawn, "_read_task_run_state", fake_state)
     monkeypatch.setattr(paseo_spawn, "_inspect_agent_ok", fake_inspect)
+    monkeypatch.setattr(paseo_spawn, "_archive_agent", lambda *args, **kwargs: True)
 
     return paseo_spawn.watch_worker(
         task_id="t_w",
@@ -1241,6 +1274,32 @@ def test_watch_exits_0_on_terminal_task_state(monkeypatch):
         inspect_results=[True],
     )
     assert rc == 0
+
+
+def test_watch_retires_agent_before_terminal_exit(monkeypatch):
+    from hermes_cli import paseo_spawn
+
+    retired = []
+    monkeypatch.setattr(
+        paseo_spawn, "_read_task_run_state", lambda *_args: ("blocked", 1)
+    )
+    monkeypatch.setattr(
+        paseo_spawn,
+        "_archive_agent",
+        lambda paseo_bin, agent_id, task_id, *, force=False: retired.append(
+            (paseo_bin, agent_id, task_id, force)
+        ) or True,
+    )
+
+    assert paseo_spawn.watch_worker(
+        task_id="t_w",
+        agent_id="ag_w",
+        db_path="unused.db",
+        run_id=1,
+        paseo_bin="paseo",
+        poll_seconds=0,
+    ) == paseo_spawn.WATCH_EXIT_TASK_SETTLED
+    assert retired == [("paseo", "ag_w", "t_w", True)]
 
 
 def test_watch_ignores_agent_idle_while_task_running(monkeypatch):
@@ -1509,6 +1568,7 @@ def _watch_stall(
     monkeypatch.setattr(paseo_spawn, "_read_task_run_state", fake_state)
     monkeypatch.setattr(paseo_spawn, "_inspect_agent_state", fake_inspect_state)
     monkeypatch.setattr(paseo_spawn, "_read_task_heartbeat", fake_hb)
+    monkeypatch.setattr(paseo_spawn, "_archive_agent", lambda *args, **kwargs: True)
     monkeypatch.setattr(_time, "time", lambda: _STALL_NOW)
     monkeypatch.setattr(_time, "sleep", fake_sleep)
 
@@ -1678,6 +1738,7 @@ def test_watch_idle_stall_disabled_ignores_frozen_heartbeat(monkeypatch):
     monkeypatch.setattr(paseo_spawn, "_read_task_run_state", fake_state)
     monkeypatch.setattr(paseo_spawn, "_inspect_agent_ok", fake_ok)
     monkeypatch.setattr(paseo_spawn, "_read_task_heartbeat", _should_not_be_called)
+    monkeypatch.setattr(paseo_spawn, "_archive_agent", lambda *args, **kwargs: True)
 
     rc = paseo_spawn.watch_worker(
         task_id="t_w",

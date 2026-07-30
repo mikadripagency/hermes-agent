@@ -104,6 +104,26 @@ def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_hom
     assert payload["source"] == "kanban.default_assignee"
 
 
+def test_default_assignee_is_canonical_before_persist_and_claim(
+    isolated_kanban_home,
+):
+    kb, _home = isolated_kanban_home
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="t1", assignee=None)
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=False,
+            default_assignee="Default",
+        )
+        task = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, task.current_run_id)
+
+    assert res.spawned[0][1] == "default"
+    assert task.assignee == "default"
+    assert run.profile == "default"
+
+
 def test_dry_run_with_default_assignee_reports_without_mutating(isolated_kanban_home):
     """Dry-run mode: reports what WOULD happen (task in auto_assigned_default,
     spawn entry) but does NOT mutate the DB. Operators using

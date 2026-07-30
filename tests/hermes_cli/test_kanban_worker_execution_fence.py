@@ -296,6 +296,154 @@ def test_concurrent_transition_serializes_before_side_effect(
     assert not marker.exists()
 
 
+def test_sequential_path_rejects_stale_run_before_middleware(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from agent.tool_executor import execute_tool_calls_sequential
+
+    with kb.connect_closing() as conn:
+        task_id = _delivery(conn)
+        task = kb.claim_task(conn, task_id, execution_profile="developer")
+        assert task is not None and task.current_run_id is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id + 1))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_home / "kanban.db"))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    monkeypatch.setenv("HERMES_HOME", str(kanban_home / "profiles" / "developer"))
+    tool_call = SimpleNamespace(
+        id="call-1",
+        function=SimpleNamespace(name="memory", arguments='{"action":"add"}'),
+    )
+    assistant_message = SimpleNamespace(tool_calls=[tool_call])
+    messages = []
+
+    execute_tool_calls_sequential(object(), assistant_message, messages, "", 0)
+
+    assert len(messages) == 1
+    assert messages[0]["role"] == "tool"
+    assert "stale kanban worker run" in messages[0]["content"]
+
+
+def test_run_transition_waits_until_admitted_effect_finishes(
+    kanban_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from agent.kanban_worker_fence import fence_kanban_worker_tool
+
+    with kb.connect_closing() as conn:
+        task_id = _delivery(conn)
+        task = kb.claim_task(conn, task_id, execution_profile="developer")
+        assert task is not None and task.current_run_id is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_home / "kanban.db"))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    monkeypatch.setenv("HERMES_HOME", str(kanban_home / "profiles" / "developer"))
+    admitted = threading.Event()
+    release = threading.Event()
+    marker = tmp_path / "leased-effect"
+    results = {}
+
+    @fence_kanban_worker_tool(name_arg_index=0)
+    def side_effect(_function_name: str) -> str:
+        admitted.set()
+        assert release.wait(timeout=5)
+        marker.touch()
+        return "ran"
+
+    effect_thread = threading.Thread(
+        target=lambda: results.setdefault("effect", side_effect("terminal"))
+    )
+    effect_thread.start()
+    assert admitted.wait(timeout=5)
+
+    def transition() -> None:
+        with kb.connect_closing() as conn:
+            results["blocked"] = kb.block_task(
+                conn,
+                task_id,
+                reason="takeover",
+                kind="capability",
+                expected_run_id=task.current_run_id,
+            )
+
+    transition_thread = threading.Thread(target=transition)
+    transition_thread.start()
+    transition_thread.join(timeout=0.1)
+    with kb.connect_closing() as conn:
+        still_running = kb.get_task(conn, task_id)
+
+    assert transition_thread.is_alive()
+    assert still_running is not None and still_running.status == "running"
+    assert not marker.exists()
+
+    release.set()
+    effect_thread.join(timeout=5)
+    transition_thread.join(timeout=5)
+
+    assert results == {"effect": "ran", "blocked": True}
+    assert marker.exists()
+    with kb.connect_closing() as conn:
+        blocked_task = kb.get_task(conn, task_id)
+        assert blocked_task is not None and blocked_task.status == "blocked"
+
+
+def test_background_process_holds_run_lease_until_exit(
+    kanban_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from tools.process_registry import ProcessRegistry
+
+    with kb.connect_closing() as conn:
+        task_id = _delivery(conn)
+        task = kb.claim_task(conn, task_id, execution_profile="developer")
+        assert task is not None and task.current_run_id is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_home / "kanban.db"))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    registry = ProcessRegistry()
+    session = registry.spawn_local(
+        "python3 -c 'import os,time; p=os.fork(); p and os._exit(0); "
+        "os.close(1); os.close(2); time.sleep(0.4); os._exit(0)'",
+        cwd=str(tmp_path),
+        task_id="test",
+        kanban_run_bound=True,
+    )
+    results = {}
+
+    def transition() -> None:
+        with kb.connect_closing() as conn:
+            results["blocked"] = kb.block_task(
+                conn,
+                task_id,
+                reason="takeover",
+                kind="capability",
+                expected_run_id=task.current_run_id,
+            )
+
+    thread = threading.Thread(target=transition)
+    thread.start()
+    assert session._completion_event.wait(timeout=1)
+    thread.join(timeout=0.1)
+    assert thread.is_alive()
+
+    thread.join(timeout=5)
+    assert results == {"blocked": True}
+
+
 def test_non_transition_tools_remain_parallel(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -11,10 +11,9 @@ from functools import wraps
 from typing import Callable, Optional
 from urllib.parse import quote
 
+from hermes_cli.kanban_run_lock import KanbanRunLockTimeout, task_run_lock
+
 _TRANSITIONS = {"kanban_block", "kanban_complete"}
-# ponytail: this gate is process-local; remote workers are fenced on their next
-# DB check, not preempted mid-tool. Replace it with a DB lease if remote reclaim
-# must cancel side effects that were already running when the claim advanced.
 _GATE_CONDITION = threading.Condition()
 _ACTIVE_TOOLS = 0
 _TRANSITION_ACTIVE = False
@@ -66,9 +65,11 @@ def worker_execution_fence_error() -> Optional[str]:
         return "kanban worker run id is invalid; tool execution refused"
 
     try:
-        from hermes_cli.profiles import get_active_profile_name
+        from hermes_cli.profiles import get_active_profile_name, normalize_profile_name
 
-        active_profile = str(get_active_profile_name() or "default").strip()
+        active_profile = normalize_profile_name(
+            str(get_active_profile_name() or "default")
+        )
     except Exception:
         return "kanban worker profile is unavailable; tool execution refused"
 
@@ -98,8 +99,14 @@ def worker_execution_fence_error() -> Optional[str]:
     ):
         return f"stale kanban worker run {run_id} for {task_id}; tool execution refused"
 
-    intended_profile = str(row["assignee"] or "").strip()
-    run_profile = str(row["run_profile"] or "").strip()
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+
+        intended_profile = normalize_profile_name(str(row["assignee"] or ""))
+        run_profile = normalize_profile_name(str(row["run_profile"] or ""))
+    except (TypeError, ValueError):
+        intended_profile = ""
+        run_profile = ""
     if not intended_profile or run_profile != intended_profile or active_profile != intended_profile:
         return (
             "kanban worker profile mismatch: "
@@ -137,18 +144,82 @@ def fence_kanban_worker_tool(*, name_arg_index: int) -> Callable:
             )
             if name == "tool_call" and isinstance(function_args, dict):
                 name = function_args.get("name")
-            with _tool_gate(transition=name in _TRANSITIONS):
-                try:
+            transition = name in _TRANSITIONS
+            task_id = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+            db_path = str(os.environ.get("HERMES_KANBAN_DB") or "").strip()
+            try:
+                with _tool_gate(transition=transition), task_run_lock(
+                    db_path, task_id, exclusive=transition,
+                ):
+                    try:
+                        error = worker_execution_fence_error()
+                    except Exception:
+                        error = "kanban worker identity guard failed; tool execution refused"
+                    if error:
+                        return json.dumps({"error": error}, ensure_ascii=False)
+                    _GATE_LOCAL.depth = 1
+                    try:
+                        return function(*args, **kwargs)
+                    finally:
+                        _GATE_LOCAL.depth = 0
+            except (KanbanRunLockTimeout, OSError) as exc:
+                return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+        return wrapped
+
+    return decorate
+
+
+def fence_kanban_worker_tool_batch(*, message_arg_index: int) -> Callable:
+    """Fence a sequential tool batch before middleware/hooks/checkpoints."""
+
+    def decorate(function: Callable) -> Callable:
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            if not os.environ.get("HERMES_KANBAN_TASK"):
+                return function(*args, **kwargs)
+            message = (
+                args[message_arg_index]
+                if len(args) > message_arg_index
+                else kwargs.get("assistant_message")
+            )
+            names = {
+                getattr(getattr(call, "function", None), "name", None)
+                for call in (getattr(message, "tool_calls", None) or [])
+            }
+            messages = args[2] if len(args) > 2 else kwargs.get("messages")
+
+            def reject(error: str):
+                content = json.dumps({"error": error}, ensure_ascii=False)
+                if isinstance(messages, list):
+                    for call in (getattr(message, "tool_calls", None) or []):
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": getattr(call, "id", "") or "",
+                            "name": getattr(
+                                getattr(call, "function", None), "name", "tool"
+                            ),
+                            "content": content,
+                        })
+                return None
+
+            transition = bool(names & _TRANSITIONS)
+            task_id = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+            db_path = str(os.environ.get("HERMES_KANBAN_DB") or "").strip()
+            try:
+                with _tool_gate(transition=transition), task_run_lock(
+                    db_path, task_id, exclusive=transition,
+                ):
                     error = worker_execution_fence_error()
-                except Exception:
-                    error = "kanban worker identity guard failed; tool execution refused"
-                if error:
-                    return json.dumps({"error": error}, ensure_ascii=False)
-                _GATE_LOCAL.depth = 1
-                try:
-                    return function(*args, **kwargs)
-                finally:
-                    _GATE_LOCAL.depth = 0
+                    if error:
+                        return reject(error)
+                    _GATE_LOCAL.depth = 1
+                    try:
+                        return function(*args, **kwargs)
+                    finally:
+                        _GATE_LOCAL.depth = 0
+            except (KanbanRunLockTimeout, OSError) as exc:
+                return reject(str(exc))
 
         return wrapped
 

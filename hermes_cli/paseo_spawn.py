@@ -184,8 +184,8 @@ def _list_task_agents(
 
     Uses ``paseo ls -g --json --label kanban_task=<id>`` so the guard is global
     (finds the agent regardless of the dispatcher's cwd) and idempotent across
-    dispatcher recovery. Returns ``[]`` on any error — a failed guard must not
-    block the spawn (worst case: a redundant agent, never a stalled task).
+    dispatcher recovery. Discovery failures raise: treating an unknown agent
+    set as empty can spawn a second native-shell owner for the same task.
     """
     try:
         cmd = [paseo_bin, "ls", "-g", "--json", "--label", f"kanban_task={task_id}"]
@@ -203,7 +203,7 @@ def _list_task_agents(
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
         _log.warning("kanban paseo_spawn: `paseo ls` failed for task %s (%s)", task_id, exc)
-        return []
+        raise RuntimeError(f"paseo agent discovery failed for task {task_id}") from exc
     if proc.returncode != 0:
         _log.warning(
             "kanban paseo_spawn: `paseo ls` exited %s for task %s: %s",
@@ -211,14 +211,14 @@ def _list_task_agents(
             task_id,
             (proc.stderr or "").strip()[:300],
         )
-        return []
+        raise RuntimeError(f"paseo agent discovery failed for task {task_id}")
     try:
         agents = json.loads(proc.stdout or "[]")
     except json.JSONDecodeError as exc:
         _log.warning("kanban paseo_spawn: could not parse `paseo ls` JSON for task %s (%s)", task_id, exc)
-        return []
+        raise RuntimeError(f"paseo agent discovery failed for task {task_id}") from exc
     if not isinstance(agents, list):
-        return []
+        raise RuntimeError(f"paseo agent discovery returned invalid data for task {task_id}")
     return [a for a in agents if isinstance(a, dict) and a.get("id")]
 
 
@@ -265,6 +265,20 @@ def _archive_agent(
             exc,
         )
         return False
+
+
+def _agent_has_label(agent: dict, key: str, value: str) -> bool:
+    """Return whether a Paseo list record carries one exact label."""
+    labels = agent.get("labels")
+    if isinstance(labels, dict):
+        return str(labels.get(key)) == value
+    if isinstance(labels, list):
+        for label in labels:
+            if isinstance(label, str) and label == f"{key}={value}":
+                return True
+            if isinstance(label, dict) and str(label.get("key")) == key:
+                return str(label.get("value")) == value
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -827,12 +841,24 @@ def watch_worker(
         if state is not None:
             status, current_run = state
             if status != "running":
-                _log.info(
-                    "paseo watch: task %s left running (status=%s) — done",
+                if _archive_agent(paseo_bin, agent_id, task_id, force=True):
+                    _log.info(
+                        "paseo watch: task %s left running (status=%s); "
+                        "retired agent %s",
+                        task_id,
+                        status,
+                        agent_id,
+                    )
+                    return WATCH_EXIT_TASK_SETTLED
+                _log.error(
+                    "paseo watch: task %s left running (status=%s) but agent "
+                    "%s could not be retired; retrying fail-closed",
                     task_id,
                     status,
+                    agent_id,
                 )
-                return WATCH_EXIT_TASK_SETTLED
+                time.sleep(poll_seconds)
+                continue
             if run_id is not None and current_run is not None and int(current_run) != int(run_id):
                 if _archive_agent(paseo_bin, agent_id, task_id, force=True):
                     _log.info(
@@ -1109,24 +1135,33 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
         #   Archive them (best-effort) and create a FRESH agent with the new
         #   run's env — keeping at most one non-archived agent per task.
         agents = _list_task_agents(paseo_bin, task.id)
-        matching_agents = _list_task_agents(
-            paseo_bin,
-            task.id,
-            run_id=getattr(task, "current_run_id", None),
-            profile=profile_arg,
-        )
-        matching_ids = {str(agent["id"]) for agent in matching_agents}
+        expected_run = str(getattr(task, "current_run_id", ""))
         active = next(
             (
                 agent
                 for agent in agents
-                if str(agent["id"]) in matching_ids
-                and agent.get("status") in _ACTIVE_STATUSES
+                if agent.get("status") in _ACTIVE_STATUSES
+                and _agent_has_label(agent, "kanban_run", expected_run)
+                and _agent_has_label(agent, "kanban_profile", profile_arg)
             ),
             None,
         )
         if active is not None:
             agent_id = str(active["id"])
+            for stale in agents:
+                stale_id = str(stale["id"])
+                if stale_id == agent_id:
+                    continue
+                if not _archive_agent(
+                    paseo_bin,
+                    stale_id,
+                    task.id,
+                    force=stale.get("status") in _ACTIVE_STATUSES,
+                ):
+                    raise RuntimeError(
+                        f"could not retire duplicate Paseo agent {stale_id} "
+                        f"for task {task.id}"
+                    )
             _log.info(
                 "kanban paseo_spawn: re-attached to actively working agent %s "
                 "for task %s",
@@ -1158,9 +1193,9 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
                     task.id,
                     force=stale.get("status") in _ACTIVE_STATUSES,
                 )
-                if stale.get("status") in _ACTIVE_STATUSES and not retired:
+                if not retired:
                     raise RuntimeError(
-                        f"could not retire active stale Paseo agent {stale_id} "
+                        f"could not retire stale Paseo agent {stale_id} "
                         f"for task {task.id}"
                     )
             labels: list[tuple[str, str]] = [("kanban_task", task.id)]

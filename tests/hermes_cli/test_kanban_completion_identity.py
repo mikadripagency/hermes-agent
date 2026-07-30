@@ -169,6 +169,19 @@ def test_unclaimed_delivery_completion_is_rejected_without_side_effects(
     assert task.current_run_id is None
 
 
+def test_cli_wrong_profile_block_has_no_containment_side_effects(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id, _ = _claimed_delivery(conn)
+
+    output = kc.run_slash(f"block {task_id} wrong-profile containment")
+
+    assert "delivery transition profile mismatch" in output
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "running"
+        assert kb.list_comments(conn, task_id) == []
+
+
 def test_system_inbox_completion_and_legacy_readback_remain_compatible(kanban_home):
     with kb.connect_closing() as conn:
         inbox_id = kb.create_system_inbox_task(
@@ -204,7 +217,7 @@ def test_cli_surfaces_claimed_delivery_identity_rejection(kanban_home):
         f"complete {task_id} --summary 'summary without task and run'"
     )
 
-    assert "authoritative completion identity" in output
+    assert "delivery transition profile mismatch" in output
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, task_id).status == "running"
 

@@ -90,6 +90,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.kanban_run_lock import fence_task_transition
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -3864,6 +3865,7 @@ def _active_project_lane_counts(conn: sqlite3.Connection) -> dict[str, int]:
     }
 
 
+@fence_task_transition()
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4030,6 +4032,7 @@ def claim_task(
     return claimed
 
 
+@fence_task_transition()
 def claim_review_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4166,6 +4169,51 @@ def heartbeat_claim(
         return False
 
 
+@fence_task_transition()
+def _release_expired_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    row,
+    now: int,
+    host_local: bool,
+    heartbeat_stale: bool,
+    termination: dict,
+) -> bool:
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
+            "AND claim_expires IS NOT NULL AND claim_expires < ?",
+            (task_id, row["claim_lock"], now),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="reclaimed", status="reclaimed",
+            error=f"stale_lock={row['claim_lock']}",
+            metadata=termination,
+        )
+        payload = {
+            "stale_lock": row["claim_lock"],
+            "worker_pid": int(row["worker_pid"]) if row["worker_pid"] is not None else None,
+            "claim_expires": int(row["claim_expires"]),
+            "last_heartbeat_at": (
+                int(row["last_heartbeat_at"])
+                if row["last_heartbeat_at"] is not None
+                else None
+            ),
+            "now": now,
+            "host_local": host_local,
+            "heartbeat_stale": bool(heartbeat_stale),
+        }
+        payload.update(termination)
+        _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)
+    return True
+
+
 def release_stale_claims(
     conn: sqlite3.Connection,
     *,
@@ -4278,45 +4326,60 @@ def release_stale_claims(
                 reason="ttl_expired_worker_alive",
             )
             continue
-        with write_txn(conn):
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'running', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
-            )
-            if cur.rowcount != 1:
-                continue
-            run_id = _end_run(
-                conn, row["id"],
-                outcome="reclaimed", status="reclaimed",
-                error=f"stale_lock={row['claim_lock']}",
-                metadata=termination,
-            )
-            payload = {
-                "stale_lock": row["claim_lock"],
-                "worker_pid": (
-                    int(row["worker_pid"])
-                    if row["worker_pid"] is not None else None
-                ),
-                "claim_expires": int(row["claim_expires"]),
-                "last_heartbeat_at": (
-                    int(row["last_heartbeat_at"])
-                    if row["last_heartbeat_at"] is not None else None
-                ),
-                "now": now,
-                "host_local": host_local,
-                "heartbeat_stale": bool(heartbeat_stale),
-            }
-            payload.update(termination)
-            _append_event(
-                conn, row["id"], "reclaimed",
-                payload,
-                run_id=run_id,
-            )
+        if _release_expired_claim(
+            conn,
+            row["id"],
+            row=row,
+            now=now,
+            host_local=host_local,
+            heartbeat_stale=heartbeat_stale,
+            termination=termination,
+        ):
             reclaimed += 1
     return reclaimed
+
+
+@fence_task_transition()
+def _release_reclaimed_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    prev_lock: Optional[str],
+    reason: Optional[str],
+    termination: dict,
+) -> bool:
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
+            "AND claim_lock IS ?",
+            (task_id, prev_lock),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="reclaimed", status="reclaimed",
+            error=(
+                f"manual_reclaim: {reason}" if reason
+                else f"manual_reclaim lock={prev_lock}"
+            ),
+            metadata=termination,
+        )
+        payload = {
+            "manual": True,
+            "reason": reason,
+            "prev_lock": prev_lock,
+        }
+        payload.update(termination)
+        _append_event(
+            conn, task_id, "reclaimed",
+            payload,
+            run_id=run_id,
+        )
+    _clear_failure_counter(conn, task_id)
+    return True
 
 
 def reclaim_task(
@@ -4350,42 +4413,23 @@ def reclaim_task(
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
-    with write_txn(conn):
-        cur = conn.execute(
-            "UPDATE tasks SET status = 'running', claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?",
-            (task_id, prev_lock),
+    if _worker_survived_termination(termination):
+        _defer_reclaim_for_live_worker(
+            conn,
+            task_id,
+            prev_lock,
+            int(time.time()),
+            termination,
+            reason="manual_reclaim_worker_alive",
         )
-        if cur.rowcount != 1:
-            return False
-        run_id = _end_run(
-            conn, task_id,
-            outcome="reclaimed", status="reclaimed",
-            error=(
-                f"manual_reclaim: {reason}" if reason
-                else f"manual_reclaim lock={prev_lock}"
-            ),
-            metadata=termination,
-        )
-        payload = {
-            "manual": True,
-            "reason": reason,
-            "prev_lock": prev_lock,
-        }
-        payload.update(termination)
-        _append_event(
-            conn, task_id, "reclaimed",
-            payload,
-            run_id=run_id,
-        )
-    # Operator intervention — they've looked at the task, so the
-    # consecutive-failures counter is now stale. Give the next retry
-    # a fresh budget. (_clear_failure_counter opens its own write_txn,
-    # so it runs after the enclosing one commits.)
-    _clear_failure_counter(conn, task_id)
-    return True
+        return False
+    return _release_reclaimed_task(
+        conn,
+        task_id,
+        prev_lock=prev_lock,
+        reason=reason,
+        termination=termination,
+    )
 
 
 def reassign_task(
@@ -4641,6 +4685,7 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+@fence_task_transition()
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5360,6 +5405,7 @@ def edit_completed_task_result(
     return True
 
 
+@fence_task_transition()
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6856,6 +6902,22 @@ def _terminate_reclaimed_worker(
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
     )
+    process_group = None
+    if signal_fn is None and kill is not None and hasattr(os, "killpg"):
+        try:
+            process_group = os.getpgid(int(pid))
+        except (ProcessLookupError, OSError):
+            try:
+                os.killpg(int(pid), 0)
+            except (ProcessLookupError, PermissionError, OSError):
+                process_group = None
+            else:
+                # The leader crashed while detached children kept its group.
+                process_group = int(pid)
+        if process_group is not None and process_group == int(pid):
+            worker_pgid = int(process_group)
+            info["process_group"] = worker_pgid
+            kill = lambda _pid, sig: os.killpg(worker_pgid, sig)
     if kill is None:
         return info
 
@@ -6871,23 +6933,26 @@ def _terminate_reclaimed_worker(
     except OSError:
         return info
 
+    def target_alive() -> bool:
+        if process_group == int(pid):
+            try:
+                os.killpg(int(pid), 0)
+            except (ProcessLookupError, PermissionError, OSError):
+                return False
+            return True
+        return _pid_alive(pid)
+
     for _ in range(10):
-        if not _pid_alive(pid):
+        if not target_alive():
             info["terminated"] = True
             return info
         time.sleep(0.5)
 
-    if _pid_alive(pid):
-        try:
-            # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
-            # (which maps to TerminateProcess via the stdlib shim).
-            _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-            kill(int(pid), _sigkill)
-            info["sigkill"] = True
-        except (ProcessLookupError, OSError):
-            return info
-
-    info["terminated"] = not _pid_alive(pid)
+    # Fail closed when SIGTERM does not stop the worker. Paseo watchers use
+    # their SIGTERM handler to retire the daemon-owned ACP agent first; SIGKILL
+    # would bypass that cleanup and release the claim beside a live remote
+    # agent. The caller records reclaim_deferred and retries instead.
+    info["terminated"] = not target_alive()
     return info
 
 
@@ -7370,6 +7435,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 continue
 
             pid = int(row["worker_pid"])
+            termination = _terminate_reclaimed_worker(pid, row["claim_lock"])
+            if _worker_survived_termination(termination):
+                # A crashed leader can leave detached group members alive.
+                # Keep the claim until those external effects are retired.
+                continue
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
             if kind == "clean_exit":
@@ -8112,7 +8182,12 @@ def _dispatch_once_locked(
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
-    _default_assignee = (default_assignee or "").strip() or None
+    try:
+        _default_assignee = (
+            _canonical_assignee(default_assignee) if default_assignee else None
+        )
+    except (TypeError, ValueError):
+        _default_assignee = None
     _default_assignee_resolved = False
     if _default_assignee:
         try:
