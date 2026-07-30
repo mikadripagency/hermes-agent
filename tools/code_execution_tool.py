@@ -548,6 +548,20 @@ def _rpc_server_loop(
                 tool_name = request.get("tool", "")
                 tool_args = request.get("args", {})
 
+                # Lifecycle transitions must remain direct model-tool calls.
+                # An execute_code RPC waits for this listener while the outer
+                # call owns the Kanban effect lease; admitting a transition
+                # here would wait on its own lease and deadlock.
+                if tool_name in {"kanban_block", "kanban_complete"}:
+                    resp = json.dumps({
+                        "error": (
+                            f"Tool '{tool_name}' cannot run inside execute_code; "
+                            "call it directly after execute_code returns."
+                        )
+                    })
+                    conn.sendall((resp + "\n").encode())
+                    continue
+
                 # Enforce the allow-list
                 if tool_name not in allowed_tools:
                     available = ", ".join(sorted(allowed_tools))
@@ -1142,10 +1156,32 @@ def execute_code(
     if not code or not code.strip():
         return tool_error("No code provided.")
 
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return json.dumps({
+            "status": "blocked",
+            "error": (
+                "Kanban workers cannot use execute_code because arbitrary "
+                "Python cannot prove descendant-process containment; use "
+                "foreground Hermes tool calls instead."
+            ),
+            "tool_calls_made": 0,
+            "duration_seconds": 0,
+        }, ensure_ascii=False)
+
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
     _env_config = _get_env_config()
     env_type = _env_config["env_type"]
+    if os.environ.get("HERMES_KANBAN_TASK") and env_type != "local":
+        return json.dumps({
+            "status": "blocked",
+            "error": (
+                "Kanban execute_code requires the local backend so detached "
+                "descendants can be proven stopped."
+            ),
+            "tool_calls_made": 0,
+            "duration_seconds": 0,
+        }, ensure_ascii=False)
 
     # execute_code runs arbitrary Python (subprocess/os.system/...) that never
     # passes through terminal()/DANGEROUS_PATTERNS, so guard the whole script
@@ -1310,6 +1346,10 @@ def execute_code(
         # with a C/POSIX locale (containers, minimal base images).
         child_env["PYTHONIOENCODING"] = "utf-8"
         child_env["PYTHONUTF8"] = "1"
+        effect_token = None
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            effect_token = f"{os.getpid()}-{time.time_ns()}"
+            child_env["HERMES_KANBAN_EFFECT_TOKEN"] = effect_token
         # Ensure the hermes-agent root is importable in the sandbox so
         # repo-root modules are available to child scripts.  We also prepend
         # the staging tmpdir so ``from hermes_tools import ...`` resolves even
@@ -1537,6 +1577,35 @@ def execute_code(
             # Include stderr in output so the LLM sees the traceback
             if stderr_text:
                 result["output"] = stdout_text + "\n--- stderr ---\n" + stderr_text
+
+        if effect_token is not None:
+            import psutil
+
+            escaped = []
+            for candidate in psutil.process_iter(["pid"]):
+                try:
+                    if candidate.environ().get(
+                        "HERMES_KANBAN_EFFECT_TOKEN"
+                    ) == effect_token:
+                        escaped.append(candidate)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                    continue
+            for candidate in escaped:
+                try:
+                    candidate.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            _, alive = psutil.wait_procs(escaped, timeout=2)
+            for candidate in alive:
+                try:
+                    candidate.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            if escaped:
+                result["status"] = "error"
+                result["error"] = (
+                    "execute_code detached child processes; they were terminated."
+                )
 
         return json.dumps(result, ensure_ascii=False)
 

@@ -2777,6 +2777,12 @@ DEFAULT_CONFIG = {
         # wins. Mirrors the kanban sentinel's default; keep the two in sync
         # (the sentinel reads this key from the profile config too).
         "default_max_runtime_seconds": 7200,
+        # Hermes profile configured behind the config-gated Paseo provider.
+        # Assignments to other profiles fall back to the normal `hermes -p`
+        # launcher so the claimed run and real worker identity cannot diverge.
+        "paseo_spawn": {
+            "profile": "developer",
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

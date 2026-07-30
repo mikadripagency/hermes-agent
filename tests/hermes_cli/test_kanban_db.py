@@ -530,7 +530,6 @@ def test_unblock_scheduled_rechecks_parent_gate(kanban_home):
 
 
 def test_stale_claim_reclaimed(kanban_home, monkeypatch):
-    import signal
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
@@ -554,7 +553,7 @@ def test_stale_claim_reclaimed(kanban_home, monkeypatch):
         reclaimed = kb.release_stale_claims(conn, signal_fn=_signal)
         assert reclaimed == 1
         assert kb.get_task(conn, t).status == "running"
-        assert killed == [signal.SIGTERM]
+        assert killed == []  # already-dead workers need no signal
 
 
 def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(

@@ -2288,6 +2288,17 @@ def terminal_tool(
                 "status": "blocked",
             }, ensure_ascii=False)
 
+        if os.environ.get("HERMES_KANBAN_TASK") and env_type != "local":
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": (
+                    "Kanban workers require the local terminal backend so "
+                    "descendant processes can be proven stopped."
+                ),
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
@@ -2348,6 +2359,48 @@ def terminal_tool(
                     "status": "blocked"
                 }, ensure_ascii=False)
 
+        detachment_source = command
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            import shlex
+
+            try:
+                for token in shlex.split(command):
+                    candidate = Path(token).expanduser()
+                    if not candidate.is_absolute() and workdir:
+                        candidate = Path(workdir) / candidate
+                    if (
+                        candidate.is_file()
+                        and candidate.suffix.lower() in {".py", ".sh", ".bash", ".zsh"}
+                        and candidate.stat().st_size <= 1_000_000
+                    ):
+                        detachment_source += "\n" + candidate.read_text(
+                            encoding="utf-8", errors="ignore"
+                        )
+            except (OSError, ValueError):
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": "Kanban worker could not inspect command scripts safely.",
+                    "status": "blocked",
+                }, ensure_ascii=False)
+
+        if os.environ.get("HERMES_KANBAN_TASK") and re.search(
+            r"(?:^|[\s;&|])(?:nohup|setsid|disown)(?:\s|$)"
+            r"|\b(?:os\.)?(?:fork|setsid)\s*\("
+            r"|start_new_session\s*=\s*True"
+            r"|(?:^|\s)&(?:\s|$)",
+            detachment_source,
+        ):
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": (
+                    "Kanban workers cannot detach child processes; run the "
+                    "command synchronously without fork/setsid/nohup/disown."
+                ),
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         # Prepare command for execution
         pty_disabled_reason = None
         effective_pty = pty
@@ -2380,6 +2433,18 @@ def terminal_tool(
             # For local backends: uses subprocess.Popen with output buffering.
             # For non-local backends: runs inside the sandbox via env.execute().
             from tools.process_registry import process_registry
+
+            if os.environ.get("HERMES_KANBAN_TASK"):
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": (
+                        "Kanban workers require foreground execution so run "
+                        "takeover can prove the command and every descendant "
+                        "have stopped."
+                    ),
+                    "status": "blocked",
+                }, ensure_ascii=False)
 
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
@@ -2650,7 +2715,66 @@ def terminal_tool(
                         "timeout": effective_timeout,
                         "cwd": command_cwd,
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    active_env = locals().get("env")
+                    assert active_env is not None
+                    effect_token = None
+                    previous_effect_token = None
+                    if (
+                        os.environ.get("HERMES_KANBAN_TASK")
+                        and env_type == "local"
+                        and hasattr(active_env, "env")
+                    ):
+                        effect_token = f"{os.getpid()}-{time.time_ns()}"
+                        previous_effect_token = active_env.env.get("HERMES_KANBAN_EFFECT_TOKEN")
+                        active_env.env["HERMES_KANBAN_EFFECT_TOKEN"] = effect_token
+                    try:
+                        command_to_execute = command
+                        if effect_token is not None:
+                            import shlex
+
+                            command_to_execute = (
+                                "export HERMES_KANBAN_EFFECT_TOKEN="
+                                f"{shlex.quote(effect_token)}; {command}"
+                            )
+                        result = active_env.execute(
+                            command_to_execute, **execute_kwargs
+                        )
+                    finally:
+                        if effect_token is not None:
+                            if previous_effect_token is None:
+                                active_env.env.pop("HERMES_KANBAN_EFFECT_TOKEN", None)
+                            else:
+                                active_env.env["HERMES_KANBAN_EFFECT_TOKEN"] = previous_effect_token
+
+                    if effect_token is not None:
+                        import psutil
+
+                        escaped = []
+                        for candidate in psutil.process_iter(["pid"]):
+                            try:
+                                if candidate.environ().get(
+                                    "HERMES_KANBAN_EFFECT_TOKEN"
+                                ) == effect_token:
+                                    escaped.append(candidate)
+                            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                                continue
+                        for candidate in escaped:
+                            try:
+                                candidate.terminate()
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                continue
+                        _, alive = psutil.wait_procs(escaped, timeout=2)
+                        for candidate in alive:
+                            try:
+                                candidate.kill()
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                pass
+                        if escaped:
+                            result = {
+                                "output": result.get("output", ""),
+                                "exit_code": -1,
+                                "error": "Kanban command detached child processes; they were terminated.",
+                            }
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:

@@ -1875,8 +1875,16 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
+    from hermes_cli.profiles import normalize_profile_name
+
+    execution_profile = normalize_profile_name(_profile_author())
     with kb.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        task = kb.claim_task(
+            conn,
+            args.task_id,
+            ttl_seconds=args.ttl,
+            execution_profile=execution_profile,
+        )
         if task is None:
             # Report why
             existing = kb.get_task(conn, args.task_id)
@@ -1924,6 +1932,33 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
+def _terminal_run_id_for(conn, task_id: str) -> Optional[int]:
+    """Bind interactive delivery transitions to the active profile/run."""
+    worker_run_id = _worker_run_id_for(task_id)
+    if worker_run_id is not None:
+        return worker_run_id
+
+    task = kb.get_task(conn, task_id)
+    if task is None or task.task_kind != "delivery" or task.status != "running":
+        return None
+    if task.current_run_id is None:
+        raise RuntimeError("delivery task has no authoritative current run")
+
+    from hermes_cli.profiles import normalize_profile_name
+
+    active_profile = normalize_profile_name(_profile_author())
+    intended_profile = normalize_profile_name(task.assignee or "")
+    run = kb.get_run(conn, int(task.current_run_id))
+    run_profile = normalize_profile_name(run.profile or "") if run is not None else ""
+    if active_profile != intended_profile or run_profile != intended_profile:
+        raise RuntimeError(
+            "delivery transition profile mismatch: "
+            f"active={active_profile!r}, run={run_profile!r}, "
+            f"assignee={intended_profile!r}"
+        )
+    return int(task.current_run_id)
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -1961,11 +1996,12 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     result=args.result,
                     summary=summary,
                     metadata=metadata,
-                    expected_run_id=_worker_run_id_for(tid),
+                    expected_run_id=_terminal_run_id_for(conn, tid),
                 )
             except (
                 kb.InvalidCompletionIdentityError,
                 kb.MissingCompletionEvidenceError,
+                RuntimeError,
             ) as exc:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {exc}", file=sys.stderr)
@@ -2014,6 +2050,12 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            try:
+                expected_run_id = _terminal_run_id_for(conn, tid)
+            except RuntimeError as exc:
+                failed.append(tid)
+                print(f"cannot block {tid}: {exc}", file=sys.stderr)
+                continue
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
             if not kb.block_task(
@@ -2021,7 +2063,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=expected_run_id,
             ):
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)

@@ -31,6 +31,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
+from agent.kanban_worker_fence import fence_kanban_worker_tool_batch
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -322,6 +323,7 @@ def _run_agent_tool_execution_middleware(
     return result, observed_args
 
 
+@fence_kanban_worker_tool_batch(message_arg_index=1, allow_transition=False)
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
@@ -1019,6 +1021,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
 
 
+@fence_kanban_worker_tool_batch(message_arg_index=1)
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
     # Resolve the context-scaled tool-output budget once per turn.

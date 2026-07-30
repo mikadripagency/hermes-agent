@@ -90,6 +90,11 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.kanban_run_lock import (
+    database_path,
+    fence_task_transition,
+    task_run_lock,
+)
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -3864,12 +3869,14 @@ def _active_project_lane_counts(conn: sqlite3.Connection) -> dict[str, int]:
     }
 
 
+@fence_task_transition()
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    execution_profile: Optional[str] = None,
     max_in_progress_per_project: Optional[int] = DEFAULT_MAX_IN_PROGRESS_PER_PROJECT,
 ) -> Optional[Task]:
     """Atomically claim Backlog or an unclaimed In Progress recovery.
@@ -3907,9 +3914,31 @@ def claim_task(
             )
             return None
         candidate = conn.execute(
-            "SELECT status, project_id, task_kind FROM tasks WHERE id = ?",
+            "SELECT status, project_id, task_kind, assignee FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        normalized_execution_profile = (
+            str(execution_profile).strip() if execution_profile is not None else None
+        )
+        intended_profile = (
+            str(candidate["assignee"] or "").strip() if candidate is not None else ""
+        )
+        if (
+            candidate is not None
+            and normalized_execution_profile is not None
+            and normalized_execution_profile != intended_profile
+        ):
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {
+                    "reason": "execution_profile_mismatch",
+                    "assignee": intended_profile or None,
+                    "execution_profile": normalized_execution_profile or None,
+                },
+            )
+            return None
         project_cap = max_in_progress_per_project if (
             isinstance(max_in_progress_per_project, int)
             and max_in_progress_per_project > 0
@@ -3976,7 +4005,9 @@ def claim_task(
             """,
             (
                 task_id,
-                trow["assignee"] if trow else None,
+                normalized_execution_profile
+                if normalized_execution_profile is not None
+                else (trow["assignee"] if trow else None),
                 trow["current_step_key"] if trow else None,
                 lock,
                 expires,
@@ -4005,12 +4036,14 @@ def claim_task(
     return claimed
 
 
+@fence_task_transition()
 def claim_review_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    execution_profile: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -4028,6 +4061,33 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        candidate = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ? AND status = 'review'",
+            (task_id,),
+        ).fetchone()
+        normalized_execution_profile = (
+            str(execution_profile).strip() if execution_profile is not None else None
+        )
+        intended_profile = (
+            str(candidate["assignee"] or "").strip() if candidate is not None else ""
+        )
+        if (
+            candidate is not None
+            and normalized_execution_profile is not None
+            and normalized_execution_profile != intended_profile
+        ):
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {
+                    "reason": "execution_profile_mismatch",
+                    "assignee": intended_profile or None,
+                    "execution_profile": normalized_execution_profile or None,
+                    "source_status": "review",
+                },
+            )
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4058,7 +4118,9 @@ def claim_review_task(
             """,
             (
                 task_id,
-                trow["assignee"] if trow else None,
+                normalized_execution_profile
+                if normalized_execution_profile is not None
+                else (trow["assignee"] if trow else None),
                 trow["current_step_key"] if trow else None,
                 lock,
                 expires,
@@ -4109,6 +4171,51 @@ def heartbeat_claim(
                 )
             return True
         return False
+
+
+@fence_task_transition()
+def _release_expired_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    row,
+    now: int,
+    host_local: bool,
+    heartbeat_stale: bool,
+    termination: dict,
+) -> bool:
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
+            "AND claim_expires IS NOT NULL AND claim_expires < ?",
+            (task_id, row["claim_lock"], now),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="reclaimed", status="reclaimed",
+            error=f"stale_lock={row['claim_lock']}",
+            metadata=termination,
+        )
+        payload = {
+            "stale_lock": row["claim_lock"],
+            "worker_pid": int(row["worker_pid"]) if row["worker_pid"] is not None else None,
+            "claim_expires": int(row["claim_expires"]),
+            "last_heartbeat_at": (
+                int(row["last_heartbeat_at"])
+                if row["last_heartbeat_at"] is not None
+                else None
+            ),
+            "now": now,
+            "host_local": host_local,
+            "heartbeat_stale": bool(heartbeat_stale),
+        }
+        payload.update(termination)
+        _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)
+    return True
 
 
 def release_stale_claims(
@@ -4223,45 +4330,60 @@ def release_stale_claims(
                 reason="ttl_expired_worker_alive",
             )
             continue
-        with write_txn(conn):
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'running', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
-            )
-            if cur.rowcount != 1:
-                continue
-            run_id = _end_run(
-                conn, row["id"],
-                outcome="reclaimed", status="reclaimed",
-                error=f"stale_lock={row['claim_lock']}",
-                metadata=termination,
-            )
-            payload = {
-                "stale_lock": row["claim_lock"],
-                "worker_pid": (
-                    int(row["worker_pid"])
-                    if row["worker_pid"] is not None else None
-                ),
-                "claim_expires": int(row["claim_expires"]),
-                "last_heartbeat_at": (
-                    int(row["last_heartbeat_at"])
-                    if row["last_heartbeat_at"] is not None else None
-                ),
-                "now": now,
-                "host_local": host_local,
-                "heartbeat_stale": bool(heartbeat_stale),
-            }
-            payload.update(termination)
-            _append_event(
-                conn, row["id"], "reclaimed",
-                payload,
-                run_id=run_id,
-            )
+        if _release_expired_claim(
+            conn,
+            row["id"],
+            row=row,
+            now=now,
+            host_local=host_local,
+            heartbeat_stale=heartbeat_stale,
+            termination=termination,
+        ):
             reclaimed += 1
     return reclaimed
+
+
+@fence_task_transition()
+def _release_reclaimed_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    prev_lock: Optional[str],
+    reason: Optional[str],
+    termination: dict,
+) -> bool:
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
+            "AND claim_lock IS ?",
+            (task_id, prev_lock),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="reclaimed", status="reclaimed",
+            error=(
+                f"manual_reclaim: {reason}" if reason
+                else f"manual_reclaim lock={prev_lock}"
+            ),
+            metadata=termination,
+        )
+        payload = {
+            "manual": True,
+            "reason": reason,
+            "prev_lock": prev_lock,
+        }
+        payload.update(termination)
+        _append_event(
+            conn, task_id, "reclaimed",
+            payload,
+            run_id=run_id,
+        )
+    _clear_failure_counter(conn, task_id)
+    return True
 
 
 def reclaim_task(
@@ -4295,42 +4417,23 @@ def reclaim_task(
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
-    with write_txn(conn):
-        cur = conn.execute(
-            "UPDATE tasks SET status = 'running', claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?",
-            (task_id, prev_lock),
+    if _worker_survived_termination(termination):
+        _defer_reclaim_for_live_worker(
+            conn,
+            task_id,
+            prev_lock,
+            int(time.time()),
+            termination,
+            reason="manual_reclaim_worker_alive",
         )
-        if cur.rowcount != 1:
-            return False
-        run_id = _end_run(
-            conn, task_id,
-            outcome="reclaimed", status="reclaimed",
-            error=(
-                f"manual_reclaim: {reason}" if reason
-                else f"manual_reclaim lock={prev_lock}"
-            ),
-            metadata=termination,
-        )
-        payload = {
-            "manual": True,
-            "reason": reason,
-            "prev_lock": prev_lock,
-        }
-        payload.update(termination)
-        _append_event(
-            conn, task_id, "reclaimed",
-            payload,
-            run_id=run_id,
-        )
-    # Operator intervention — they've looked at the task, so the
-    # consecutive-failures counter is now stale. Give the next retry
-    # a fresh budget. (_clear_failure_counter opens its own write_txn,
-    # so it runs after the enclosing one commits.)
-    _clear_failure_counter(conn, task_id)
-    return True
+        return False
+    return _release_reclaimed_task(
+        conn,
+        task_id,
+        prev_lock=prev_lock,
+        reason=reason,
+        termination=termination,
+    )
 
 
 def reassign_task(
@@ -4586,6 +4689,7 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+@fence_task_transition()
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5305,6 +5409,7 @@ def edit_completed_task_result(
     return True
 
 
+@fence_task_transition()
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5319,11 +5424,11 @@ def block_task(
     un-typed block) drives routing instead of every block landing in one
     undifferentiated ``blocked`` bucket:
 
-    * ``dependency`` — the task is only waiting on another task. It does NOT
-      sit in ``blocked`` (where a cron would keep "unblocking" it); it goes to
-      ``todo`` so the existing parent-gating / ``recompute_ready`` machinery
-      promotes it automatically once its parents finish. No human, no cron, no
-      retry storm. This is Dale's "Type 2 — dependency blocked".
+    * ``dependency`` — when an unfinished parent link proves the dependency,
+      the task goes to ``todo`` so parent-gating promotes it once the parents
+      finish. Without an unfinished parent it stays in ``blocked``: treating an
+      ungrounded dependency claim as auto-resumable creates an immediate
+      block → promote → respawn loop.
 
     * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
@@ -5399,7 +5504,12 @@ def block_task(
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
-        if kind == "dependency":
+        dependency_is_parent_gated = kind == "dependency" and conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            (task_id,),
+        ).fetchone() is not None
+        if dependency_is_parent_gated:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -6796,6 +6906,25 @@ def _terminate_reclaimed_worker(
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
     )
+    process_group = None
+    if signal_fn is None and kill is not None and hasattr(os, "killpg"):
+        try:
+            process_group = os.getpgid(int(pid))
+        except (ProcessLookupError, OSError):
+            try:
+                os.killpg(int(pid), 0)
+            except (ProcessLookupError, PermissionError, OSError):
+                process_group = None
+            else:
+                # The leader crashed while detached children kept its group.
+                process_group = int(pid)
+        if process_group is not None and process_group == int(pid):
+            worker_pgid = int(process_group)
+            info["process_group"] = worker_pgid
+            kill = lambda _pid, sig: os.killpg(worker_pgid, sig)
+    if process_group is None and not _pid_alive(pid):
+        info["terminated"] = True
+        return info
     if kill is None:
         return info
 
@@ -6811,23 +6940,26 @@ def _terminate_reclaimed_worker(
     except OSError:
         return info
 
+    def target_alive() -> bool:
+        if process_group == int(pid):
+            try:
+                os.killpg(int(pid), 0)
+            except (ProcessLookupError, PermissionError, OSError):
+                return False
+            return True
+        return _pid_alive(pid)
+
     for _ in range(10):
-        if not _pid_alive(pid):
+        if not target_alive():
             info["terminated"] = True
             return info
         time.sleep(0.5)
 
-    if _pid_alive(pid):
-        try:
-            # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
-            # (which maps to TerminateProcess via the stdlib shim).
-            _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-            kill(int(pid), _sigkill)
-            info["sigkill"] = True
-        except (ProcessLookupError, OSError):
-            return info
-
-    info["terminated"] = not _pid_alive(pid)
+    # Fail closed when SIGTERM does not stop the worker. Paseo watchers use
+    # their SIGTERM handler to retire the daemon-owned ACP agent first; SIGKILL
+    # would bypass that cleanup and release the claim beside a live remote
+    # agent. The caller records reclaim_deferred and retries instead.
+    info["terminated"] = not target_alive()
     return info
 
 
@@ -6948,7 +7080,7 @@ def enforce_max_runtime(
 ) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
-    Sends SIGTERM, waits a short grace window, then SIGKILL. Emits a
+    Sends SIGTERM and advances ownership only after the worker/agent is gone. Emits a
     ``timed_out`` event and drops the task back to ``ready`` so the next
     dispatcher tick re-spawns it — unless the spawn-failure circuit
     breaker has already given up, in which case the task stays blocked
@@ -6958,7 +7090,6 @@ def enforce_max_runtime(
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
     test hook; defaults to ``os.kill`` on POSIX.
     """
-    import signal
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -6986,58 +7117,43 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
-        killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        termination = _terminate_reclaimed_worker(
+            pid, row["claim_lock"], signal_fn=signal_fn,
         )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
-
-        with write_txn(conn):
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'running', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (tid, pid, row["claim_lock"]),
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, row["claim_lock"], now, termination,
+                reason="max_runtime_worker_alive",
             )
-            if cur.rowcount == 1:
-                payload = {
-                    "pid": pid,
-                    "elapsed_seconds": int(elapsed),
-                    "limit_seconds": int(row["max_runtime_seconds"]),
-                    "sigkill": killed,
-                }
-                run_id = _end_run(
-                    conn, tid,
-                    outcome="timed_out", status="timed_out",
-                    error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
-                    metadata=payload,
+            continue
+
+        with task_run_lock(database_path(conn), tid, exclusive=True):
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'running', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, "
+                    "last_heartbeat_at = NULL "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND worker_pid = ? AND claim_lock IS ?",
+                    (tid, pid, row["claim_lock"]),
                 )
-                _append_event(
-                    conn, tid, "timed_out", payload, run_id=run_id,
-                )
-                timed_out.append(tid)
+                if cur.rowcount == 1:
+                    payload = {
+                        "pid": pid,
+                        "elapsed_seconds": int(elapsed),
+                        "limit_seconds": int(row["max_runtime_seconds"]),
+                    }
+                    payload.update(termination)
+                    run_id = _end_run(
+                        conn, tid,
+                        outcome="timed_out", status="timed_out",
+                        error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
+                        metadata=payload,
+                    )
+                    _append_event(
+                        conn, tid, "timed_out", payload, run_id=run_id,
+                    )
+                    timed_out.append(tid)
         # Increment the unified failure counter. Outside the write_txn
         # above because ``_record_task_failure`` opens its own. If the
         # breaker trips, this flips the task ``ready → blocked`` and
@@ -7050,7 +7166,7 @@ def enforce_max_runtime(
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed},
+                event_payload_extra={"pid": pid, **termination},
             )
     return timed_out
 
@@ -7186,45 +7302,46 @@ def detect_stale_running(
             reclaimed.append(tid)
             continue
 
-        with write_txn(conn):
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'running', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ?",
-                (tid, row["claim_lock"]),
-            )
-            if cur.rowcount != 1:
-                continue
+        with task_run_lock(database_path(conn), tid, exclusive=True):
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'running', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, "
+                    "last_heartbeat_at = NULL "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND claim_lock IS ?",
+                    (tid, row["claim_lock"]),
+                )
+                if cur.rowcount != 1:
+                    continue
 
-            payload = {
-                "elapsed_seconds": int(elapsed),
-                "last_heartbeat_at": (
-                    int(last_hb) if last_hb is not None else None
-                ),
-                "heartbeat_age_seconds": (
-                    int(hb_age) if hb_age is not None else None
-                ),
-                "timeout_seconds": stale_timeout_seconds,
-                "pid": int(pid) if pid else None,
-            }
-            payload.update(termination)
+                payload = {
+                    "elapsed_seconds": int(elapsed),
+                    "last_heartbeat_at": (
+                        int(last_hb) if last_hb is not None else None
+                    ),
+                    "heartbeat_age_seconds": (
+                        int(hb_age) if hb_age is not None else None
+                    ),
+                    "timeout_seconds": stale_timeout_seconds,
+                    "pid": int(pid) if pid else None,
+                }
+                payload.update(termination)
 
-            run_id = _end_run(
-                conn, tid,
-                outcome="stale", status="stale",
-                error=(
-                    f"no heartbeat for {int(hb_age)}s "
-                    if hb_age is not None
-                    else "no heartbeat ever"
-                ) + f" after {int(elapsed)}s running",
-                metadata=payload,
-            )
-            _append_event(
-                conn, tid, "stale", payload, run_id=run_id,
-            )
-            reclaimed.append(tid)
+                run_id = _end_run(
+                    conn, tid,
+                    outcome="stale", status="stale",
+                    error=(
+                        f"no heartbeat for {int(hb_age)}s "
+                        if hb_age is not None
+                        else "no heartbeat ever"
+                    ) + f" after {int(elapsed)}s running",
+                    metadata=payload,
+                )
+                _append_event(
+                    conn, tid, "stale", payload, run_id=run_id,
+                )
+                reclaimed.append(tid)
 
         # Intentionally NOT calling _record_task_failure here. Stale reclaim
         # is dispatcher-side detection of an absent heartbeat; the task is
@@ -7250,203 +7367,160 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
+@fence_task_transition()
+def _release_crashed_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    pid: int,
+    claim_lock: str,
+) -> Optional[tuple[bool, bool, str, bool]]:
+    """End one dead run while holding the same exclusive fence as takeover."""
+    kind, code = _classify_worker_exit(pid)
+    rate_limited_exit = kind == "rate_limited"
+    protocol_violation = kind == "clean_exit"
+    if protocol_violation:
+        error_text = (
+            "worker exited cleanly (rc=0) without calling "
+            "kanban_complete or kanban_block — protocol violation"
+        )
+        event_kind = "protocol_violation"
+        event_payload = {"pid": pid, "claimer": claim_lock, "exit_code": code}
+    elif rate_limited_exit:
+        error_text = (
+            f"pid {pid} exited rate-limited (quota wall) — "
+            "requeued without counting a failure"
+        )
+        event_kind = "rate_limited"
+        event_payload = {"pid": pid, "claimer": claim_lock, "exit_code": code}
+    else:
+        if kind == "nonzero_exit":
+            error_text = f"pid {pid} exited with code {code}"
+        elif kind == "signaled":
+            error_text = f"pid {pid} killed by signal {code}"
+        else:
+            error_text = f"pid {pid} not alive"
+        event_kind = "crashed"
+        event_payload = {"pid": pid, "claimer": claim_lock}
+        if code is not None and kind != "unknown":
+            event_payload["exit_kind"] = kind
+            event_payload["exit_code"] = code
+
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = 'running' "
+            "  AND worker_pid = ? AND claim_lock IS ?",
+            (task_id, pid, claim_lock),
+        )
+        if cur.rowcount != 1:
+            return None
+        run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome=run_outcome,
+            status=run_outcome,
+            error=error_text,
+            metadata=dict(event_payload),
+        )
+        _append_event(
+            conn, task_id, event_kind, event_payload, run_id=run_id,
+        )
+        if rate_limited_exit:
+            conn.execute(
+                "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                (error_text[:500], task_id),
+            )
+    auto_blocked = False
+    if not rate_limited_exit:
+        auto_blocked = _record_task_failure(
+            conn,
+            task_id,
+            error=error_text,
+            outcome="crashed",
+            failure_limit=1 if protocol_violation else DEFAULT_FAILURE_LIMIT,
+            release_claim=False,
+            end_run=False,
+            event_payload_extra={"pid": pid, "claimer": claim_lock},
+        )
+    return rate_limited_exit, protocol_violation, error_text, auto_blocked
+
+
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
-    """Reclaim ``running`` tasks whose worker PID is no longer alive.
-
-    Appends a ``crashed`` event and drops the task back to ``ready``.
-    Different from ``release_stale_claims``: this checks liveness
-    immediately rather than waiting for the claim TTL.
-
-    Only considers tasks claimed by *this host* — PIDs from other hosts
-    are meaningless here. The host-local check is enough because
-    ``_default_spawn`` always runs the worker on the same host as the
-    dispatcher (the whole design is single-host).
-
-    When the reap registry shows the worker exited cleanly (rc=0) but
-    the task was still ``running`` in the DB, treat it as a protocol
-    violation (worker answered conversationally without calling
-    ``kanban_complete`` / ``kanban_block``) and trip the circuit breaker
-    on the first occurrence — retrying a worker whose CLI keeps
-    returning 0 without a terminal transition just loops forever.
-
-    When the reap registry shows the worker exited with the rate-limit
-    sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
-    provider quota wall, NOT a task failure. Such tasks are released back
-    to ``ready`` WITHOUT counting a failure (so a long quota window can't
-    trip the breaker) and stamped with a quota-blocker error so
-    ``check_respawn_guard`` defers their respawn until the window clears.
-    The ids are returned via the ``_last_rate_limited`` function attribute
-    (the public return stays the crashed-only ``list[str]``).
-    """
+    """Reclaim dead host-local workers without advancing past live effects."""
     crashed: list[str] = []
     rate_limited: list[str] = []
-    # Per-crash details collected inside the main txn, used after it
-    # closes to run ``_record_task_failure`` (which needs its own
-    # write_txn so can't nest). ``protocol_violation`` flags the
-    # clean-exit-but-still-running case so we can trip the breaker
-    # immediately instead of incrementing by 1.
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
-    with write_txn(conn):
-        rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
-        ).fetchall()
-        host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-        for row in rows:
-            # Only check liveness for claims owned by this host.
-            lock = row["claim_lock"] or ""
-            if not lock.startswith(host_prefix):
-                continue
-            # Skip liveness check inside the launch-window grace period
-            # so a freshly-spawned worker isn't reclaimed before its PID
-            # is visible on /proc.
-            started_at = row["started_at"] if "started_at" in row.keys() else None
-            if started_at is not None:
-                grace = _resolve_crash_grace_seconds()
-                if time.time() - started_at < grace:
-                    continue
-            if _pid_alive(row["worker_pid"]):
-                continue
-
-            pid = int(row["worker_pid"])
-            kind, code = _classify_worker_exit(pid)
-            rate_limited_exit = False
-            if kind == "clean_exit":
-                # Worker subprocess returned 0 but its task is still
-                # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Retrying won't
-                # help.
-                protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation"
-                )
-                event_kind = "protocol_violation"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                }
-            elif kind == "rate_limited":
-                # Worker bailed because the provider rate-limited / exhausted
-                # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
-                # the task is fine, the account just hit a wall. Release it
-                # back to ``ready`` so the respawn guard defers it until the
-                # quota window clears, and crucially do NOT count a failure
-                # (skip ``_record_task_failure``) so a long quota window can't
-                # trip the circuit breaker and permanently block the card.
-                protocol_violation = False
-                rate_limited_exit = True
-                error_text = (
-                    f"pid {pid} exited rate-limited (quota wall) — "
-                    f"requeued without counting a failure"
-                )
-                event_kind = "rate_limited"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                }
-            else:
-                protocol_violation = False
-                if kind == "nonzero_exit":
-                    error_text = f"pid {pid} exited with code {code}"
-                elif kind == "signaled":
-                    error_text = f"pid {pid} killed by signal {code}"
-                else:
-                    error_text = f"pid {pid} not alive"
-                event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
-                if code is not None and kind != "unknown":
-                    event_payload["exit_kind"] = kind
-                    event_payload["exit_code"] = code
-
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'running', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
-            )
-            if cur.rowcount == 1:
-                # Rate-limited requeues are a clean release, not a crash —
-                # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
-                run_id = _end_run(
-                    conn, row["id"],
-                    outcome=_run_outcome, status=_run_outcome,
-                    error=error_text,
-                    metadata=dict(event_payload),
-                )
-                _append_event(
-                    conn, row["id"], event_kind,
-                    event_payload,
-                    run_id=run_id,
-                )
-                if rate_limited_exit:
-                    # Stamp the failure-error column so ``check_respawn_guard``
-                    # recognizes this as a quota blocker and defers the
-                    # respawn until the window clears — WITHOUT touching
-                    # ``consecutive_failures`` (that's the whole point: no
-                    # breaker trip on a throttle).
-                    conn.execute(
-                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-                        (error_text[:500], row["id"]),
-                    )
-                    rate_limited.append(row["id"])
-                else:
-                    crashed.append(row["id"])
-                    crash_details.append(
-                        (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
-                    )
-    # Outside the main txn: increment the unified failure counter for
-    # each crashed task. If the breaker trips, the task transitions
-    # ready → blocked with a ``gave_up`` event on top of the ``crashed``
-    # event we already emitted.
-    #
-    # Protocol-violation crashes force an immediate trip (failure_limit=1)
-    # because clean-exit-without-transition is deterministic: the next
-    # respawn will do exactly the same thing. Better to surface to a
-    # human with a clear reason than to loop ``DEFAULT_FAILURE_LIMIT``
-    # times first.
     auto_blocked: list[str] = []
+    crash_details: list[tuple[str, int, str, bool, str]] = []
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    rows = conn.execute(
+        "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+        "WHERE status = 'running' AND worker_pid IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        claim_lock = row["claim_lock"] or ""
+        if not claim_lock.startswith(host_prefix):
+            continue
+        started_at = row["started_at"] if "started_at" in row.keys() else None
+        if (
+            started_at is not None
+            and time.time() - started_at < _resolve_crash_grace_seconds()
+        ):
+            continue
+        if _pid_alive(row["worker_pid"]):
+            continue
+
+        pid = int(row["worker_pid"])
+        termination = _terminate_reclaimed_worker(pid, claim_lock)
+        if _worker_survived_termination(termination):
+            continue
+        released = _release_crashed_worker(
+            conn, row["id"], pid=pid, claim_lock=claim_lock,
+        )
+        if released is None:
+            continue
+        rate_limited_exit, protocol_violation, error_text, was_auto_blocked = released
+        if rate_limited_exit:
+            rate_limited.append(row["id"])
+        else:
+            crashed.append(row["id"])
+            crash_details.append(
+                (row["id"], pid, claim_lock, protocol_violation, error_text)
+            )
+            if was_auto_blocked:
+                auto_blocked.append(row["id"])
+
     if crash_details:
-        # Fingerprint errors to detect systemic failures.
-        _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
-            fp = _error_fingerprint(err_text)
-            _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
+        fingerprint_counts: dict[str, int] = {}
+        for _, _, _, _, error_text in crash_details:
+            fingerprint = _error_fingerprint(error_text)
+            fingerprint_counts[fingerprint] = fingerprint_counts.get(fingerprint, 0) + 1
         for tid, pid, claimer, protocol_violation, error_text in crash_details:
-            fp = _error_fingerprint(error_text)
             is_systemic = (
                 not protocol_violation
-                and _fp_counts.get(fp, 0) >= 3
+                and fingerprint_counts.get(_error_fingerprint(error_text), 0) >= 3
             )
-            tripped = _record_task_failure(
-                conn, tid,
+            if not is_systemic:
+                continue
+            if _record_task_failure(
+                conn,
+                tid,
                 error=error_text,
                 outcome="crashed",
-                failure_limit=1 if (protocol_violation or is_systemic) else None,
+                failure_limit=1,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
-            )
-            if tripped:
+            ):
                 auto_blocked.append(tid)
-    # Stash auto-blocked ids on the function for the dispatch loop to pick up.
-    # Keeps the public return type (``list[str]``) stable for direct callers
-    # and tests that destructure the result; ``dispatch_once`` reads this
-    # side-channel attribute to populate ``DispatchResult.auto_blocked``.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
-    # Same side-channel for rate-limited requeues — these did NOT count a
-    # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
     return crashed
 
 
+@fence_task_transition()
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7497,10 +7571,18 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, current_run_id, claim_lock "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
+            return False
+        if (
+            not release_claim
+            and not end_run
+            and (row["current_run_id"] is not None or row["claim_lock"] is not None)
+        ):
+            # A new claim won the gap after crash/timeout release. Old-run
+            # bookkeeping must never block or mutate that replacement run.
             return False
         failures = int(row["consecutive_failures"]) + 1
         cur_status = row["status"]
@@ -8052,7 +8134,12 @@ def _dispatch_once_locked(
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
-    _default_assignee = (default_assignee or "").strip() or None
+    try:
+        _default_assignee = (
+            _canonical_assignee(default_assignee) if default_assignee else None
+        )
+    except (TypeError, ValueError):
+        _default_assignee = None
     _default_assignee_resolved = False
     if _default_assignee:
         try:
@@ -8200,6 +8287,7 @@ def _dispatch_once_locked(
             conn,
             row["id"],
             ttl_seconds=ttl_seconds,
+            execution_profile=row_assignee,
             max_in_progress_per_project=_per_project_cap,
         )
         if claimed is None:
@@ -8297,7 +8385,12 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            execution_profile=row["assignee"],
+        )
         if claimed is None:
             continue
         try:
@@ -9424,14 +9517,25 @@ def _install_blocked_delivery(
     notifier_profile = _intended_completion_notifier_profile(
         conn, task_id, run_id
     )
+    install_orchestration_route = orchestration_route is not None
     if orchestration_route is not None:
-        _assert_orchestration_route_profile(
-            conn,
-            task_id,
-            platform=orchestration_route[0],
-            chat_id=orchestration_route[1],
-            notifier_profile=notifier_profile,
-        )
+        existing_route = conn.execute(
+            "SELECT notifier_profile, last_message_id FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ''",
+            (task_id, orchestration_route[0], orchestration_route[1]),
+        ).fetchone()
+        if existing_route is not None:
+            route_owner = str(existing_route["notifier_profile"] or "").strip()
+            route_receipt = str(existing_route["last_message_id"] or "").strip()
+            if route_owner and route_owner != notifier_profile:
+                # Blocking is containment, not a terminal success claim. Keep
+                # the already-commissioned route truthful and persist the block
+                # instead of rolling the transaction back on an old run/profile
+                # mismatch. Completion actor binding remains strict.
+                notifier_profile = route_owner
+                install_orchestration_route = False
+            elif not route_owner and route_receipt:
+                install_orchestration_route = False
     # Durable pending placeholder for the blocked event, mirroring the
     # done-time row complete_task writes. Consumed by the notifier once the
     # real platform receipt lands (acknowledge_blocked_delivery).
@@ -9446,7 +9550,7 @@ def _install_blocked_delivery(
             int(created_at),
         ),
     )
-    if orchestration_route is not None:
+    if orchestration_route is not None and install_orchestration_route:
         _install_orchestration_completion_sub(
             conn,
             task_id,

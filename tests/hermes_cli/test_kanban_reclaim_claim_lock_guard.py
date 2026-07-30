@@ -16,6 +16,8 @@ computed for.
 from __future__ import annotations
 
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -43,6 +45,35 @@ def kanban_home(tmp_path, monkeypatch):
 def conn(kanban_home):
     with kb.connect() as c:
         yield c
+
+
+def test_termination_retires_group_after_worker_leader_crash(monkeypatch):
+    import signal
+
+    state = {"group_alive": True}
+    signals = []
+
+    monkeypatch.setattr(kb, "_claimer_id", lambda: "local:dispatcher")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        kb.os,
+        "getpgid",
+        lambda _pid: (_ for _ in ()).throw(ProcessLookupError()),
+    )
+
+    def fake_killpg(pgid, sig):
+        if not state["group_alive"]:
+            raise ProcessLookupError()
+        signals.append((pgid, sig))
+        if sig == signal.SIGTERM:
+            state["group_alive"] = False
+
+    monkeypatch.setattr(kb.os, "killpg", fake_killpg)
+
+    result = kb._terminate_reclaimed_worker(4321, "local:claim")
+
+    assert result["terminated"] is True
+    assert (4321, signal.SIGTERM) in signals
 
 
 def test_stale_crash_reset_rejected_for_reclaimed_task(conn):
@@ -118,3 +149,66 @@ def test_genuine_crash_still_reclaims(conn):
     assert final["claim_lock"] is None
     assert final["current_run_id"] is None
     assert kb.claim_task(conn, tid, claimer=f"{host}:retry") is not None
+
+
+@pytest.mark.parametrize("takeover", ["max_runtime", "stale", "crashed"])
+def test_dispatcher_takeover_waits_for_active_run_effect(
+    kanban_home, monkeypatch, takeover
+):
+    from hermes_cli.kanban_run_lock import database_path, task_run_lock
+
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect_closing() as setup:
+        tid = kb.create_task(
+            setup,
+            title=f"leased {takeover}",
+            assignee="w",
+            max_runtime_seconds=1,
+        )
+        task = kb.claim_task(setup, tid, claimer=f"{host}:A")
+        assert task is not None
+        kb._set_worker_pid(setup, tid, 4321)
+        setup.execute(
+            "UPDATE tasks SET started_at=1, last_heartbeat_at=NULL WHERE id=?",
+            (tid,),
+        )
+        setup.execute("UPDATE task_runs SET started_at=1 WHERE task_id=?", (tid,))
+        setup.commit()
+        db_path = database_path(setup)
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda *args, **kwargs: {
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+        },
+    )
+    monkeypatch.setattr(kb, "_classify_worker_exit", lambda _pid: ("nonzero_exit", 1))
+    results = {}
+
+    def run_takeover():
+        with kb.connect_closing() as worker_conn:
+            if takeover == "max_runtime":
+                results["value"] = kb.enforce_max_runtime(worker_conn)
+            elif takeover == "stale":
+                results["value"] = kb.detect_stale_running(
+                    worker_conn, stale_timeout_seconds=1
+                )
+            else:
+                results["value"] = kb.detect_crashed_workers(worker_conn)
+
+    with task_run_lock(db_path, tid, exclusive=False):
+        thread = threading.Thread(target=run_takeover)
+        thread.start()
+        time.sleep(0.1)
+        with kb.connect_closing() as check:
+            current = kb.get_task(check, tid)
+        assert thread.is_alive()
+        assert current is not None and current.claim_lock is not None
+
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert tid in results["value"]
