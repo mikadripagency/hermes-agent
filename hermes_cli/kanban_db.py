@@ -7504,6 +7504,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return crashed
 
 
+@fence_task_transition()
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7554,10 +7555,18 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, current_run_id, claim_lock "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
+            return False
+        if (
+            not release_claim
+            and not end_run
+            and (row["current_run_id"] is not None or row["claim_lock"] is not None)
+        ):
+            # A new claim won the gap after crash/timeout release. Old-run
+            # bookkeeping must never block or mutate that replacement run.
             return False
         failures = int(row["consecutive_failures"]) + 1
         cur_status = row["status"]

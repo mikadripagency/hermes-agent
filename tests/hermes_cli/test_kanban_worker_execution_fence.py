@@ -481,12 +481,14 @@ def test_run_transition_waits_until_admitted_effect_finishes(
         assert blocked_task is not None and blocked_task.status == "blocked"
 
 
+@pytest.mark.live_system_guard_bypass
 def test_kanban_worker_rejects_background_processes(
     kanban_home: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import os
+    import time
 
     from tools.terminal_tool import terminal_tool
 
@@ -529,6 +531,25 @@ def test_kanban_worker_rejects_background_processes(
     nested = json.loads(execute_code("import os; os.fork()"))
     assert nested["status"] == "blocked"
     assert "cannot spawn or detach" in nested["error"]
+
+    marker = tmp_path / "escaped"
+    script = tmp_path / "detach.py"
+    script.write_text(
+        "from os import fork,setsid,close,_exit\n"
+        "from time import sleep\n"
+        "p=fork()\n"
+        "if p: _exit(0)\n"
+        "setsid(); close(1); close(2); sleep(3)\n"
+        f"open({str(marker)!r},'w').write('escaped')\n",
+        encoding="utf-8",
+    )
+    indirect = json.loads(
+        terminal_tool(f"python3 {script}", task_id="test", workdir=str(tmp_path))
+    )
+    assert indirect["exit_code"] == -1
+    assert "cannot detach" in indirect["error"]
+    time.sleep(0.4)
+    assert not marker.exists()
 
 
 def test_non_transition_tools_remain_parallel(
