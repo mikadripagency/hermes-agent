@@ -1,0 +1,334 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+
+
+@pytest.fixture
+def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "profiles" / "developer").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    return home
+
+
+def _delivery(conn, *, assignee: str = "developer") -> str:
+    return kb.create_task(
+        conn,
+        title="profile-fenced delivery",
+        assignee=assignee,
+        evidence_contract_na_reason="runtime identity regression",
+    )
+
+
+def test_claim_rejects_execution_profile_mismatch_before_run_creation(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        task_id = _delivery(conn)
+
+        assert kb.claim_task(conn, task_id, execution_profile="default") is None
+
+        task = kb.get_task(conn, task_id)
+        runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+        rejected = [event for event in kb.list_events(conn, task_id) if event.kind == "claim_rejected"]
+
+    assert task is not None and task.status == "ready"
+    assert task.claim_lock is None and task.current_run_id is None
+    assert runs == 0
+    assert rejected[-1].payload == {
+        "reason": "execution_profile_mismatch",
+        "assignee": "developer",
+        "execution_profile": "default",
+    }
+
+
+def test_claim_materializes_authoritative_execution_profile(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        task_id = _delivery(conn)
+
+        task = kb.claim_task(conn, task_id, execution_profile="developer")
+
+        assert task is not None and task.current_run_id is not None
+        run = kb.get_run(conn, task.current_run_id)
+
+    assert run is not None and run.profile == "developer"
+
+
+def test_review_claim_uses_same_execution_profile_fence(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        task_id = _delivery(conn)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
+
+        assert kb.claim_review_task(
+            conn, task_id, execution_profile="default"
+        ) is None
+        task = kb.get_task(conn, task_id)
+        runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+
+    assert task is not None and task.status == "review"
+    assert task.current_run_id is None and runs == 0
+
+
+def test_legacy_wrong_profile_route_conflict_cannot_rollback_containment_block(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        kb, "_resolve_orchestration_completion_route", lambda: ("slack", "C-ORCH")
+    )
+    with kb.connect_closing() as conn:
+        task_id = _delivery(conn)
+        task = kb.claim_task(conn, task_id, execution_profile="developer")
+        assert task is not None and task.current_run_id is not None
+        with kb.write_txn(conn):
+            # Historical pre-fence shape: the durable task/route owner is
+            # developer, but the already-running worker was stamped default.
+            conn.execute(
+                "UPDATE task_runs SET profile='default' WHERE id=?",
+                (task.current_run_id,),
+            )
+            conn.execute(
+                "INSERT INTO kanban_notify_subs "
+                "(task_id, platform, chat_id, thread_id, notifier_profile, created_at) "
+                "VALUES (?, 'slack', 'C-ORCH', '', 'developer', 1)",
+                (task_id,),
+            )
+
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="owner capability required",
+            kind="needs_input",
+            expected_run_id=task.current_run_id,
+        )
+
+        blocked = kb.get_task(conn, task_id)
+        route = conn.execute(
+            "SELECT notifier_profile FROM kanban_notify_subs WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        deliveries = conn.execute(
+            "SELECT state, notifier_profile FROM completion_deliveries WHERE task_id=?",
+            (task_id,),
+        ).fetchall()
+
+    assert blocked is not None and blocked.status == "blocked"
+    assert route["notifier_profile"] == "developer"
+    assert [(row["state"], row["notifier_profile"]) for row in deliveries] == [
+        ("pending", "developer")
+    ]
+
+
+def test_stale_run_terminal_tool_is_rejected_before_side_effect(
+    kanban_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with kb.connect_closing() as conn:
+        task_id = _delivery(conn)
+        stale = kb.claim_task(conn, task_id, execution_profile="developer")
+        assert stale is not None and stale.current_run_id is not None
+        stale_run_id = stale.current_run_id
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='reclaimed', outcome='reclaimed', ended_at=2 "
+                "WHERE id=?",
+                (stale_run_id,),
+            )
+            replacement = conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at) "
+                "VALUES (?, 'developer', 'running', 3)",
+                (task_id,),
+            )
+            conn.execute(
+                "UPDATE tasks SET current_run_id=? WHERE id=?",
+                (replacement.lastrowid, task_id),
+            )
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(stale_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_home / "kanban.db"))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    monkeypatch.setenv("HERMES_HOME", str(kanban_home / "profiles" / "developer"))
+    marker = tmp_path / "stale-side-effect"
+
+    from model_tools import handle_function_call
+
+    result = json.loads(
+        handle_function_call(
+            "terminal",
+            {"command": f"python3 -c \"from pathlib import Path; Path({str(marker)!r}).touch()\""},
+        )
+    )
+
+    assert "stale kanban worker run" in result["error"]
+    assert not marker.exists()
+
+
+def test_wrong_profile_terminal_tool_is_rejected_before_side_effect(
+    kanban_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with kb.connect_closing() as conn:
+        task_id = _delivery(conn)
+        task = kb.claim_task(conn, task_id, execution_profile="developer")
+        assert task is not None and task.current_run_id is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_home / "kanban.db"))
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    marker = tmp_path / "wrong-profile-side-effect"
+
+    from model_tools import handle_function_call
+
+    result = json.loads(
+        handle_function_call(
+            "terminal",
+            {"command": f"python3 -c \"from pathlib import Path; Path({str(marker)!r}).touch()\""},
+        )
+    )
+
+    assert "kanban worker profile mismatch" in result["error"]
+    assert not marker.exists()
+
+
+def test_current_intended_profile_can_execute_tool(
+    kanban_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with kb.connect_closing() as conn:
+        task_id = _delivery(conn)
+        task = kb.claim_task(conn, task_id, execution_profile="developer")
+        assert task is not None and task.current_run_id is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_home / "kanban.db"))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    monkeypatch.setenv("HERMES_HOME", str(kanban_home / "profiles" / "developer"))
+    marker = tmp_path / "current-worker-side-effect"
+
+    from model_tools import handle_function_call
+
+    result = json.loads(
+        handle_function_call(
+            "terminal",
+            {"command": f"python3 -c \"from pathlib import Path; Path({str(marker)!r}).touch()\""},
+        )
+    )
+
+    assert result["exit_code"] == 0
+    assert marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("transition_name", "transition_args"),
+    [("kanban_block", {}), ("tool_call", {"name": "kanban_block"})],
+)
+def test_concurrent_transition_serializes_before_side_effect(
+    kanban_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transition_name: str,
+    transition_args: dict,
+) -> None:
+    import threading
+
+    from agent.kanban_worker_fence import fence_kanban_worker_tool
+
+    with kb.connect_closing() as conn:
+        task_id = _delivery(conn)
+        task = kb.claim_task(conn, task_id, execution_profile="developer")
+        assert task is not None and task.current_run_id is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_home / "kanban.db"))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    monkeypatch.setenv("HERMES_HOME", str(kanban_home / "profiles" / "developer"))
+    transitioned = threading.Event()
+    marker = tmp_path / "raced-side-effect"
+    results = {}
+
+    @fence_kanban_worker_tool(name_arg_index=0)
+    def transition(_function_name: str, _function_args: dict) -> str:
+        with kb.connect_closing() as conn:
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (task_id,))
+        transitioned.set()
+        return "blocked"
+
+    @fence_kanban_worker_tool(name_arg_index=0)
+    def side_effect(_function_name: str) -> str:
+        marker.touch()
+        return "ran"
+
+    first = threading.Thread(
+        target=lambda: results.setdefault(
+            "transition", transition(transition_name, transition_args)
+        )
+    )
+    first.start()
+    assert transitioned.wait(timeout=5)
+    second = threading.Thread(
+        target=lambda: results.setdefault("side_effect", side_effect("terminal"))
+    )
+    second.start()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert results["transition"] == "blocked"
+    assert "stale kanban worker run" in json.loads(results["side_effect"])["error"]
+    assert not marker.exists()
+
+
+def test_non_transition_tools_remain_parallel(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from agent.kanban_worker_fence import fence_kanban_worker_tool
+
+    with kb.connect_closing() as conn:
+        task_id = _delivery(conn)
+        task = kb.claim_task(conn, task_id, execution_profile="developer")
+        assert task is not None and task.current_run_id is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_home / "kanban.db"))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    monkeypatch.setenv("HERMES_HOME", str(kanban_home / "profiles" / "developer"))
+    rendezvous = threading.Barrier(2, timeout=5)
+    results = []
+
+    @fence_kanban_worker_tool(name_arg_index=0)
+    def read_tool(_function_name: str) -> str:
+        rendezvous.wait()
+        return "ok"
+
+    threads = [
+        threading.Thread(target=lambda: results.append(read_tool("read_file")))
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert results == ["ok", "ok"]

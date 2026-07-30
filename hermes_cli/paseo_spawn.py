@@ -39,6 +39,9 @@ Config keys (under ``kanban.paseo_spawn`` in the profile ``config.yaml``):
 * ``enabled`` (bool, default ``False``) — gate. When false the dispatcher never
   reaches this module.
 * ``provider`` (str, default ``"hermes"``) — Paseo provider to run under.
+* ``profile`` (str, default ``"developer"``) — Hermes profile configured
+  behind that provider. Other assignees use the profile-aware subprocess
+  launcher instead of entering Paseo under the wrong identity.
 * ``mode`` (str, default ``"dont_ask"``) — ACP session mode passed as
   ``paseo run --mode``. Workers must never pause on permission prompts; the
   hermes ACP adapter's valid mode ids are ``default`` / ``accept_edits`` /
@@ -170,7 +173,13 @@ def _paseo_healthy(paseo_bin: str) -> bool:
     return proc.returncode == 0
 
 
-def _list_task_agents(paseo_bin: str, task_id: str) -> list:
+def _list_task_agents(
+    paseo_bin: str,
+    task_id: str,
+    *,
+    run_id: Optional[int] = None,
+    profile: Optional[str] = None,
+) -> list:
     """Return non-archived agents labeled ``kanban_task=<task_id>``.
 
     Uses ``paseo ls -g --json --label kanban_task=<id>`` so the guard is global
@@ -179,8 +188,13 @@ def _list_task_agents(paseo_bin: str, task_id: str) -> list:
     block the spawn (worst case: a redundant agent, never a stalled task).
     """
     try:
+        cmd = [paseo_bin, "ls", "-g", "--json", "--label", f"kanban_task={task_id}"]
+        if run_id is not None:
+            cmd.extend(["--label", f"kanban_run={int(run_id)}"])
+        if profile:
+            cmd.extend(["--label", f"kanban_profile={profile}"])
         proc = subprocess.run(  # noqa: S603 - fixed argv
-            [paseo_bin, "ls", "-g", "--json", "--label", f"kanban_task={task_id}"],
+            cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -208,16 +222,26 @@ def _list_task_agents(paseo_bin: str, task_id: str) -> list:
     return [a for a in agents if isinstance(a, dict) and a.get("id")]
 
 
-def _archive_agent(paseo_bin: str, agent_id: str, task_id: str) -> None:
+def _archive_agent(
+    paseo_bin: str,
+    agent_id: str,
+    task_id: str,
+    *,
+    force: bool = False,
+) -> bool:
     """Best-effort ``paseo archive <id>`` of a stale agent. Never raises.
 
-    Only called for agents that are NOT actively working, so no ``--force``
-    (which would interrupt a live run). Failure is logged and the spawn
-    proceeds — a stray stale agent is cosmetic; a stalled task is not.
+    ``force=True`` is reserved for a superseded run: the current run pointer is
+    already authoritative, so leaving that agent alive would permit stale
+    repository/runtime side effects through its native ACP shell.
     """
     try:
+        cmd = [paseo_bin, "archive", agent_id]
+        if force:
+            cmd.append("--force")
+        cmd.append("--json")
         proc = subprocess.run(  # noqa: S603 - fixed argv
-            [paseo_bin, "archive", agent_id, "--json"],
+            cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -231,6 +255,8 @@ def _archive_agent(paseo_bin: str, agent_id: str, task_id: str) -> None:
                 task_id,
                 (proc.stderr or "").strip()[:300],
             )
+            return False
+        return True
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
         _log.warning(
             "kanban paseo_spawn: could not archive stale agent %s for task %s (%s)",
@@ -238,6 +264,7 @@ def _archive_agent(paseo_bin: str, agent_id: str, task_id: str) -> None:
             task_id,
             exc,
         )
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -807,13 +834,26 @@ def watch_worker(
                 )
                 return WATCH_EXIT_TASK_SETTLED
             if run_id is not None and current_run is not None and int(current_run) != int(run_id):
-                _log.info(
-                    "paseo watch: task %s run superseded (%s -> %s) — done",
+                if _archive_agent(paseo_bin, agent_id, task_id, force=True):
+                    _log.info(
+                        "paseo watch: task %s run superseded (%s -> %s); "
+                        "retired stale agent %s",
+                        task_id,
+                        run_id,
+                        current_run,
+                        agent_id,
+                    )
+                    return WATCH_EXIT_TASK_SETTLED
+                _log.error(
+                    "paseo watch: task %s run superseded (%s -> %s) but stale "
+                    "agent %s could not be retired; retrying fail-closed",
                     task_id,
                     run_id,
                     current_run,
+                    agent_id,
                 )
-                return WATCH_EXIT_TASK_SETTLED
+                time.sleep(poll_seconds)
+                continue
 
         # (b) Agent liveness — only consecutive sustained failure counts. When
         # the soft-stall check is enabled we read (ok, status) in one inspect
@@ -920,6 +960,29 @@ def _spawn_watcher(
     return proc.pid
 
 
+def _install_watch_termination_handler(
+    *,
+    paseo_bin: str,
+    agent_id: str,
+    task_id: str,
+) -> None:
+    """Make dispatcher SIGTERM retire the daemon-owned ACP agent first."""
+    import signal
+
+    def _terminate(signum, _frame):
+        if not _archive_agent(paseo_bin, agent_id, task_id, force=True):
+            _log.error(
+                "paseo watch: refusing SIGTERM exit while stale agent %s for "
+                "task %s could not be retired",
+                agent_id,
+                task_id,
+            )
+            return
+        raise SystemExit(128 + int(signum))
+
+    signal.signal(signal.SIGTERM, _terminate)
+
+
 def main(argv: Optional[list] = None) -> int:
     """CLI entrypoint: ``python -m hermes_cli.paseo_spawn --watch ...``."""
     import argparse
@@ -945,6 +1008,11 @@ def main(argv: Optional[list] = None) -> int:
         poll_seconds = float(os.environ.get("HERMES_PASEO_WATCH_POLL", WATCH_POLL_SECONDS))
     except ValueError:
         poll_seconds = WATCH_POLL_SECONDS
+    _install_watch_termination_handler(
+        paseo_bin=args.paseo_bin,
+        agent_id=args.agent,
+        task_id=args.task,
+    )
     return watch_worker(
         task_id=args.task,
         agent_id=args.agent,
@@ -969,6 +1037,19 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
     cfg = _paseo_spawn_config()
     paseo_bin = cfg.get("paseo_bin") or "paseo"
     provider = cfg.get("provider") or "hermes"
+    env = kb._build_worker_env(task, workspace, board=board)
+    profile_arg = env.get("HERMES_PROFILE") or "kanban"
+    provider_profile = str(cfg.get("profile") or "developer").strip()
+    if provider_profile != profile_arg:
+        _log.info(
+            "kanban paseo_spawn: provider %s belongs to profile %s, not task "
+            "profile %s; using _default_spawn for task %s",
+            provider,
+            provider_profile,
+            profile_arg,
+            task.id,
+        )
+        return kb._default_spawn(task, workspace, board=board)
     # ACP session mode (default dont_ask so workers never pause on permission
     # prompts). An explicit empty string / null omits --mode entirely.
     #
@@ -1006,11 +1087,6 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
         )
         return kb._default_spawn(task, workspace, board=board)
 
-    # Build the shared worker env contract (raises if task has no assignee,
-    # exactly like _default_spawn).
-    env = kb._build_worker_env(task, workspace, board=board)
-    profile_arg = env.get("HERMES_PROFILE") or "kanban"
-
     # Per-task worker log, shared with the _default_spawn path (same dir +
     # rotation policy) so `hermes kanban log <id>` reads one file.
     log_dir = kb.worker_logs_dir(board=board)
@@ -1033,8 +1109,20 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
         #   Archive them (best-effort) and create a FRESH agent with the new
         #   run's env — keeping at most one non-archived agent per task.
         agents = _list_task_agents(paseo_bin, task.id)
+        matching_agents = _list_task_agents(
+            paseo_bin,
+            task.id,
+            run_id=getattr(task, "current_run_id", None),
+            profile=profile_arg,
+        )
+        matching_ids = {str(agent["id"]) for agent in matching_agents}
         active = next(
-            (a for a in agents if a.get("status") in _ACTIVE_STATUSES),
+            (
+                agent
+                for agent in agents
+                if str(agent["id"]) in matching_ids
+                and agent.get("status") in _ACTIVE_STATUSES
+            ),
             None,
         )
         if active is not None:
@@ -1064,10 +1152,21 @@ def spawn_via_paseo(task, workspace, *, board=None) -> Optional[int]:
                     f"(status={stale.get('status')})\n".encode()
                 )
                 log_f.flush()
-                _archive_agent(paseo_bin, stale_id, task.id)
+                retired = _archive_agent(
+                    paseo_bin,
+                    stale_id,
+                    task.id,
+                    force=stale.get("status") in _ACTIVE_STATUSES,
+                )
+                if stale.get("status") in _ACTIVE_STATUSES and not retired:
+                    raise RuntimeError(
+                        f"could not retire active stale Paseo agent {stale_id} "
+                        f"for task {task.id}"
+                    )
             labels: list[tuple[str, str]] = [("kanban_task", task.id)]
             if getattr(task, "current_run_id", None) is not None:
                 labels.append(("kanban_run", str(task.current_run_id)))
+            labels.append(("kanban_profile", profile_arg))
             board_slug = env.get("HERMES_KANBAN_BOARD")
             if board_slug:
                 labels.append(("kanban_board", board_slug))

@@ -30,6 +30,7 @@ import time
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
+from agent.kanban_worker_fence import fence_kanban_worker_tool
 from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
@@ -1022,6 +1023,7 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
+@fence_kanban_worker_tool(name_arg_index=0)
 def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],

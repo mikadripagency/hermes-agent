@@ -3870,6 +3870,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    execution_profile: Optional[str] = None,
     max_in_progress_per_project: Optional[int] = DEFAULT_MAX_IN_PROGRESS_PER_PROJECT,
 ) -> Optional[Task]:
     """Atomically claim Backlog or an unclaimed In Progress recovery.
@@ -3907,9 +3908,31 @@ def claim_task(
             )
             return None
         candidate = conn.execute(
-            "SELECT status, project_id, task_kind FROM tasks WHERE id = ?",
+            "SELECT status, project_id, task_kind, assignee FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        normalized_execution_profile = (
+            str(execution_profile).strip() if execution_profile is not None else None
+        )
+        intended_profile = (
+            str(candidate["assignee"] or "").strip() if candidate is not None else ""
+        )
+        if (
+            candidate is not None
+            and normalized_execution_profile is not None
+            and normalized_execution_profile != intended_profile
+        ):
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {
+                    "reason": "execution_profile_mismatch",
+                    "assignee": intended_profile or None,
+                    "execution_profile": normalized_execution_profile or None,
+                },
+            )
+            return None
         project_cap = max_in_progress_per_project if (
             isinstance(max_in_progress_per_project, int)
             and max_in_progress_per_project > 0
@@ -3976,7 +3999,9 @@ def claim_task(
             """,
             (
                 task_id,
-                trow["assignee"] if trow else None,
+                normalized_execution_profile
+                if normalized_execution_profile is not None
+                else (trow["assignee"] if trow else None),
                 trow["current_step_key"] if trow else None,
                 lock,
                 expires,
@@ -4011,6 +4036,7 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    execution_profile: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -4028,6 +4054,33 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        candidate = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ? AND status = 'review'",
+            (task_id,),
+        ).fetchone()
+        normalized_execution_profile = (
+            str(execution_profile).strip() if execution_profile is not None else None
+        )
+        intended_profile = (
+            str(candidate["assignee"] or "").strip() if candidate is not None else ""
+        )
+        if (
+            candidate is not None
+            and normalized_execution_profile is not None
+            and normalized_execution_profile != intended_profile
+        ):
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {
+                    "reason": "execution_profile_mismatch",
+                    "assignee": intended_profile or None,
+                    "execution_profile": normalized_execution_profile or None,
+                    "source_status": "review",
+                },
+            )
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4058,7 +4111,9 @@ def claim_review_task(
             """,
             (
                 task_id,
-                trow["assignee"] if trow else None,
+                normalized_execution_profile
+                if normalized_execution_profile is not None
+                else (trow["assignee"] if trow else None),
                 trow["current_step_key"] if trow else None,
                 lock,
                 expires,
@@ -5319,11 +5374,11 @@ def block_task(
     un-typed block) drives routing instead of every block landing in one
     undifferentiated ``blocked`` bucket:
 
-    * ``dependency`` — the task is only waiting on another task. It does NOT
-      sit in ``blocked`` (where a cron would keep "unblocking" it); it goes to
-      ``todo`` so the existing parent-gating / ``recompute_ready`` machinery
-      promotes it automatically once its parents finish. No human, no cron, no
-      retry storm. This is Dale's "Type 2 — dependency blocked".
+    * ``dependency`` — when an unfinished parent link proves the dependency,
+      the task goes to ``todo`` so parent-gating promotes it once the parents
+      finish. Without an unfinished parent it stays in ``blocked``: treating an
+      ungrounded dependency claim as auto-resumable creates an immediate
+      block → promote → respawn loop.
 
     * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
@@ -5399,7 +5454,12 @@ def block_task(
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
-        if kind == "dependency":
+        dependency_is_parent_gated = kind == "dependency" and conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            (task_id,),
+        ).fetchone() is not None
+        if dependency_is_parent_gated:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -8200,6 +8260,7 @@ def _dispatch_once_locked(
             conn,
             row["id"],
             ttl_seconds=ttl_seconds,
+            execution_profile=row_assignee,
             max_in_progress_per_project=_per_project_cap,
         )
         if claimed is None:
@@ -8297,7 +8358,12 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            execution_profile=row["assignee"],
+        )
         if claimed is None:
             continue
         try:
@@ -9424,14 +9490,25 @@ def _install_blocked_delivery(
     notifier_profile = _intended_completion_notifier_profile(
         conn, task_id, run_id
     )
+    install_orchestration_route = orchestration_route is not None
     if orchestration_route is not None:
-        _assert_orchestration_route_profile(
-            conn,
-            task_id,
-            platform=orchestration_route[0],
-            chat_id=orchestration_route[1],
-            notifier_profile=notifier_profile,
-        )
+        existing_route = conn.execute(
+            "SELECT notifier_profile, last_message_id FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ''",
+            (task_id, orchestration_route[0], orchestration_route[1]),
+        ).fetchone()
+        if existing_route is not None:
+            route_owner = str(existing_route["notifier_profile"] or "").strip()
+            route_receipt = str(existing_route["last_message_id"] or "").strip()
+            if route_owner and route_owner != notifier_profile:
+                # Blocking is containment, not a terminal success claim. Keep
+                # the already-commissioned route truthful and persist the block
+                # instead of rolling the transaction back on an old run/profile
+                # mismatch. Completion actor binding remains strict.
+                notifier_profile = route_owner
+                install_orchestration_route = False
+            elif not route_owner and route_receipt:
+                install_orchestration_route = False
     # Durable pending placeholder for the blocked event, mirroring the
     # done-time row complete_task writes. Consumed by the notifier once the
     # real platform receipt lands (acknowledge_blocked_delivery).
@@ -9446,7 +9523,7 @@ def _install_blocked_delivery(
             int(created_at),
         ),
     )
-    if orchestration_route is not None:
+    if orchestration_route is not None and install_orchestration_route:
         _install_orchestration_completion_sub(
             conn,
             task_id,

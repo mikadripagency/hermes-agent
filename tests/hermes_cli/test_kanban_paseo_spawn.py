@@ -17,6 +17,7 @@ import json
 import subprocess
 
 import pytest
+import yaml
 
 pytestmark = pytest.mark.usefixtures("explicit_delivery_contract_for_kanban_fixtures")
 
@@ -43,15 +44,24 @@ def _make_task(kb, *, assignee: str = "w", task_id: str = "t_paseo", workspace_k
     )
 
 
-def _profile_home(tmp_path, monkeypatch, *, assignee: str = "w", paseo_cfg: str = ""):
+def _profile_home(
+    tmp_path,
+    monkeypatch,
+    *,
+    assignee: str = "w",
+    paseo_cfg: str = "",
+    provider_profile: str | None = None,
+):
     root = tmp_path / ".hermes"
     (root / "profiles" / assignee).mkdir(parents=True)
     (root / "profiles" / assignee / "config.yaml").write_text(
         "toolsets:\n  - kanban\n", encoding="utf-8"
     )
-    root.joinpath("config.yaml").write_text(
-        "toolsets:\n  - kanban\n" + paseo_cfg, encoding="utf-8"
+    config = yaml.safe_load("toolsets:\n  - kanban\n" + paseo_cfg) or {}
+    config.setdefault("kanban", {}).setdefault("paseo_spawn", {})["profile"] = (
+        provider_profile or assignee
     )
+    root.joinpath("config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
     return root
 
@@ -142,6 +152,7 @@ def test_enabled_healthy_launches_agent_with_contract(monkeypatch, tmp_path):
     joined = " ".join(run_cmd)
     assert "--label kanban_task=t_paseo" in joined
     assert "--label kanban_run=7" in joined
+    assert "--label kanban_profile=w" in joined
     assert "--label kanban_board=" in joined
     # Env contract flows via --env (task id -> kanban toolset auto-append).
     env_pairs = [run_cmd[i + 1] for i, a in enumerate(run_cmd) if a == "--env"]
@@ -207,7 +218,8 @@ def test_no_max_runtime_fallback_deadline_is_config_tunable(monkeypatch, tmp_pat
 
     root = _profile_home(tmp_path, monkeypatch)
     root.joinpath("config.yaml").write_text(
-        "toolsets:\n  - kanban\nkanban:\n  default_max_runtime_seconds: 10800\n",
+        "toolsets:\n  - kanban\nkanban:\n  default_max_runtime_seconds: 10800\n"
+        "  paseo_spawn:\n    profile: w\n",
         encoding="utf-8",
     )
     from hermes_cli import kanban_db as kb
@@ -233,7 +245,8 @@ def test_explicit_max_runtime_beats_configured_default(monkeypatch, tmp_path):
 
     root = _profile_home(tmp_path, monkeypatch)
     root.joinpath("config.yaml").write_text(
-        "toolsets:\n  - kanban\nkanban:\n  default_max_runtime_seconds: 10800\n",
+        "toolsets:\n  - kanban\nkanban:\n  default_max_runtime_seconds: 10800\n"
+        "  paseo_spawn:\n    profile: w\n",
         encoding="utf-8",
     )
     from hermes_cli import kanban_db as kb
@@ -349,6 +362,39 @@ def test_daemon_down_falls_back_to_default_spawn(monkeypatch, tmp_path):
     assert pid == 9999
 
 
+def test_provider_profile_mismatch_falls_back_before_paseo_spawn(monkeypatch, tmp_path):
+    """A default task cannot be claimed then launched by the developer provider."""
+    _profile_home(
+        tmp_path,
+        monkeypatch,
+        assignee="default",
+        provider_profile="developer",
+    )
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    fallback = []
+    monkeypatch.setattr(
+        kb,
+        "_default_spawn",
+        lambda task, workspace, *, board=None: fallback.append(
+            (task.assignee, workspace, board)
+        )
+        or 4242,
+    )
+    calls = _install_fake_paseo(monkeypatch)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    pid = paseo_spawn.spawn_via_paseo(
+        _make_task(kb, assignee="default"), str(workspace), board=None
+    )
+
+    assert pid == 4242
+    assert fallback == [("default", str(workspace), None)]
+    assert calls["status"] == [] and calls["run"] == []
+
+
 def test_actively_working_agent_reattaches_without_second_run(monkeypatch, tmp_path):
     """An ACTIVELY working labeled agent → watcher only: no archive, no new run."""
     _profile_home(tmp_path, monkeypatch)
@@ -372,6 +418,127 @@ def test_actively_working_agent_reattaches_without_second_run(monkeypatch, tmp_p
     assert "--watch" in watch_cmd
     assert watch_cmd[watch_cmd.index("--agent") + 1] == "ag_existing1"
     assert pid == 9999
+
+
+def test_active_agent_from_old_run_is_force_archived_before_fresh_spawn(
+    monkeypatch, tmp_path
+):
+    """A running agent is reusable only for the exact run and profile labels."""
+    _profile_home(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    calls = _install_fake_paseo(monkeypatch)
+    old = {"id": "ag_old", "status": "running"}
+
+    def list_agents(_bin, _task_id, *, run_id=None, profile=None):
+        return [old] if run_id is None and profile is None else []
+
+    monkeypatch.setattr(paseo_spawn, "_list_task_agents", list_agents)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    pid = paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
+
+    assert pid == 9999
+    assert len(calls["archive"]) == 1
+    assert calls["archive"][0][:3] == ["paseo", "archive", "ag_old"]
+    assert "--force" in calls["archive"][0]
+    assert len(calls["run"]) == 1
+
+
+def test_active_stale_agent_archive_failure_prevents_second_worker(
+    monkeypatch, tmp_path
+):
+    """A failed forced retirement cannot create two live workers for one task."""
+    _profile_home(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *a, **k: None)
+    calls = _install_fake_paseo(monkeypatch, archive_rc=1)
+    old = {"id": "ag_old", "status": "running"}
+    monkeypatch.setattr(
+        paseo_spawn,
+        "_list_task_agents",
+        lambda _bin, _task_id, *, run_id=None, profile=None: (
+            [old] if run_id is None and profile is None else []
+        ),
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    with pytest.raises(RuntimeError, match="could not retire active stale"):
+        paseo_spawn.spawn_via_paseo(_make_task(kb), str(workspace), board=None)
+
+    assert len(calls["archive"]) == 1
+    assert "--force" in calls["archive"][0]
+    assert calls["run"] == [] and calls["popen"] == []
+
+
+def test_superseded_run_retires_agent_before_watcher_reports_settled(monkeypatch):
+    """A reclaimed Paseo agent cannot keep using native shell after run advance."""
+    from hermes_cli import paseo_spawn
+
+    retired = []
+    monkeypatch.setattr(
+        paseo_spawn,
+        "_read_task_run_state",
+        lambda *_args: ("running", 8),
+    )
+    monkeypatch.setattr(
+        paseo_spawn,
+        "_archive_agent",
+        lambda paseo_bin, agent_id, task_id, *, force=False: retired.append(
+            (paseo_bin, agent_id, task_id, force)
+        ) or True,
+    )
+
+    result = paseo_spawn.watch_worker(
+        task_id="t_stale",
+        agent_id="ag_stale",
+        db_path="unused.db",
+        run_id=7,
+        paseo_bin="paseo",
+        poll_seconds=0,
+    )
+
+    assert result == paseo_spawn.WATCH_EXIT_TASK_SETTLED
+    assert retired == [("paseo", "ag_stale", "t_stale", True)]
+
+
+def test_watcher_sigterm_retires_daemon_agent_before_exit(monkeypatch):
+    """Manual reclaim kills the ACP agent, not only its local watcher PID."""
+    import signal
+
+    from hermes_cli import paseo_spawn
+
+    installed = []
+    retired = []
+    monkeypatch.setattr(
+        signal,
+        "signal",
+        lambda signum, handler: installed.append((signum, handler)),
+    )
+    monkeypatch.setattr(
+        paseo_spawn,
+        "_archive_agent",
+        lambda paseo_bin, agent_id, task_id, *, force=False: retired.append(
+            (paseo_bin, agent_id, task_id, force)
+        ) or True,
+    )
+
+    paseo_spawn._install_watch_termination_handler(
+        paseo_bin="paseo",
+        agent_id="ag_stale",
+        task_id="t_stale",
+    )
+
+    assert installed[0][0] == signal.SIGTERM
+    with pytest.raises(SystemExit, match=str(128 + int(signal.SIGTERM))):
+        installed[0][1](signal.SIGTERM, None)
+    assert retired == [("paseo", "ag_stale", "t_stale", True)]
 
 
 def test_idle_agent_archived_and_fresh_agent_spawned(monkeypatch, tmp_path):
@@ -1149,6 +1316,7 @@ def test_watch_exits_0_when_run_superseded(monkeypatch):
     """current_run_id moved past our run → our watch is stale → exit 0."""
     from hermes_cli import paseo_spawn
 
+    monkeypatch.setattr(paseo_spawn, "_archive_agent", lambda *args, **kwargs: True)
     rc, _ = _watch(
         paseo_spawn,
         monkeypatch,

@@ -202,7 +202,9 @@ def test_dependency_block_installs_no_delivery(kanban_home):
     """A dependency wait routes to todo and never gets a delivery/sub."""
     _write_channel_directory(kanban_home)
     with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="unfinished dependency", assignee="worker")
         tid = _running_task(conn)
+        kb.link_tasks(conn, parent_id=parent, child_id=tid)
         assert kb.block_task(conn, tid, reason="waiting on parent", kind="dependency")
         assert kb.get_task(conn, tid).status == "todo"
         # No 'blocked' event, no orchestration sub, no delivery ledger rows.

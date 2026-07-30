@@ -78,7 +78,7 @@ def test_unblock_does_not_reset_recurrence_counter(kanban_home: Path) -> None:
         assert kb.get_task(conn, tid).block_recurrences == 1
         assert kb.unblock_task(conn, tid)
         t = kb.get_task(conn, tid)
-        assert t.status == "ready"
+        assert t is not None and t.status == "running"
         assert t.block_recurrences == 1  # NOT reset to 0
         assert t.block_kind == "needs_input"  # kind preserved for comparison
 
@@ -143,11 +143,27 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
 def test_dependency_block_routes_to_todo(kanban_home: Path) -> None:
     """Dependency waits never enter the human 'blocked' bucket."""
     with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="unfinished parent", assignee="worker")
         tid = _running_task(conn)
+        kb.link_tasks(conn, parent_id=parent, child_id=tid)
         assert kb.block_task(conn, tid, reason="need X first", kind="dependency")
         t = kb.get_task(conn, tid)
         assert t.status == "todo"
         assert t.block_kind == "dependency"
+
+
+def test_dependency_without_open_parent_becomes_sticky_block(kanban_home: Path) -> None:
+    """A worker cannot turn a rejected capability block into a respawn loop."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+
+        assert kb.block_task(conn, tid, reason="missing owner capability", kind="dependency")
+        kb.recompute_ready(conn)
+
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "blocked"
+        assert task.block_kind == "dependency"
+        assert not any(event.kind == "dependency_wait" for event in kb.list_events(conn, tid))
 
 
 def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
