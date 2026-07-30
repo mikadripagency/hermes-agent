@@ -2348,6 +2348,23 @@ def terminal_tool(
                     "status": "blocked"
                 }, ensure_ascii=False)
 
+        if os.environ.get("HERMES_KANBAN_TASK") and re.search(
+            r"(?:^|[\s;&|])(?:nohup|setsid|disown)(?:\s|$)"
+            r"|\bos\.(?:fork|setsid)\s*\("
+            r"|start_new_session\s*=\s*True"
+            r"|(?:^|\s)&(?:\s|$)",
+            command,
+        ):
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": (
+                    "Kanban workers cannot detach child processes; run the "
+                    "command synchronously without fork/setsid/nohup/disown."
+                ),
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         # Prepare command for execution
         pty_disabled_reason = None
         effective_pty = pty

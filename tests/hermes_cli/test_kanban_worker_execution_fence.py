@@ -512,7 +512,23 @@ def test_kanban_worker_rejects_background_processes(
     )
 
     assert result["status"] == "blocked"
-    assert "foreground" in result["error"]
+    assert "cannot detach" in result["error"]
+
+    detached = json.loads(
+        terminal_tool(
+            "python3 -c 'import os,time; os.setsid(); time.sleep(30)'",
+            task_id="test",
+            workdir=str(tmp_path),
+        )
+    )
+    assert detached["status"] == "blocked"
+    assert "cannot detach" in detached["error"]
+
+    from tools.code_execution_tool import execute_code
+
+    nested = json.loads(execute_code("import os; os.fork()"))
+    assert nested["status"] == "blocked"
+    assert "cannot spawn or detach" in nested["error"]
 
 
 def test_non_transition_tools_remain_parallel(

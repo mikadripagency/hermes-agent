@@ -1156,6 +1156,25 @@ def execute_code(
     if not code or not code.strip():
         return tool_error("No code provided.")
 
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        import re
+
+        if re.search(
+            r"\bos\.(?:fork|forkpty|setsid|daemon)\s*\("
+            r"|start_new_session\s*=\s*True"
+            r"|\b(?:subprocess|multiprocessing)\b",
+            code,
+        ):
+            return json.dumps({
+                "status": "blocked",
+                "error": (
+                    "Kanban execute_code cannot spawn or detach subprocesses; "
+                    "use foreground Hermes tool calls instead."
+                ),
+                "tool_calls_made": 0,
+                "duration_seconds": 0,
+            }, ensure_ascii=False)
+
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
     _env_config = _get_env_config()

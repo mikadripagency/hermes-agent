@@ -6922,6 +6922,9 @@ def _terminate_reclaimed_worker(
             worker_pgid = int(process_group)
             info["process_group"] = worker_pgid
             kill = lambda _pid, sig: os.killpg(worker_pgid, sig)
+    if process_group is None and not _pid_alive(pid):
+        info["terminated"] = True
+        return info
     if kill is None:
         return info
 
@@ -7087,7 +7090,6 @@ def enforce_max_runtime(
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
     test hook; defaults to ``os.kill`` on POSIX.
     """
-    import signal
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -7365,207 +7367,139 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
+@fence_task_transition()
+def _release_crashed_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    pid: int,
+    claim_lock: str,
+) -> Optional[tuple[bool, bool, str]]:
+    """End one dead run while holding the same exclusive fence as takeover."""
+    kind, code = _classify_worker_exit(pid)
+    rate_limited_exit = kind == "rate_limited"
+    protocol_violation = kind == "clean_exit"
+    if protocol_violation:
+        error_text = (
+            "worker exited cleanly (rc=0) without calling "
+            "kanban_complete or kanban_block — protocol violation"
+        )
+        event_kind = "protocol_violation"
+        event_payload = {"pid": pid, "claimer": claim_lock, "exit_code": code}
+    elif rate_limited_exit:
+        error_text = (
+            f"pid {pid} exited rate-limited (quota wall) — "
+            "requeued without counting a failure"
+        )
+        event_kind = "rate_limited"
+        event_payload = {"pid": pid, "claimer": claim_lock, "exit_code": code}
+    else:
+        if kind == "nonzero_exit":
+            error_text = f"pid {pid} exited with code {code}"
+        elif kind == "signaled":
+            error_text = f"pid {pid} killed by signal {code}"
+        else:
+            error_text = f"pid {pid} not alive"
+        event_kind = "crashed"
+        event_payload = {"pid": pid, "claimer": claim_lock}
+        if code is not None and kind != "unknown":
+            event_payload["exit_kind"] = kind
+            event_payload["exit_code"] = code
+
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = 'running' "
+            "  AND worker_pid = ? AND claim_lock IS ?",
+            (task_id, pid, claim_lock),
+        )
+        if cur.rowcount != 1:
+            return None
+        run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome=run_outcome,
+            status=run_outcome,
+            error=error_text,
+            metadata=dict(event_payload),
+        )
+        _append_event(
+            conn, task_id, event_kind, event_payload, run_id=run_id,
+        )
+        if rate_limited_exit:
+            conn.execute(
+                "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                (error_text[:500], task_id),
+            )
+    return rate_limited_exit, protocol_violation, error_text
+
+
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
-    """Reclaim ``running`` tasks whose worker PID is no longer alive.
-
-    Appends a ``crashed`` event and drops the task back to ``ready``.
-    Different from ``release_stale_claims``: this checks liveness
-    immediately rather than waiting for the claim TTL.
-
-    Only considers tasks claimed by *this host* — PIDs from other hosts
-    are meaningless here. The host-local check is enough because
-    ``_default_spawn`` always runs the worker on the same host as the
-    dispatcher (the whole design is single-host).
-
-    When the reap registry shows the worker exited cleanly (rc=0) but
-    the task was still ``running`` in the DB, treat it as a protocol
-    violation (worker answered conversationally without calling
-    ``kanban_complete`` / ``kanban_block``) and trip the circuit breaker
-    on the first occurrence — retrying a worker whose CLI keeps
-    returning 0 without a terminal transition just loops forever.
-
-    When the reap registry shows the worker exited with the rate-limit
-    sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
-    provider quota wall, NOT a task failure. Such tasks are released back
-    to ``ready`` WITHOUT counting a failure (so a long quota window can't
-    trip the breaker) and stamped with a quota-blocker error so
-    ``check_respawn_guard`` defers their respawn until the window clears.
-    The ids are returned via the ``_last_rate_limited`` function attribute
-    (the public return stays the crashed-only ``list[str]``).
-    """
+    """Reclaim dead host-local workers without advancing past live effects."""
     crashed: list[str] = []
     rate_limited: list[str] = []
-    # Per-crash details collected inside the main txn, used after it
-    # closes to run ``_record_task_failure`` (which needs its own
-    # write_txn so can't nest). ``protocol_violation`` flags the
-    # clean-exit-but-still-running case so we can trip the breaker
-    # immediately instead of incrementing by 1.
     crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
-    with write_txn(conn):
-        rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
-        ).fetchall()
-        host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-        for row in rows:
-            # Only check liveness for claims owned by this host.
-            lock = row["claim_lock"] or ""
-            if not lock.startswith(host_prefix):
-                continue
-            # Skip liveness check inside the launch-window grace period
-            # so a freshly-spawned worker isn't reclaimed before its PID
-            # is visible on /proc.
-            started_at = row["started_at"] if "started_at" in row.keys() else None
-            if started_at is not None:
-                grace = _resolve_crash_grace_seconds()
-                if time.time() - started_at < grace:
-                    continue
-            if _pid_alive(row["worker_pid"]):
-                continue
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    rows = conn.execute(
+        "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+        "WHERE status = 'running' AND worker_pid IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        claim_lock = row["claim_lock"] or ""
+        if not claim_lock.startswith(host_prefix):
+            continue
+        started_at = row["started_at"] if "started_at" in row.keys() else None
+        if (
+            started_at is not None
+            and time.time() - started_at < _resolve_crash_grace_seconds()
+        ):
+            continue
+        if _pid_alive(row["worker_pid"]):
+            continue
 
-            pid = int(row["worker_pid"])
-            termination = _terminate_reclaimed_worker(pid, row["claim_lock"])
-            if _worker_survived_termination(termination):
-                # A crashed leader can leave detached group members alive.
-                # Keep the claim until those external effects are retired.
-                continue
-            kind, code = _classify_worker_exit(pid)
-            rate_limited_exit = False
-            if kind == "clean_exit":
-                # Worker subprocess returned 0 but its task is still
-                # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Retrying won't
-                # help.
-                protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation"
-                )
-                event_kind = "protocol_violation"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                }
-            elif kind == "rate_limited":
-                # Worker bailed because the provider rate-limited / exhausted
-                # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
-                # the task is fine, the account just hit a wall. Release it
-                # back to ``ready`` so the respawn guard defers it until the
-                # quota window clears, and crucially do NOT count a failure
-                # (skip ``_record_task_failure``) so a long quota window can't
-                # trip the circuit breaker and permanently block the card.
-                protocol_violation = False
-                rate_limited_exit = True
-                error_text = (
-                    f"pid {pid} exited rate-limited (quota wall) — "
-                    f"requeued without counting a failure"
-                )
-                event_kind = "rate_limited"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                }
-            else:
-                protocol_violation = False
-                if kind == "nonzero_exit":
-                    error_text = f"pid {pid} exited with code {code}"
-                elif kind == "signaled":
-                    error_text = f"pid {pid} killed by signal {code}"
-                else:
-                    error_text = f"pid {pid} not alive"
-                event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
-                if code is not None and kind != "unknown":
-                    event_payload["exit_kind"] = kind
-                    event_payload["exit_code"] = code
+        pid = int(row["worker_pid"])
+        termination = _terminate_reclaimed_worker(pid, claim_lock)
+        if _worker_survived_termination(termination):
+            continue
+        released = _release_crashed_worker(
+            conn, row["id"], pid=pid, claim_lock=claim_lock,
+        )
+        if released is None:
+            continue
+        rate_limited_exit, protocol_violation, error_text = released
+        if rate_limited_exit:
+            rate_limited.append(row["id"])
+        else:
+            crashed.append(row["id"])
+            crash_details.append(
+                (row["id"], pid, claim_lock, protocol_violation, error_text)
+            )
 
-            with task_run_lock(
-                database_path(conn), row["id"], exclusive=True
-            ):
-                cur = conn.execute(
-                    "UPDATE tasks SET status = 'running', claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL "
-                    "WHERE id = ? AND status = 'running' "
-                    "  AND worker_pid = ? AND claim_lock IS ?",
-                    (row["id"], pid, row["claim_lock"]),
-                )
-            if cur.rowcount == 1:
-                # Rate-limited requeues are a clean release, not a crash —
-                # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
-                run_id = _end_run(
-                    conn, row["id"],
-                    outcome=_run_outcome, status=_run_outcome,
-                    error=error_text,
-                    metadata=dict(event_payload),
-                )
-                _append_event(
-                    conn, row["id"], event_kind,
-                    event_payload,
-                    run_id=run_id,
-                )
-                if rate_limited_exit:
-                    # Stamp the failure-error column so ``check_respawn_guard``
-                    # recognizes this as a quota blocker and defers the
-                    # respawn until the window clears — WITHOUT touching
-                    # ``consecutive_failures`` (that's the whole point: no
-                    # breaker trip on a throttle).
-                    conn.execute(
-                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-                        (error_text[:500], row["id"]),
-                    )
-                    rate_limited.append(row["id"])
-                else:
-                    crashed.append(row["id"])
-                    crash_details.append(
-                        (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
-                    )
-    # Outside the main txn: increment the unified failure counter for
-    # each crashed task. If the breaker trips, the task transitions
-    # ready → blocked with a ``gave_up`` event on top of the ``crashed``
-    # event we already emitted.
-    #
-    # Protocol-violation crashes force an immediate trip (failure_limit=1)
-    # because clean-exit-without-transition is deterministic: the next
-    # respawn will do exactly the same thing. Better to surface to a
-    # human with a clear reason than to loop ``DEFAULT_FAILURE_LIMIT``
-    # times first.
     auto_blocked: list[str] = []
     if crash_details:
-        # Fingerprint errors to detect systemic failures.
-        _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
-            fp = _error_fingerprint(err_text)
-            _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
+        fingerprint_counts: dict[str, int] = {}
+        for _, _, _, _, error_text in crash_details:
+            fingerprint = _error_fingerprint(error_text)
+            fingerprint_counts[fingerprint] = fingerprint_counts.get(fingerprint, 0) + 1
         for tid, pid, claimer, protocol_violation, error_text in crash_details:
-            fp = _error_fingerprint(error_text)
             is_systemic = (
                 not protocol_violation
-                and _fp_counts.get(fp, 0) >= 3
+                and fingerprint_counts.get(_error_fingerprint(error_text), 0) >= 3
             )
-            tripped = _record_task_failure(
-                conn, tid,
+            if _record_task_failure(
+                conn,
+                tid,
                 error=error_text,
                 outcome="crashed",
                 failure_limit=1 if (protocol_violation or is_systemic) else None,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
-            )
-            if tripped:
+            ):
                 auto_blocked.append(tid)
-    # Stash auto-blocked ids on the function for the dispatch loop to pick up.
-    # Keeps the public return type (``list[str]``) stable for direct callers
-    # and tests that destructure the result; ``dispatch_once`` reads this
-    # side-channel attribute to populate ``DispatchResult.auto_blocked``.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
-    # Same side-channel for rate-limited requeues — these did NOT count a
-    # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
     return crashed
 
