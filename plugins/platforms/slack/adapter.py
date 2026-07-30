@@ -62,6 +62,8 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
 
 logger = logging.getLogger(__name__)
 
+_SOCKET_TASK_UNSET = object()
+
 # ContextVar carrying the user_id of the slash-command invoker.
 # Set in _handle_slash_command, read in send() to match the correct
 # stashed response_url when multiple users issue commands on the same
@@ -489,6 +491,10 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        self._socket_reconnect_attempts = 0
+        self._socket_reconnect_base_delay_s = 30.0
+        self._socket_reconnect_max_delay_s = 300.0
+        self._socket_reconnect_max_attempts = 10
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
@@ -553,7 +559,11 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return None
 
-    async def _restart_socket_mode(self, reason: str) -> None:
+    async def _restart_socket_mode(
+        self,
+        reason: str,
+        observed_task: object = _SOCKET_TASK_UNSET,
+    ) -> None:
         """Reconnect Socket Mode without rebuilding adapter state."""
         if not self._running:
             return
@@ -562,7 +572,55 @@ class SlackAdapter(BasePlatformAdapter):
             if not self._running or not self._app or not self._app_token:
                 return
 
-            logger.warning("[Slack] Socket Mode unhealthy (%s); reconnecting", reason)
+            # The done-callback and watchdog can report the same failed task.
+            # Ignore the later report if another caller already replaced it.
+            if (
+                observed_task is not _SOCKET_TASK_UNSET
+                and observed_task is not self._socket_mode_task
+            ):
+                return
+
+            if self._socket_reconnect_attempts >= self._socket_reconnect_max_attempts:
+                message = (
+                    "Slack Socket Mode reconnect failed "
+                    f"{self._socket_reconnect_attempts} times; handing off to "
+                    "the gateway reconnect supervisor"
+                )
+                logger.error("[Slack] %s", message)
+                await self._stop_socket_mode_handler()
+                self._set_fatal_error(
+                    "slack_socket_reconnect_exhausted",
+                    message,
+                    retryable=True,
+                )
+                try:
+                    await self._notify_fatal_error()
+                except Exception:  # pragma: no cover - defensive logging
+                    logger.warning(
+                        "[Slack] Failed to notify gateway supervisor after "
+                        "Socket Mode reconnect exhaustion",
+                        exc_info=True,
+                    )
+                return
+
+            attempt = self._socket_reconnect_attempts + 1
+            delay = min(
+                self._socket_reconnect_base_delay_s * (2 ** (attempt - 1)),
+                self._socket_reconnect_max_delay_s,
+            )
+            logger.warning(
+                "[Slack] Socket Mode unhealthy (%s); reconnect attempt %d/%d "
+                "in %.1fs",
+                reason,
+                attempt,
+                self._socket_reconnect_max_attempts,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            if not self._running or not self._app or not self._app_token:
+                return
+
+            self._socket_reconnect_attempts = attempt
             await self._stop_socket_mode_handler()
 
             try:
@@ -587,16 +645,28 @@ class SlackAdapter(BasePlatformAdapter):
 
                 task = self._socket_mode_task
                 if task is None:
-                    await self._restart_socket_mode("socket task missing")
+                    await self._restart_socket_mode(
+                        "socket task missing", observed_task=task
+                    )
                     continue
 
                 if task.done():
-                    await self._restart_socket_mode("socket task stopped")
+                    await self._restart_socket_mode(
+                        "socket task stopped", observed_task=task
+                    )
                     continue
 
                 connected = await self._socket_transport_connected()
                 if connected is False:
-                    await self._restart_socket_mode("transport disconnected")
+                    await self._restart_socket_mode(
+                        "transport disconnected", observed_task=task
+                    )
+                elif self._socket_reconnect_attempts:
+                    logger.info(
+                        "[Slack] Socket Mode healthy after %d reconnect attempt(s)",
+                        self._socket_reconnect_attempts,
+                    )
+                    self._socket_reconnect_attempts = 0
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
@@ -661,7 +731,9 @@ class SlackAdapter(BasePlatformAdapter):
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(self._restart_socket_mode("socket task exited"))
+        loop.create_task(
+            self._restart_socket_mode("socket task exited", observed_task=task)
+        )
 
     def _describe_slack_api_error(
         self, response: Any, *, file_obj: Optional[Dict[str, Any]] = None
@@ -1260,7 +1332,8 @@ class SlackAdapter(BasePlatformAdapter):
             # let the ``finally`` block release the platform lock cleanly.
             try:
                 self._start_socket_mode_handler()
-                self._running = True
+                self._socket_reconnect_attempts = 0
+                self._mark_connected()
                 self._ensure_socket_watchdog()
             except Exception:
                 self._running = False
