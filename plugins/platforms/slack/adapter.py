@@ -13,6 +13,7 @@ import contextvars
 import json
 import logging
 import os
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -489,6 +490,8 @@ class SlackAdapter(BasePlatformAdapter):
         self._app_token: Optional[str] = None
         self._proxy_url: Optional[str] = None
         self._socket_watchdog_task: Optional[asyncio.Task] = None
+        self._socket_restart_tasks: set[asyncio.Task] = set()
+        self._socket_connection_generation = 0
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
         self._socket_reconnect_attempts = 0
@@ -501,6 +504,7 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._app or not self._app_token:
             raise RuntimeError("Socket Mode requires an initialized app and app token")
 
+        self._socket_connection_generation += 1
         self._handler = AsyncSocketModeHandler(
             self._app, self._app_token, proxy=self._proxy_url
         )
@@ -537,6 +541,20 @@ class SlackAdapter(BasePlatformAdapter):
                 logger.debug(
                     "[Slack] Socket Mode task failed while stopping", exc_info=True
                 )
+
+    async def _cancel_socket_restart_tasks(self) -> None:
+        """Cancel delayed done-callback reconnects owned by this adapter."""
+        current = asyncio.current_task()
+        tasks = [
+            task
+            for task in self._socket_restart_tasks
+            if task is not current and not task.done()
+        ]
+        self._socket_restart_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _socket_transport_connected(self) -> Optional[bool]:
         """Best-effort check of current Socket Mode transport state."""
@@ -580,6 +598,13 @@ class SlackAdapter(BasePlatformAdapter):
             ):
                 return
 
+            current_task = self._socket_mode_task
+            if current_task is not None and not current_task.done():
+                connected = await self._socket_transport_connected()
+                if connected is True:
+                    self._socket_reconnect_attempts = 0
+                    return
+
             if self._socket_reconnect_attempts >= self._socket_reconnect_max_attempts:
                 message = (
                     "Slack Socket Mode reconnect failed "
@@ -604,10 +629,13 @@ class SlackAdapter(BasePlatformAdapter):
                 return
 
             attempt = self._socket_reconnect_attempts + 1
-            delay = min(
+            base_delay = min(
                 self._socket_reconnect_base_delay_s * (2 ** (attempt - 1)),
                 self._socket_reconnect_max_delay_s,
             )
+            # Jitter below the cap so capped attempts do not synchronize at
+            # exactly 300s after a shared network outage.
+            delay = base_delay * (0.8 + 0.2 * random.random())
             logger.warning(
                 "[Slack] Socket Mode unhealthy (%s); reconnect attempt %d/%d "
                 "in %.1fs",
@@ -616,12 +644,20 @@ class SlackAdapter(BasePlatformAdapter):
                 self._socket_reconnect_max_attempts,
                 delay,
             )
+
+            # Stop the SDK client before waiting. Its internal auto-reconnect
+            # loop otherwise keeps dialing during DNS/TLS blackholes.
+            generation = self._socket_connection_generation
+            await self._stop_socket_mode_handler()
             await asyncio.sleep(delay)
             if not self._running or not self._app or not self._app_token:
                 return
+            if generation != self._socket_connection_generation:
+                return
+            if self._socket_mode_task is not None:
+                return
 
             self._socket_reconnect_attempts = attempt
-            await self._stop_socket_mode_handler()
 
             try:
                 self._start_socket_mode_handler()
@@ -731,9 +767,11 @@ class SlackAdapter(BasePlatformAdapter):
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(
+        restart_task = loop.create_task(
             self._restart_socket_mode("socket task exited", observed_task=task)
         )
+        self._socket_restart_tasks.add(restart_task)
+        restart_task.add_done_callback(self._socket_restart_tasks.discard)
 
     def _describe_slack_api_error(
         self, response: Any, *, file_obj: Optional[Dict[str, Any]] = None
@@ -1084,6 +1122,8 @@ class SlackAdapter(BasePlatformAdapter):
                 return False
             lock_acquired = True
             self._running = False
+            self._socket_connection_generation += 1
+            await self._cancel_socket_restart_tasks()
 
             # Tear down any prior reconnect state before flipping ``_running``
             # back on. We must cancel + await the existing watchdog (not just
@@ -1404,6 +1444,8 @@ class SlackAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Slack."""
         self._running = False
+        self._socket_connection_generation += 1
+        await self._cancel_socket_restart_tasks()
 
         watchdog_task = self._socket_watchdog_task
         self._socket_watchdog_task = None
