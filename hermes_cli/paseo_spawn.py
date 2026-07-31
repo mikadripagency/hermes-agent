@@ -534,17 +534,35 @@ def _resolve_task_workspace_id(paseo_bin: str, task, workspace: str, log_f) -> O
         return None
 
 
-def _worker_env_delta(env: dict) -> dict:
-    """Vars ``_build_worker_env`` added/changed vs the ambient environment.
+_WORKER_ENV_KEYS = (
+    "HERMES_HOME",
+    "HERMES_TENANT",
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_BRANCH",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_CLAIM_LOCK",
+    "HERMES_KANBAN_GOAL_MODE",
+    "HERMES_KANBAN_GOAL_MAX_TURNS",
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_BOARD",
+    "HERMES_PROFILE",
+    "TERMINAL_CWD",
+    "TERMINAL_TIMEOUT",
+    "TERMINAL_MAX_FOREGROUND_TIMEOUT",
+)
 
-    ``paseo run --env`` *adds* vars to the agent's provider process, which is
-    spawned by the paseo daemon (it already has a base environment). Passing the
-    full ``os.environ`` would both bloat the argv and leak unrelated dispatcher
-    state; the meaningful "worker contract" is exactly the set of vars the
-    builder set or overrode, so we diff against the ambient env.
+
+def _worker_env_contract(env: dict) -> dict:
+    """Return the complete allowlisted worker contract for the Paseo daemon.
+
+    ``paseo run --env`` adds vars to a provider process spawned under the
+    daemon's environment, not the dispatcher's. Contract keys must therefore be
+    sent even when their values equal the dispatcher's ambient values. The
+    explicit allowlist keeps unrelated ambient state and secrets out of argv.
     """
-    base = os.environ
-    return {k: v for k, v in env.items() if base.get(k) != v}
+    return {key: env[key] for key in _WORKER_ENV_KEYS if key in env}
 
 
 def _launch_agent(
@@ -591,7 +609,7 @@ def _launch_agent(
         cmd.extend(["--mode", mode])
     for key, value in labels:
         cmd.extend(["--label", f"{key}={value}"])
-    for key, value in _worker_env_delta(env).items():
+    for key, value in _worker_env_contract(env).items():
         cmd.extend(["--env", f"{key}={value}"])
     cmd.append(prompt)
 
