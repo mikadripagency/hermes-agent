@@ -14,6 +14,7 @@ plus one real-subprocess end-to-end run against a real kanban DB.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 
 import pytest
@@ -182,6 +183,53 @@ def test_enabled_healthy_launches_agent_with_contract(monkeypatch, tmp_path):
     # Deadline ≈ now + max_runtime + slack.
     deadline = float(watch_cmd[watch_cmd.index("--deadline") + 1])
     assert abs(deadline - (_time.time() + 1800 + 300)) < 60
+
+
+def test_worker_contract_is_sent_even_when_it_matches_dispatcher_ambient(
+    monkeypatch, tmp_path
+):
+    """Paseo gets the allowlisted contract, not an ambient-env delta."""
+    _profile_home(tmp_path, monkeypatch, assignee="developer")
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import paseo_spawn
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    contract = {
+        "HERMES_HOME": str(tmp_path / "profile-home"),
+        "HERMES_TENANT": "tenant-a",
+        "HERMES_KANBAN_DB": str(tmp_path / "kanban.db"),
+        "HERMES_KANBAN_TASK": "t_paseo",
+        "HERMES_KANBAN_WORKSPACE": str(workspace),
+        "HERMES_KANBAN_BRANCH": "task-branch",
+        "HERMES_KANBAN_RUN_ID": "7",
+        "HERMES_KANBAN_CLAIM_LOCK": "claim-lock",
+        "HERMES_KANBAN_GOAL_MODE": "1",
+        "HERMES_KANBAN_GOAL_MAX_TURNS": "12",
+        "HERMES_KANBAN_BOARD": "default",
+        "HERMES_KANBAN_WORKSPACES_ROOT": str(tmp_path / "workspaces"),
+        "HERMES_PROFILE": "developer",
+        "TERMINAL_CWD": str(workspace),
+        "TERMINAL_TIMEOUT": "1800",
+        "TERMINAL_MAX_FOREGROUND_TIMEOUT": "1800",
+    }
+    for key, value in contract.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("UNRELATED_API_KEY", "must-not-reach-paseo")
+
+    worker_env = dict(os.environ)
+    monkeypatch.setattr(kb, "_build_worker_env", lambda *args, **kwargs: worker_env)
+    monkeypatch.setattr(paseo_spawn, "_record_linkage_comment", lambda *args, **kwargs: None)
+    calls = _install_fake_paseo(monkeypatch)
+
+    paseo_spawn.spawn_via_paseo(
+        _make_task(kb, assignee="developer"), str(workspace), board=None
+    )
+
+    run_cmd = calls["run"][0]
+    env_pairs = [run_cmd[i + 1] for i, arg in enumerate(run_cmd) if arg == "--env"]
+    assert set(env_pairs) == {f"{key}={value}" for key, value in contract.items()}
+    assert not any(pair.startswith("UNRELATED_API_KEY=") for pair in env_pairs)
 
 
 def test_no_max_runtime_derives_fallback_deadline(monkeypatch, tmp_path):
