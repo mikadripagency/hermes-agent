@@ -752,6 +752,7 @@ class TestSlackSocketWatchdog:
                 assert await adapter.connect() is True
                 baseline = len(instances)
                 observed_task = adapter._socket_mode_task
+                instances[-1].client.is_connected = lambda: False
 
                 await asyncio.gather(
                     adapter._restart_socket_mode(
@@ -776,22 +777,124 @@ class TestSlackSocketWatchdog:
         adapter._app = MagicMock()
         adapter._app_token = "xapp-fake"
         adapter._socket_reconnect_max_attempts = 99
+        order = []
+
+        async def stop_handler():
+            order.append("stop")
+
+        async def sleep(delay):
+            order.append(("sleep", delay))
+
+        adapter._stop_socket_mode_handler = AsyncMock(side_effect=stop_handler)
+        adapter._start_socket_mode_handler = MagicMock()
+
+        with (
+            patch.object(_slack_mod.asyncio, "sleep", side_effect=sleep) as sleep_mock,
+            patch.object(_slack_mod.random, "random", return_value=0.5),
+        ):
+            for _ in range(6):
+                await adapter._restart_socket_mode("socket task stopped")
+
+        assert [awaited.args[0] for awaited in sleep_mock.await_args_list] == [
+            27.0,
+            54.0,
+            108.0,
+            216.0,
+            270.0,
+            270.0,
+        ]
+        assert order[::2] == ["stop"] * 6
+        assert adapter._start_socket_mode_handler.call_count == 6
+
+    @pytest.mark.asyncio
+    async def test_reconnect_leaves_transport_that_recovered_before_teardown(self):
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._running = True
+        adapter._app = MagicMock()
+        adapter._app_token = "xapp-fake"
+        observed_task = MagicMock(done=MagicMock(return_value=False))
+        adapter._socket_mode_task = observed_task
+        adapter._socket_reconnect_attempts = 2
+        adapter._socket_transport_connected = AsyncMock(return_value=True)
         adapter._stop_socket_mode_handler = AsyncMock()
         adapter._start_socket_mode_handler = MagicMock()
 
         with patch.object(_slack_mod.asyncio, "sleep", new_callable=AsyncMock) as sleep:
-            for _ in range(6):
-                await adapter._restart_socket_mode("socket task stopped")
+            await adapter._restart_socket_mode(
+                "transport disconnected", observed_task=observed_task
+            )
 
-        assert [awaited.args[0] for awaited in sleep.await_args_list] == [
-            30.0,
-            60.0,
-            120.0,
-            240.0,
-            300.0,
-            300.0,
-        ]
-        assert adapter._start_socket_mode_handler.call_count == 6
+        sleep.assert_not_awaited()
+        adapter._stop_socket_mode_handler.assert_not_awaited()
+        adapter._start_socket_mode_handler.assert_not_called()
+        assert adapter._socket_reconnect_attempts == 0
+
+    @pytest.mark.asyncio
+    async def test_reconnect_does_not_replace_new_handler_installed_during_backoff(self):
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._running = True
+        adapter._app = MagicMock()
+        adapter._app_token = "xapp-fake"
+        observed_task = MagicMock(done=MagicMock(return_value=False))
+        replacement_task = MagicMock(done=MagicMock(return_value=False))
+        adapter._socket_mode_task = observed_task
+        stopped_tasks = []
+
+        async def stop_handler():
+            stopped_tasks.append(adapter._socket_mode_task)
+            adapter._socket_mode_task = None
+
+        async def install_replacement(_delay):
+            adapter._socket_mode_task = replacement_task
+
+        adapter._stop_socket_mode_handler = AsyncMock(side_effect=stop_handler)
+        adapter._start_socket_mode_handler = MagicMock()
+
+        with (
+            patch.object(_slack_mod.asyncio, "sleep", side_effect=install_replacement),
+            patch.object(_slack_mod.random, "random", return_value=0.0),
+        ):
+            await adapter._restart_socket_mode(
+                "transport disconnected", observed_task=observed_task
+            )
+
+        assert stopped_tasks == [observed_task]
+        assert adapter._socket_mode_task is replacement_task
+        adapter._start_socket_mode_handler.assert_not_called()
+        assert adapter._socket_reconnect_attempts == 0
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_done_callback_reconnect_delay(self):
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._running = True
+        adapter._app = MagicMock()
+        adapter._app_token = "xapp-fake"
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def delayed_restart(*_args, **_kwargs):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        adapter._restart_socket_mode = delayed_restart
+
+        async def complete():
+            return None
+
+        socket_task = asyncio.create_task(complete())
+        await socket_task
+        adapter._socket_mode_task = socket_task
+        adapter._on_socket_mode_task_done(socket_task)
+        await entered.wait()
+
+        await adapter.disconnect()
+
+        assert cancelled.is_set()
+        assert not adapter._socket_restart_tasks
 
     @pytest.mark.asyncio
     async def test_reconnect_exhaustion_escalates_to_gateway_supervisor(self):
