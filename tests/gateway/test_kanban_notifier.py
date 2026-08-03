@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 
 from gateway.config import Platform
 from gateway.kanban_watchers import (
@@ -10,6 +11,12 @@ from gateway.kanban_watchers import (
 )
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
+
+
+pytestmark = pytest.mark.usefixtures(
+    "explicit_delivery_contract_for_kanban_fixtures",
+    "claimed_completion_for_kanban_fixtures",
+)
 
 
 class RecordingAdapter:
@@ -575,42 +582,66 @@ def test_notifier_uses_active_profile_adapter_for_matching_owner(tmp_path, monke
     assert [item["text"] for item in adapter.sent] == ["active profile fertig."]
 
 
-def test_developer_slack_completion_with_blank_profile_stays_pending(tmp_path, monkeypatch):
+def test_developer_slack_completion_claims_blank_origin_and_delivers_once(tmp_path, monkeypatch):
     db_path = tmp_path / "blank-developer-profile.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="blank route", assignee="developer")
-        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="CORCH")
-        kb.complete_task(conn, tid, summary="done")
+        tid = kb.create_task(
+            conn,
+            title="blank route",
+            assignee="developer",
+            evidence_contract_na_reason="notifier regression fixture",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="slack",
+            chat_id="DORIGIN",
+            thread_id="123.456",
+        )
+        claimed = kb.claim_task(conn, tid, claimer="developer-test")
+        assert claimed is not None
+        kb.complete_task(
+            conn,
+            tid,
+            summary=f"{tid}/run {claimed.current_run_id} · done",
+            expected_run_id=claimed.current_run_id,
+        )
         event_id = next(ev.id for ev in kb.list_events(conn, tid) if ev.kind == "completed")
     finally:
         conn.close()
 
-    default_adapter = RecordingAdapter(profile="default", actor="BDEFAULT")
-    runner = _make_runner(default_adapter, Platform.SLACK)
-    runner._kanban_notifier_profile = "default"
+    developer_adapter = RecordingAdapter(profile="developer", actor="BDEVELOPER")
+    runner = _make_runner(developer_adapter, Platform.SLACK)
+    runner._kanban_notifier_profile = "developer"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    runner._running = True
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert default_adapter.sent == []
+    assert len(developer_adapter.sent) == 1
+    assert developer_adapter.sent[0]["chat_id"] == "DORIGIN"
+    assert developer_adapter.sent[0]["metadata"]["thread_id"] == "123.456"
+    assert developer_adapter.sent[0]["metadata"]["client_msg_id"]
     conn = kb.connect()
     try:
         delivery = conn.execute(
             "SELECT state, notifier_profile, receipt_id FROM completion_deliveries "
-            "WHERE event_id = ? AND chat_id = 'CORCH'",
+            "WHERE event_id = ? AND chat_id = 'DORIGIN'",
             (event_id,),
         ).fetchone()
         sub = kb.list_notify_subs(conn, tid)[0]
     finally:
         conn.close()
     assert dict(delivery) == {
-        "state": "pending",
-        "notifier_profile": "",
-        "receipt_id": None,
+        "state": "acknowledged",
+        "notifier_profile": "developer",
+        "receipt_id": "1783796000.123456",
     }
-    assert sub["last_message_id"] is None
-    assert sub["last_event_id"] == 0
+    assert sub["notifier_profile"] == "developer"
+    assert sub["last_message_id"] == "1783796000.123456"
+    assert sub["last_event_id"] == event_id
 
 
 def test_developer_slack_completion_rejects_wrong_profile_actor(tmp_path, monkeypatch):
