@@ -587,6 +587,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_review_bind.add_argument("--head-sha", required=True)
     p_review_bind.add_argument("--integration-sha", required=True)
 
+    p_deploy_gate = sub.add_parser(
+        "deploy-gate", help="Fail unless a deploy matches the current bound review"
+    )
+    p_deploy_gate.add_argument("task_id")
+    p_deploy_gate.add_argument("--repository", required=True, metavar="OWNER/REPO")
+    p_deploy_gate.add_argument("--reviewed-sha", required=True)
+    p_deploy_gate.add_argument("--integration-sha", required=True)
+
     p_edit = sub.add_parser(
         "edit",
         help="Edit recovery fields on an already-completed task",
@@ -1037,6 +1045,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "review-record": _cmd_review_record,
             "review-gate": _cmd_review_gate,
             "review-bind": _cmd_review_bind,
+            "deploy-gate": _cmd_deploy_gate,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
@@ -2100,6 +2109,26 @@ def _cmd_review_bind(args: argparse.Namespace) -> int:
     print(
         f"REVIEW_INTEGRATION_BOUND task={args.task_id} "
         f"head={args.head_sha} integration={args.integration_sha}"
+    )
+    return 0
+
+
+def _cmd_deploy_gate(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        run_id = _terminal_run_id_for(conn, args.task_id)
+        if run_id is None:
+            raise RuntimeError("deploy review gate requires a running delivery task")
+        kb.assert_deploy_review_gate(
+            conn,
+            args.task_id,
+            repository=args.repository,
+            reviewed_sha=args.reviewed_sha,
+            integration_sha=args.integration_sha,
+            expected_run_id=run_id,
+        )
+    print(
+        f"DEPLOY_REVIEW_GATE_PASS task={args.task_id} "
+        f"reviewed={args.reviewed_sha} integration={args.integration_sha}"
     )
     return 0
 

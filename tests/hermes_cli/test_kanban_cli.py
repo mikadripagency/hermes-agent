@@ -170,6 +170,38 @@ def test_run_slash_review_gate_is_sha_scoped_and_fail_closed(kanban_home):
     )
 
 
+def test_run_slash_deploy_gate_requires_current_review_and_integration(kanban_home):
+    head_sha = "a" * 40
+    merge_sha = "b" * 40
+    repository = "Pryapus/Drip-Research-Hub"
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="deploy reviewed delivery",
+            assignee="default",
+            required_evidence=["pr_merged"],
+        )
+        assert kb.claim_task(conn, task_id) is not None
+
+    command = (
+        f"deploy-gate {task_id} --repository {repository} "
+        f"--reviewed-sha {head_sha} --integration-sha {merge_sha}"
+    )
+    assert "missing review receipt" in kc.run_slash(command)
+
+    kc.run_slash(
+        f"review-record {task_id} --repository {repository} --head-sha {head_sha} "
+        "--verdict passed --findings-json '[]'"
+    )
+    assert "final integration SHA is not bound" in kc.run_slash(command)
+
+    kc.run_slash(
+        f"review-bind {task_id} --repository {repository} --head-sha {head_sha} "
+        f"--integration-sha {merge_sha}"
+    )
+    assert "DEPLOY_REVIEW_GATE_PASS" in kc.run_slash(command)
+
+
 def test_run_slash_reopen_recovers_same_completed_card(kanban_home):
     import re
 
