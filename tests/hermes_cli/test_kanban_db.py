@@ -2318,6 +2318,17 @@ def test_review_gate_binds_review_findings_and_integration_sha(
         claimed = kb.claim_task(conn, task_id, claimer="test:owner")
         assert claimed is not None and claimed.current_run_id is not None
 
+        with pytest.raises(kb.ReviewGateError, match="task/run identity"):
+            kb.record_review_receipt(
+                conn,
+                task_id,
+                repository=repository,
+                reviewed_sha=reviewed_sha,
+                verdict="passed",
+                findings=[],
+                expected_run_id=claimed.current_run_id + 1,
+            )
+
         kb.record_review_receipt(
             conn,
             task_id,
