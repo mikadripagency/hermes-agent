@@ -2446,6 +2446,13 @@ def test_non_repository_delivery_keeps_explicit_na_path(kanban_home):
         )
         claimed = kb.claim_task(conn, task_id, claimer="test:owner")
         assert claimed is not None and claimed.current_run_id is not None
+        with pytest.raises(kb.ReviewGateError, match="no pr_merged"):
+            kb.assert_review_gate(
+                conn,
+                task_id,
+                repository="mikadripagency/hermes-agent",
+                final_sha="f" * 40,
+            )
         assert kb.complete_task(
             conn,
             task_id,

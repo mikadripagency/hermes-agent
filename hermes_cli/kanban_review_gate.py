@@ -183,7 +183,7 @@ def assert_review_gate(
     if task is None:
         raise ReviewGateError(task_id, "task does not exist")
     if not review_gate_required(task):
-        return True
+        raise ReviewGateError(task_id, "task has no pr_merged evidence contract")
 
     latest_blocking_id = 0
     latest_pass: Optional[tuple[int, dict]] = None
