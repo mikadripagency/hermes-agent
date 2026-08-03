@@ -265,6 +265,30 @@ def bind_review_integration(
     return True
 
 
+def assert_deploy_review_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    repository: str,
+    reviewed_sha: str,
+    integration_sha: str,
+    expected_run_id: Optional[int],
+) -> bool:
+    """Authorize a deploy only for the current run and its bound review."""
+    _require_current_run(conn, task_id, expected_run_id)
+    assert_review_gate(
+        conn, task_id, repository=repository, final_sha=reviewed_sha
+    )
+    assert_review_gate(
+        conn,
+        task_id,
+        repository=repository,
+        final_sha=integration_sha,
+        require_integration=True,
+    )
+    return True
+
+
 def assert_completion_review_gate(
     conn: sqlite3.Connection, task, metadata: Optional[dict]
 ) -> None:

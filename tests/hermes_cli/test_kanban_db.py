@@ -2381,6 +2381,23 @@ def test_review_gate_binds_review_findings_and_integration_sha(
             final_sha=merge_sha,
             require_integration=True,
         )
+        assert kb.assert_deploy_review_gate(
+            conn,
+            task_id,
+            repository=repository,
+            reviewed_sha=fixed_sha,
+            integration_sha=merge_sha,
+            expected_run_id=claimed.current_run_id,
+        )
+        with pytest.raises(kb.ReviewGateError, match="task/run identity"):
+            kb.assert_deploy_review_gate(
+                conn,
+                task_id,
+                repository=repository,
+                reviewed_sha=fixed_sha,
+                integration_sha=merge_sha,
+                expected_run_id=claimed.current_run_id + 1,
+            )
 
 
 def test_completion_rejects_open_no_go_before_terminal_side_effects(kanban_home):
