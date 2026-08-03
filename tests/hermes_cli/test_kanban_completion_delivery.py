@@ -544,6 +544,38 @@ def test_acknowledge_upgrades_pending_row(kanban_home):
         assert acked[0].payload["completed_event_id"] == event_id
 
 
+def test_acknowledge_claims_matching_legacy_unstamped_route(kanban_home):
+    with kb.connect_closing() as conn:
+        tid, event_id = _complete_with_pending_row(conn)
+        conn.execute(
+            "UPDATE completion_deliveries SET platform = 'slack', chat_id = 'DORIGIN', "
+            "thread_id = '123.456', notifier_profile = '' WHERE event_id = ?",
+            (event_id,),
+        )
+        conn.commit()
+
+        assert kb.acknowledge_completion_delivery(
+            conn,
+            task_id=tid,
+            event_id=event_id,
+            platform="slack",
+            chat_id="DORIGIN",
+            thread_id="123.456",
+            notifier_profile="developer",
+            receipt_id="1784300000.000009",
+        )
+        rows = conn.execute(
+            "SELECT notifier_profile, state, receipt_id FROM completion_deliveries "
+            "WHERE event_id = ?",
+            (event_id,),
+        ).fetchall()
+        assert [dict(row) for row in rows] == [{
+            "notifier_profile": "developer",
+            "state": "acknowledged",
+            "receipt_id": "1784300000.000009",
+        }]
+
+
 def test_acknowledge_inserts_row_for_pre_ledger_completions(kanban_home):
     with kb.connect_closing() as conn:
         tid, event_id = _complete_with_pending_row(conn)
@@ -681,6 +713,40 @@ def test_reconcile_backstop_still_upgrades_done_time_pending_row(kanban_home):
             "state": "acknowledged",
             "receipt_id": "1784300000.000003",
         }
+
+        conn.execute(
+            "INSERT INTO completion_deliveries "
+            "(event_id, task_id, handoff_version, platform, chat_id, thread_id, "
+            "notifier_profile, state, created_at) "
+            "SELECT event_id, task_id, handoff_version, platform, chat_id, thread_id, "
+            "'', 'pending', created_at FROM completion_deliveries WHERE event_id = ?",
+            (event_id,),
+        )
+        conn.commit()
+        assert kb.reconcile_completion_delivery(
+            conn,
+            task_id=tid,
+            event_id=event_id,
+            platform="slack",
+            chat_id=ORCH_CHAT_ID,
+            thread_id="",
+            notifier_profile="developer",
+        ) == "1784300000.000003"
+        routes = conn.execute(
+            "SELECT notifier_profile, state FROM completion_deliveries WHERE event_id = ?",
+            (event_id,),
+        ).fetchall()
+        assert [dict(route) for route in routes] == [{
+            "notifier_profile": "developer",
+            "state": "acknowledged",
+        }]
+        retired = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "completion_delivery_legacy_route_retired"
+        ]
+        assert len(retired) == 1
+        assert retired[0].payload is not None
+        assert retired[0].payload["reason"] == "matching owned route already acknowledged"
 
 
 def test_reopen_refuses_archived_completed_dependent(kanban_home):
