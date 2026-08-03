@@ -2297,6 +2297,153 @@ def test_review_required_and_changes_requested_follow_main_path(
     assert spawned_ids == [t]
 
 
+@pytest.mark.parametrize(
+    "repository",
+    ("Pryapus/Drip-Research-Hub", "mikadripagency/hermes-agent"),
+)
+def test_review_gate_binds_review_findings_and_integration_sha(
+    kanban_home, repository
+):
+    reviewed_sha = "a" * 40
+    fixed_sha = "b" * 40
+    merge_sha = "c" * 40
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="repository delivery",
+            assignee="alice",
+            required_evidence=["pr_merged"],
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="test:owner")
+        assert claimed is not None and claimed.current_run_id is not None
+
+        kb.record_review_receipt(
+            conn,
+            task_id,
+            repository=repository,
+            reviewed_sha=reviewed_sha,
+            verdict="changes_requested",
+            findings=[{"id": "F1", "status": "open", "proof": "RED recompute"}],
+            expected_run_id=claimed.current_run_id,
+        )
+        with pytest.raises(kb.ReviewGateError, match="changes requested"):
+            kb.assert_review_gate(
+                conn, task_id, repository=repository, final_sha=reviewed_sha
+            )
+
+        with pytest.raises(kb.ReviewGateError, match="unresolved finding F1"):
+            kb.record_review_receipt(
+                conn,
+                task_id,
+                repository=repository,
+                reviewed_sha=fixed_sha,
+                verdict="passed",
+                findings=[],
+                expected_run_id=claimed.current_run_id,
+            )
+
+        kb.record_review_receipt(
+            conn,
+            task_id,
+            repository=repository,
+            reviewed_sha=fixed_sha,
+            verdict="passed",
+            findings=[{"id": "F1", "status": "closed", "proof": "400-row PASS"}],
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.assert_review_gate(
+            conn, task_id, repository=repository, final_sha=fixed_sha
+        )
+        assert kb.bind_review_integration(
+            conn,
+            task_id,
+            repository=repository,
+            reviewed_sha=fixed_sha,
+            integration_sha=merge_sha,
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.assert_review_gate(
+            conn,
+            task_id,
+            repository=repository,
+            final_sha=merge_sha,
+            require_integration=True,
+        )
+
+
+def test_completion_rejects_open_no_go_before_terminal_side_effects(kanban_home):
+    repository = "mikadripagency/hermes-agent"
+    reviewed_sha = "d" * 40
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="blocked repository delivery",
+            assignee="alice",
+            required_evidence=["pr_merged"],
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="test:owner")
+        assert claimed is not None and claimed.current_run_id is not None
+        kb.record_review_receipt(
+            conn,
+            task_id,
+            repository=repository,
+            reviewed_sha=reviewed_sha,
+            verdict="changes_requested",
+            findings=[
+                {"id": "F1", "status": "open", "proof": "RED recompute"},
+                {"id": "F2", "status": "open", "proof": "RED cardinality"},
+            ],
+            expected_run_id=claimed.current_run_id,
+        )
+
+        with pytest.raises(kb.ReviewGateError, match="changes requested"):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary=_claimed_summary(conn, task_id),
+                metadata={
+                    "evidence": {
+                        "pr_merged": {
+                            "status": "passed",
+                            "repository": repository,
+                            "head_sha": reviewed_sha,
+                            "merge_sha": "e" * 40,
+                        }
+                    }
+                },
+                expected_run_id=claimed.current_run_id,
+            )
+
+        assert kb.get_task(conn, task_id).status == "running"
+        assert not [e for e in kb.list_events(conn, task_id) if e.kind == "completed"]
+        deliveries = conn.execute(
+            "SELECT COUNT(*) FROM completion_deliveries WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+        assert deliveries == 0
+
+
+def test_non_repository_delivery_keeps_explicit_na_path(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="non repository delivery",
+            assignee="alice",
+            required_evidence=["runtime_smoke"],
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="test:owner")
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary=_claimed_summary(conn, task_id),
+            metadata={"evidence": {"runtime_smoke": {"status": "passed"}}},
+            expected_run_id=claimed.current_run_id,
+        )
+
+
 def test_dispatch_respawn_guard_dry_run_no_auto_block(
     kanban_home, all_assignees_spawnable
 ):

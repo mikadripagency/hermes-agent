@@ -89,6 +89,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli.kanban_review_gate import (
+    ReviewGateError,
+    assert_completion_review_gate,
+    assert_review_gate,
+    bind_review_integration,
+    record_review_receipt,
+)
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from hermes_cli.kanban_run_lock import (
     database_path,
@@ -4735,6 +4742,7 @@ def complete_task(
     # row. The rejected-attempt event is intentionally non-terminal and gives
     # operators a durable, resumable audit trail.
     missing_evidence: list[str] = []
+    review_error: Optional[ReviewGateError] = None
     with write_txn(conn):
         task = get_task(conn, task_id)
         if task is not None and task.status not in {"running", "ready", "blocked"}:
@@ -4754,8 +4762,22 @@ def complete_task(
                 {"missing": missing_evidence},
                 run_id=expected_run_id,
             )
+        elif task is not None:
+            try:
+                assert_completion_review_gate(conn, task, metadata)
+            except ReviewGateError as exc:
+                review_error = exc
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_review",
+                    {"reason": exc.reason},
+                    run_id=expected_run_id,
+                )
     if missing_evidence:
         raise MissingCompletionEvidenceError(missing_evidence, task_id)
+    if review_error is not None:
+        raise review_error
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -4793,6 +4815,7 @@ def complete_task(
             _validate_completion_identity(
                 locked_task, summary if summary is not None else result
             )
+            assert_completion_review_gate(conn, locked_task, metadata)
         notifier_profile = _intended_completion_notifier_profile(
             conn, task_id, expected_run_id
         )

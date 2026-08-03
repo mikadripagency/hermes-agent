@@ -558,6 +558,35 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
 
+    p_review_record = sub.add_parser(
+        "review-record", help="Append a SHA-scoped repository review receipt"
+    )
+    p_review_record.add_argument("task_id")
+    p_review_record.add_argument("--repository", required=True, metavar="OWNER/REPO")
+    p_review_record.add_argument("--head-sha", required=True)
+    p_review_record.add_argument(
+        "--verdict", required=True, choices=("passed", "changes_requested")
+    )
+    p_review_record.add_argument(
+        "--findings-json", required=True,
+        help='JSON list of {"id","status","proof"} finding receipts',
+    )
+
+    p_review_gate = sub.add_parser(
+        "review-gate", help="Fail unless the final PR head has a closed review receipt"
+    )
+    p_review_gate.add_argument("task_id")
+    p_review_gate.add_argument("--repository", required=True, metavar="OWNER/REPO")
+    p_review_gate.add_argument("--head-sha", required=True)
+
+    p_review_bind = sub.add_parser(
+        "review-bind", help="Bind a merged integration SHA to its reviewed PR head"
+    )
+    p_review_bind.add_argument("task_id")
+    p_review_bind.add_argument("--repository", required=True, metavar="OWNER/REPO")
+    p_review_bind.add_argument("--head-sha", required=True)
+    p_review_bind.add_argument("--integration-sha", required=True)
+
     p_edit = sub.add_parser(
         "edit",
         help="Edit recovery fields on an already-completed task",
@@ -1005,6 +1034,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "claim":    _cmd_claim,
             "comment":  _cmd_comment,
             "complete": _cmd_complete,
+            "review-record": _cmd_review_record,
+            "review-gate": _cmd_review_gate,
+            "review-bind": _cmd_review_bind,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
@@ -2012,6 +2044,64 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
+
+
+def _cmd_review_record(args: argparse.Namespace) -> int:
+    try:
+        findings = json.loads(args.findings_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--findings-json: {exc}") from exc
+    if not isinstance(findings, list):
+        raise ValueError("--findings-json must be a JSON list")
+    with kb.connect_closing() as conn:
+        run_id = _terminal_run_id_for(conn, args.task_id)
+        if run_id is None:
+            raise RuntimeError("review receipts require a running delivery task")
+        event_id = kb.record_review_receipt(
+            conn,
+            args.task_id,
+            repository=args.repository,
+            reviewed_sha=args.head_sha,
+            verdict=args.verdict,
+            findings=findings,
+            expected_run_id=run_id,
+        )
+    print(f"REVIEW_RECEIPT event={event_id} task={args.task_id} head={args.head_sha}")
+    return 0
+
+
+def _cmd_review_gate(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        if _terminal_run_id_for(conn, args.task_id) is None:
+            raise RuntimeError("review gate requires a running delivery task")
+        kb.assert_review_gate(
+            conn,
+            args.task_id,
+            repository=args.repository,
+            final_sha=args.head_sha,
+        )
+    print(f"REVIEW_GATE_PASS task={args.task_id} head={args.head_sha}")
+    return 0
+
+
+def _cmd_review_bind(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        run_id = _terminal_run_id_for(conn, args.task_id)
+        if run_id is None:
+            raise RuntimeError("review integration binding requires a running delivery task")
+        kb.bind_review_integration(
+            conn,
+            args.task_id,
+            repository=args.repository,
+            reviewed_sha=args.head_sha,
+            integration_sha=args.integration_sha,
+            expected_run_id=run_id,
+        )
+    print(
+        f"REVIEW_INTEGRATION_BOUND task={args.task_id} "
+        f"head={args.head_sha} integration={args.integration_sha}"
+    )
+    return 0
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:
