@@ -92,6 +92,7 @@ from typing import Any, Iterable, Optional
 from hermes_cli.kanban_review_gate import (
     ReviewGateError,
     assert_completion_review_gate,
+    assert_deploy_review_gate,
     assert_review_gate,
     bind_review_integration,
     record_review_receipt,
