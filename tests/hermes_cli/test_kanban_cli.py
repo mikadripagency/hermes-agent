@@ -138,6 +138,38 @@ def test_run_slash_create_persists_required_evidence_contract(kanban_home):
     assert task.required_evidence == ["authenticated_production_e2e"]
 
 
+def test_run_slash_review_gate_is_sha_scoped_and_fail_closed(kanban_home):
+    head_sha = "a" * 40
+    merge_sha = "b" * 40
+    repository = "mikadripagency/hermes-agent"
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="reviewed delivery",
+            assignee="default",
+            required_evidence=["pr_merged"],
+        )
+        assert kb.claim_task(conn, task_id) is not None
+
+    rejected = kc.run_slash(
+        f"review-gate {task_id} --repository {repository} --head-sha {head_sha}"
+    )
+    assert "missing review receipt" in rejected
+
+    recorded = kc.run_slash(
+        f"review-record {task_id} --repository {repository} --head-sha {head_sha} "
+        "--verdict passed --findings-json '[]'"
+    )
+    assert "REVIEW_RECEIPT" in recorded
+    assert "REVIEW_GATE_PASS" in kc.run_slash(
+        f"review-gate {task_id} --repository {repository} --head-sha {head_sha}"
+    )
+    assert "REVIEW_INTEGRATION_BOUND" in kc.run_slash(
+        f"review-bind {task_id} --repository {repository} --head-sha {head_sha} "
+        f"--integration-sha {merge_sha}"
+    )
+
+
 def test_run_slash_reopen_recovers_same_completed_card(kanban_home):
     import re
 
