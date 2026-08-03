@@ -4820,6 +4820,11 @@ def complete_task(
         notifier_profile = _intended_completion_notifier_profile(
             conn, task_id, expected_run_id
         )
+        _stamp_unowned_developer_slack_routes(
+            conn,
+            task_id,
+            notifier_profile=notifier_profile,
+        )
         if orchestration_route is not None:
             _assert_orchestration_route_profile(
                 conn,
@@ -9501,6 +9506,47 @@ def _materialize_completion_delivery_routes(
             for route in routes
         ],
     )
+
+
+def _stamp_unowned_developer_slack_routes(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    notifier_profile: str,
+) -> None:
+    """Give pre-existing developer Slack completion routes a runnable owner.
+
+    Legacy origin subscriptions can be created without a profile when the
+    creator's session context is unavailable in a worker subprocess. The
+    notifier deliberately refuses to claim those developer Slack routes, so
+    materializing them as pending creates an outbox row with no claim, retry,
+    or acknowledgement path. Completion already knows the authoritative
+    closing run profile; claim unsent routes atomically before the task becomes
+    done. A receipt is immutable sender evidence and therefore fails closed
+    instead of being reassigned.
+    """
+    blank_routes = conn.execute(
+        "SELECT last_message_id FROM kanban_notify_subs "
+        "WHERE task_id = ? AND LOWER(platform) = 'slack' "
+        "AND TRIM(COALESCE(notifier_profile, '')) = '' "
+        "AND EXISTS (SELECT 1 FROM tasks WHERE id = ? AND assignee = 'developer')",
+        (task_id, task_id),
+    ).fetchall()
+    if not blank_routes:
+        return
+    if any(str(route["last_message_id"] or "").strip() for route in blank_routes):
+        raise ValueError(
+            "notification route has an unstamped receipt and cannot be reassigned"
+        )
+    cur = conn.execute(
+        "UPDATE kanban_notify_subs SET notifier_profile = ? "
+        "WHERE task_id = ? AND LOWER(platform) = 'slack' "
+        "AND TRIM(COALESCE(notifier_profile, '')) = '' "
+        "AND TRIM(COALESCE(last_message_id, '')) = ''",
+        (notifier_profile, task_id),
+    )
+    if cur.rowcount != len(blank_routes):
+        raise ValueError("notification route profile changed concurrently")
 
 
 def _install_blocked_delivery(

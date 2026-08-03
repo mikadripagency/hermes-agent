@@ -336,11 +336,17 @@ def test_completion_never_restamps_existing_receipt_as_closing_profile(kanban_ho
     _write_channel_directory(kanban_home)
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="legacy wrong actor", assignee="developer")
-        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id=ORCH_CHAT_ID)
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="slack",
+            chat_id="DORIGIN",
+            thread_id="123.456",
+        )
         conn.execute(
             "UPDATE kanban_notify_subs SET last_message_id = 'wrong-actor-receipt' "
             "WHERE task_id = ? AND chat_id = ?",
-            (tid, ORCH_CHAT_ID),
+            (tid, "DORIGIN"),
         )
         conn.commit()
         claimed = kb.claim_task(conn, tid, claimer="developer-test")
@@ -350,15 +356,19 @@ def test_completion_never_restamps_existing_receipt_as_closing_profile(kanban_ho
             kb.complete_task(
                 conn,
                 tid,
-                summary="done",
+                summary=f"{tid}/run {claimed.current_run_id} · done",
                 expected_run_id=claimed.current_run_id,
             )
 
         sub = kb.list_notify_subs(conn, tid)[0]
         task = kb.get_task(conn, tid)
+        deliveries = conn.execute(
+            "SELECT COUNT(*) FROM completion_deliveries WHERE task_id = ?", (tid,)
+        ).fetchone()[0]
     assert sub["notifier_profile"] is None
     assert sub["last_message_id"] == "wrong-actor-receipt"
     assert task is not None and task.status == "running"
+    assert deliveries == 0
 
 
 def test_subscribe_never_restamps_existing_receipt_as_requested_profile(kanban_home):
