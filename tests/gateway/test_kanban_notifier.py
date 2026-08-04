@@ -913,6 +913,21 @@ def test_notifier_drops_sub_after_consecutive_permanent_failures(tmp_path, monke
 
     assert adapter.attempts == 1
     assert _read_sub(tid) is None, "permanent-failure sub should be dropped"
+    conn = kb.connect()
+    try:
+        delivery = conn.execute(
+            "SELECT state, receipt_id FROM completion_deliveries WHERE task_id = ?",
+            (tid,),
+        ).fetchone()
+        cancelled = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "completion_delivery_cancelled"
+        ]
+    finally:
+        conn.close()
+    assert dict(delivery) == {"state": "cancelled", "receipt_id": None}
+    assert len(cancelled) == 1
+    assert cancelled[0].payload["reason"] == "permanent delivery failure"
 
 
 def test_notifier_backoff_gate_skips_subscription_not_yet_due(tmp_path, monkeypatch):
