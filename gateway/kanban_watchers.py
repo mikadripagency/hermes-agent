@@ -579,7 +579,10 @@ class GatewayKanbanWatchersMixin:
                                     sub["task_id"], sub["chat_id"], platform_str, fail_count, exc,
                                 )
                                 await asyncio.to_thread(
-                                    self._kanban_unsub, sub, board_slug,
+                                    self._kanban_unsub,
+                                    sub,
+                                    board_slug,
+                                    "permanent delivery failure",
                                 )
                             else:
                                 logger.warning(
@@ -799,7 +802,12 @@ class GatewayKanbanWatchersMixin:
                 sub.get("task_id"), event_id, exc,
             )
 
-    def _kanban_unsub(self, sub: dict, board: Optional[str] = None) -> None:
+    def _kanban_unsub(
+        self,
+        sub: dict,
+        board: Optional[str] = None,
+        reason: str = "subscription removed",
+    ) -> None:
         from hermes_cli import kanban_db as _kb
         conn = _kb.connect(board=board)
         try:
@@ -809,6 +817,7 @@ class GatewayKanbanWatchersMixin:
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
+                reason=reason,
             )
         finally:
             conn.close()
