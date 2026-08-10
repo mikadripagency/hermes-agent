@@ -2648,6 +2648,11 @@ def _detect_registered_project_reference(
 
 
 _EVIDENCE_CLASS_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_VALID_DELIVERY_GATES = frozenset({"merge", "deploy"})
+_DELIVERY_GATE_EVIDENCE = {
+    "merge": ("pr_merged",),
+    "deploy": ("pr_merged", "runtime_smoke"),
+}
 
 
 def _normalize_required_evidence(
@@ -2686,6 +2691,27 @@ def _normalize_evidence_contract_na_reason(value: Optional[str]) -> Optional[str
             f"{MAX_EVIDENCE_NA_REASON_CHARS} characters"
         )
     return reason
+
+
+def _normalize_delivery_gates(
+    values: Optional[Iterable[str]], *, workspace_kind: str,
+) -> list[str]:
+    """Resolve repository delivery policy before a task can be dispatched."""
+    if values is None:
+        return ["merge"] if workspace_kind == "worktree" else []
+    if isinstance(values, str):
+        values = [values]
+    gates: list[str] = []
+    for raw in values:
+        gate = str(raw).strip().casefold()
+        if gate not in _VALID_DELIVERY_GATES:
+            raise ValueError(
+                "delivery_gates must contain only merge or deploy; got "
+                + repr(gate)
+            )
+        if gate not in gates:
+            gates.append(gate)
+    return gates
 
 
 def _existing_idempotent_task(
@@ -2765,6 +2791,7 @@ def create_task(
     task_kind: str = "delivery",
     required_evidence: Optional[Iterable[str]] = None,
     evidence_contract_na_reason: Optional[str] = None,
+    delivery_gates: Optional[Iterable[str]] = None,
     _system_inbox_capability: Optional[object] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
@@ -2866,6 +2893,21 @@ def create_task(
     evidence_na_reason = _normalize_evidence_contract_na_reason(
         evidence_contract_na_reason
     )
+    delivery_gate_list = _normalize_delivery_gates(
+        delivery_gates, workspace_kind=workspace_kind
+    )
+    if delivery_gate_list and evidence_na_reason:
+        raise ValueError(
+            "repository delivery with merge/deploy gates requires exact "
+            "pr_merged/runtime_smoke evidence; an N/A contract is impossible. For an "
+            "intentional no-code worktree pass delivery_gates=[] explicitly."
+        )
+    if delivery_gate_list:
+        required_evidence_list = list(required_evidence_list or [])
+        for gate in delivery_gate_list:
+            for evidence_class in _DELIVERY_GATE_EVIDENCE[gate]:
+                if evidence_class not in required_evidence_list:
+                    required_evidence_list.append(evidence_class)
     if required_evidence_list and evidence_na_reason:
         raise ValueError(
             "delivery evidence contract must choose required_evidence or "
@@ -3123,6 +3165,7 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "delivery_gates": delivery_gate_list,
                         "required_evidence": required_evidence_list or None,
                         "evidence_contract_na_reason": evidence_na_reason,
                     },
@@ -3184,6 +3227,78 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Task.from_row(row) if row else None
+
+
+def amend_evidence_contract(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    add_required_evidence: Iterable[str],
+    actor: str,
+    reason: str,
+) -> int:
+    """Monotonically strengthen an inactive delivery task's evidence contract."""
+    additions = _normalize_required_evidence(add_required_evidence) or []
+    actor = str(actor or "").strip()
+    reason = str(reason or "").strip()
+    if not additions:
+        raise ValueError("at least one evidence class to add is required")
+    if not actor:
+        raise ValueError("contract amendment actor is required")
+    if not reason:
+        raise ValueError("contract amendment reason is required")
+
+    allowed_statuses = {"blocked", "todo", "ready", "triage"}
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, task_kind, assignee, current_run_id, required_evidence, "
+            "evidence_contract_na_reason FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task {task_id}")
+        if (row["task_kind"] or "delivery") != "delivery":
+            raise ValueError("only delivery task evidence contracts can be amended")
+        if row["status"] not in allowed_statuses or row["current_run_id"] is not None:
+            raise ValueError(
+                "contract amendment requires an inactive blocked, todo, ready, or "
+                "triage task"
+            )
+        if actor != "default" and actor != (row["assignee"] or ""):
+            raise ValueError(
+                f"profile {actor!r} is not authorized to amend task {task_id}; "
+                "use the assigned profile or the default orchestrator"
+            )
+
+        previous = _normalize_required_evidence(
+            json.loads(row["required_evidence"])
+            if row["required_evidence"] else None
+        )
+        amended = list(previous or [])
+        added = [name for name in additions if name not in amended]
+        if not added:
+            raise ValueError("contract amendment must add a new evidence class")
+        amended.extend(added)
+        previous_na = row["evidence_contract_na_reason"] or None
+        conn.execute(
+            "UPDATE tasks SET required_evidence = ?, "
+            "evidence_contract_na_reason = NULL WHERE id = ?",
+            (json.dumps(amended), task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "evidence_contract_amended",
+            {
+                "actor": actor,
+                "reason": reason,
+                "added_required_evidence": added,
+                "previous_required_evidence": previous,
+                "previous_evidence_contract_na_reason": previous_na,
+                "required_evidence": amended,
+            },
+        )
+        return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
 
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.

@@ -39,7 +39,10 @@ def explicit_evidence_contract_for_unrelated_cli_tests(monkeypatch):
             and "--require-evidence" not in stripped
             and "--evidence-na-reason" not in stripped
         ):
-            command += " --evidence-na-reason 'unrelated CLI test fixture'"
+            command += (
+                " --evidence-na-reason 'unrelated CLI test fixture'"
+                " --no-delivery-gates"
+            )
         return original(command)
 
     monkeypatch.setattr(kc, "run_slash", run_slash_with_contract)
@@ -52,6 +55,7 @@ def explicit_evidence_contract_for_unrelated_cli_tests(monkeypatch):
             and not kwargs.get("evidence_contract_na_reason")
         ):
             kwargs["evidence_contract_na_reason"] = "unrelated CLI test fixture"
+            kwargs["delivery_gates"] = []
         return original_create_task(conn, **kwargs)
 
     monkeypatch.setattr(kb, "create_task", create_with_contract)

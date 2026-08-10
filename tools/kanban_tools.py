@@ -894,6 +894,7 @@ def _handle_create(args: dict, **kw) -> str:
     goal_max_turns = args.get("goal_max_turns")
     required_evidence = args.get("required_evidence")
     evidence_contract_na_reason = args.get("evidence_contract_na_reason")
+    delivery_gates = args.get("delivery_gates")
     if isinstance(required_evidence, str):
         required_evidence = [required_evidence]
     if required_evidence is not None and not isinstance(
@@ -902,6 +903,10 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             "required_evidence must be a list of evidence class names"
         )
+    if delivery_gates is not None and not isinstance(
+        delivery_gates, (list, tuple)
+    ):
+        return tool_error("delivery_gates must be a list containing merge or deploy")
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -953,6 +958,7 @@ def _handle_create(args: dict, **kw) -> str:
                 task_kind="delivery",
                 required_evidence=required_evidence,
                 evidence_contract_na_reason=evidence_contract_na_reason,
+                delivery_gates=delivery_gates,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1584,6 +1590,16 @@ KANBAN_CREATE_SCHEMA = {
                     "Explicit auditable reason why a delivery task has no "
                     "machine-checkable completion evidence. Mutually exclusive "
                     "with required_evidence."
+                ),
+            },
+            "delivery_gates": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["merge", "deploy"]},
+                "description": (
+                    "Repository delivery gates. Worktree tasks default to "
+                    "['merge'], which adds exact pr_merged evidence; deploy "
+                    "also adds runtime_smoke. Pass [] "
+                    "only for an explicit no-code/reconciliation worktree."
                 ),
             },
             "board": _board_schema_prop(),

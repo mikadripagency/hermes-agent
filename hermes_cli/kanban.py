@@ -385,6 +385,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "machine-checkable completion evidence."
         ),
     )
+    delivery_policy = p_create.add_mutually_exclusive_group()
+    delivery_policy.add_argument(
+        "--delivery-gate",
+        action="append",
+        choices=("merge", "deploy"),
+        dest="delivery_gates",
+        help=(
+            "Required repository delivery gate (repeatable). Worktrees default "
+            "to merge; merge adds pr_merged and deploy also adds runtime_smoke."
+        ),
+    )
+    delivery_policy.add_argument(
+        "--no-delivery-gates",
+        action="store_const",
+        const=[],
+        dest="delivery_gates",
+        help="Explicit no-code/reconciliation worktree carveout.",
+    )
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -571,6 +589,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--findings-json", required=True,
         help='JSON list of {"id","status","proof"} finding receipts',
     )
+
+    p_contract_amend = sub.add_parser(
+        "contract-amend",
+        help="Monotonically add exact evidence classes to an inactive task",
+    )
+    p_contract_amend.add_argument("task_id")
+    p_contract_amend.add_argument(
+        "--add-evidence", action="append", required=True, dest="add_evidence",
+    )
+    p_contract_amend.add_argument("--reason", required=True)
 
     p_review_gate = sub.add_parser(
         "review-gate", help="Fail unless the final PR head has a closed review receipt"
@@ -1069,6 +1097,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "claim":    _cmd_claim,
             "comment":  _cmd_comment,
             "complete": _cmd_complete,
+            "contract-amend": _cmd_contract_amend,
             "review-record": _cmd_review_record,
             "review-gate": _cmd_review_gate,
             "review-bind": _cmd_review_bind,
@@ -1478,6 +1507,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             evidence_contract_na_reason=getattr(
                 args, "evidence_contract_na_reason", None
             ),
+            delivery_gates=getattr(args, "delivery_gates", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2106,6 +2136,19 @@ def _cmd_review_record(args: argparse.Namespace) -> int:
             expected_run_id=run_id,
         )
     print(f"REVIEW_RECEIPT event={event_id} task={args.task_id} head={args.head_sha}")
+    return 0
+
+
+def _cmd_contract_amend(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        event_id = kb.amend_evidence_contract(
+            conn,
+            args.task_id,
+            add_required_evidence=args.add_evidence,
+            actor=_profile_author(),
+            reason=args.reason,
+        )
+    print(f"EVIDENCE_CONTRACT_AMENDED event={event_id} task={args.task_id}")
     return 0
 
 
