@@ -595,6 +595,33 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_deploy_gate.add_argument("--reviewed-sha", required=True)
     p_deploy_gate.add_argument("--integration-sha", required=True)
 
+    p_deploy_request = sub.add_parser(
+        "deploy-request", help="Persist one reviewed core deployment request"
+    )
+    p_deploy_request.add_argument("task_id")
+    p_deploy_request.add_argument("--repository", required=True, metavar="OWNER/REPO")
+    p_deploy_request.add_argument("--reviewed-sha", required=True)
+    p_deploy_request.add_argument("--integration-sha", required=True)
+
+    p_deploy_claim = sub.add_parser(
+        "deploy-claim", help="Claim a durable core deployment request"
+    )
+    p_deploy_claim.add_argument("task_id")
+    p_deploy_claim.add_argument("--repository", required=True, metavar="OWNER/REPO")
+    p_deploy_claim.add_argument("--reviewed-sha", required=True)
+    p_deploy_claim.add_argument("--integration-sha", required=True)
+    p_deploy_claim.add_argument("--claimant", required=True)
+    p_deploy_claim.add_argument("--lease", type=int, default=300)
+
+    p_deploy_finish = sub.add_parser(
+        "deploy-finish", help="Acknowledge a claimed core deployment request"
+    )
+    p_deploy_finish.add_argument("task_id")
+    p_deploy_finish.add_argument("--request-event", type=int, required=True)
+    p_deploy_finish.add_argument("--claim-id", required=True)
+    p_deploy_finish.add_argument("--status", required=True, choices=("succeeded", "failed"))
+    p_deploy_finish.add_argument("--receipt-json", required=True)
+
     p_edit = sub.add_parser(
         "edit",
         help="Edit recovery fields on an already-completed task",
@@ -1046,6 +1073,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "review-gate": _cmd_review_gate,
             "review-bind": _cmd_review_bind,
             "deploy-gate": _cmd_deploy_gate,
+            "deploy-request": _cmd_deploy_request,
+            "deploy-claim": _cmd_deploy_claim,
+            "deploy-finish": _cmd_deploy_finish,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
@@ -2130,6 +2160,61 @@ def _cmd_deploy_gate(args: argparse.Namespace) -> int:
         f"DEPLOY_REVIEW_GATE_PASS task={args.task_id} "
         f"reviewed={args.reviewed_sha} integration={args.integration_sha}"
     )
+    return 0
+
+
+def _cmd_deploy_request(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        run_id = _terminal_run_id_for(conn, args.task_id)
+        if run_id is None:
+            raise RuntimeError("deploy requests require a running delivery task")
+        event_id = kb.request_core_deploy(
+            conn,
+            args.task_id,
+            repository=args.repository,
+            reviewed_sha=args.reviewed_sha,
+            integration_sha=args.integration_sha,
+            expected_run_id=run_id,
+        )
+    print(f"CORE_DEPLOY_REQUEST event={event_id} task={args.task_id}")
+    return 0
+
+
+def _cmd_deploy_claim(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        claim = kb.claim_core_deploy(
+            conn,
+            args.task_id,
+            repository=args.repository,
+            reviewed_sha=args.reviewed_sha,
+            integration_sha=args.integration_sha,
+            claimant=args.claimant,
+            lease_seconds=args.lease,
+        )
+    print(
+        f"CORE_DEPLOY_CLAIM request={claim['request_event_id']} "
+        f"claim={claim['claim_id']} task={args.task_id}"
+    )
+    return 0
+
+
+def _cmd_deploy_finish(args: argparse.Namespace) -> int:
+    try:
+        receipt = json.loads(args.receipt_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--receipt-json: {exc}") from exc
+    if not isinstance(receipt, dict):
+        raise ValueError("--receipt-json must be a JSON object")
+    with kb.connect_closing() as conn:
+        event_id = kb.finish_core_deploy(
+            conn,
+            args.task_id,
+            request_event_id=args.request_event,
+            claim_id=args.claim_id,
+            status=args.status,
+            receipt=receipt,
+        )
+    print(f"CORE_DEPLOY_{args.status.upper()} event={event_id} task={args.task_id}")
     return 0
 
 

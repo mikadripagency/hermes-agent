@@ -97,6 +97,12 @@ from hermes_cli.kanban_review_gate import (
     bind_review_integration,
     record_review_receipt,
 )
+from hermes_cli.kanban_deploy_requests import (
+    CoreDeployRequestError,
+    claim_core_deploy,
+    finish_core_deploy,
+    request_core_deploy,
+)
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from hermes_cli.kanban_run_lock import (
     database_path,
