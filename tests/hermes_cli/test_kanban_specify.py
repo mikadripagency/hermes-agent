@@ -116,7 +116,9 @@ def test_specify_task_happy_path(kanban_home):
 
 def test_specify_task_falls_back_to_body_only_on_bad_json(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="keep title", triage=True)
+        tid = kb.create_task(
+            conn, title="keep title", body="original fallback body", triage=True
+        )
 
     # Model returned plain markdown, no JSON object.
     content = "Goal: Do a thing.\nApproach: Steps here."
@@ -127,10 +129,50 @@ def test_specify_task_falls_back_to_body_only_on_bad_json(kanban_home):
     assert outcome.ok is True
     with kb.connect() as conn:
         t = kb.get_task(conn, tid)
+        event = next(e for e in kb.list_events(conn, tid) if e.kind == "specified")
+        comments = kb.list_comments(conn, tid)
     # Title preserved (no JSON with a title key).
     assert t.title == "keep title"
     # Body replaced with the raw response.
     assert "Goal:" in (t.body or "")
+    assert event.payload is not None
+    assert event.payload["old_title"] == "keep title"
+    assert event.payload["old_body"] == "original fallback body"
+    assert len(comments) == 1
+    assert "keep title" in comments[0].body
+    assert "original fallback body" in comments[0].body
+
+
+def test_cli_specify_original_is_visible_on_isolated_board_show_and_context(
+    tmp_path, monkeypatch, capsys
+):
+    board_path = tmp_path / "isolated-board" / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(board_path))
+    kb.init_db()
+
+    original_title = "ORIGINAL_TITLE_SENTINEL"
+    original_body = "ORIGINAL_BODY_SENTINEL"
+    with kb.connect() as conn:
+        assert Path(kb.database_path(conn)).resolve() == board_path.resolve()
+        tid = kb.create_task(
+            conn, title=original_title, body=original_body, triage=True
+        )
+
+    content = jsonlib.dumps({"title": "rewritten", "body": "rewritten body"})
+    p, _ = _patch_aux_client(content)
+    with p:
+        assert _run_cli("specify", tid) == 0
+    capsys.readouterr()
+
+    assert _run_cli("show", tid) == 0
+    show_output = capsys.readouterr().out
+    assert original_title in show_output
+    assert original_body in show_output
+
+    assert _run_cli("context", tid) == 0
+    context_output = capsys.readouterr().out
+    assert original_title in context_output
+    assert original_body in context_output
 
 
 def test_specify_task_rejects_non_triage_task(kanban_home):

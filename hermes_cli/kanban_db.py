@@ -5990,9 +5990,11 @@ def specify_triage_task(
     dispatcher tick, which keeps the normal parent-gating behaviour intact
     for specified tasks that happen to have open parents.
 
-    ``author`` is recorded on an audit comment only when at least one of
-    ``title`` / ``body`` / ``assignee`` actually changed — avoids noisy
-    comment spam for status-only promotions.
+    Before ``title`` or ``body`` is replaced, both original values are stored
+    verbatim in the ``specified`` event and an automatic audit comment. This
+    keeps every rewrite recoverable through ``kanban show`` and ``context``.
+    ``author`` is used for that comment when provided; direct DB callers fall
+    back to ``kanban-specifier`` so omitting an author cannot lose history.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
@@ -6019,6 +6021,7 @@ def specify_triage_task(
             sets.append("assignee = ?")
             params.append(assignee)
             changed_fields.append("assignee")
+        rewrites_spec = "title" in changed_fields or "body" in changed_fields
         params.append(task_id)
         cur = conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} "
@@ -6027,29 +6030,58 @@ def specify_triage_task(
         )
         if cur.rowcount != 1:
             return False
-        if changed_fields and author and author.strip():
+        comment_author = (
+            author.strip()
+            if author and author.strip()
+            else "kanban-specifier" if rewrites_spec else None
+        )
+        if changed_fields and comment_author:
             # Inline INSERT (rather than ``add_comment``) because we're
             # already inside this function's write_txn — nested BEGIN
             # IMMEDIATE would raise OperationalError. We also skip the
             # 'commented' event that ``add_comment`` emits, since the
             # 'specified' event below already records the change.
+            if rewrites_spec:
+                comment_body = (
+                    "AUTOMATIC ORIGINAL SPEC SNAPSHOT\n"
+                    "The following title and body are the verbatim values "
+                    "before this specify rewrite.\n\n"
+                    "Original title:\n"
+                    f"{existing['title'] or ''}\n\n"
+                    "--- ORIGINAL BODY ---\n"
+                    f"{existing['body'] if existing['body'] is not None else ''}\n"
+                    "--- END ORIGINAL SPEC ---\n\n"
+                    "Specified — updated "
+                    + ", ".join(changed_fields)
+                    + " and promoted to todo."
+                )
+            else:
+                comment_body = (
+                    "Specified — updated "
+                    + ", ".join(changed_fields)
+                    + " and promoted to todo."
+                )
             conn.execute(
                 "INSERT INTO task_comments (task_id, author, body, created_at) "
                 "VALUES (?, ?, ?, ?)",
                 (
                     task_id,
-                    author.strip(),
-                    "Specified — updated "
-                    + ", ".join(changed_fields)
-                    + " and promoted to todo.",
+                    comment_author,
+                    comment_body,
                     int(time.time()),
                 ),
+            )
+        event_payload = {"changed_fields": changed_fields} if changed_fields else None
+        if rewrites_spec and event_payload is not None:
+            event_payload.update(
+                old_title=existing["title"],
+                old_body=existing["body"],
             )
         _append_event(
             conn,
             task_id,
             "specified",
-            {"changed_fields": changed_fields} if changed_fields else None,
+            event_payload,
         )
     # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
     # ready-promotion pass opens its own IMMEDIATE txn. This runs the same

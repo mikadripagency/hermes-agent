@@ -103,9 +103,11 @@ def test_specify_rejects_blank_title(kanban_home):
         kb.specify_triage_task(conn, tid, title="   ", body="ok")
 
 
-def test_specify_emits_event(kanban_home):
+def test_specify_emits_event_with_verbatim_original(kanban_home):
+    original_title = "rough ORIGINAL_TITLE_SENTINEL"
+    original_body = "x" * 5000 + " ORIGINAL_BODY_SENTINEL"
     with kb.connect() as conn:
-        tid = _create_triage(conn, title="rough")
+        tid = _create_triage(conn, title=original_title, body=original_body)
     with kb.connect() as conn:
         kb.specify_triage_task(
             conn, tid, title="new", body="b", author="ace"
@@ -121,26 +123,32 @@ def test_specify_emits_event(kanban_home):
     fields = spec_ev.payload.get("changed_fields") or []
     assert "title" in fields
     assert "body" in fields
+    assert spec_ev.payload["old_title"] == original_title
+    assert spec_ev.payload["old_body"] == original_body
 
 
-def test_specify_records_audit_comment_only_when_author_given(kanban_home):
-    # With author → comment added.
+def test_specify_records_original_snapshot_with_or_without_author(kanban_home):
+    # With author → snapshot is attributed to that author.
     with kb.connect() as conn:
-        tid1 = _create_triage(conn, title="a")
+        tid1 = _create_triage(conn, title="original a", body="original body a")
         kb.specify_triage_task(
             conn, tid1, title="A-spec", body="b", author="ace"
         )
         comments1 = kb.list_comments(conn, tid1)
     assert len(comments1) == 1
-    assert "Specified" in comments1[0].body
+    assert "original a" in comments1[0].body
+    assert "original body a" in comments1[0].body
     assert comments1[0].author == "ace"
 
-    # Without author → no comment (silent).
+    # Without author → the original still must not be lost.
     with kb.connect() as conn:
-        tid2 = _create_triage(conn, title="b")
+        tid2 = _create_triage(conn, title="original b", body="original body b")
         kb.specify_triage_task(conn, tid2, title="B-spec", body="b")
         comments2 = kb.list_comments(conn, tid2)
-    assert comments2 == []
+    assert len(comments2) == 1
+    assert comments2[0].author == "kanban-specifier"
+    assert "original b" in comments2[0].body
+    assert "original body b" in comments2[0].body
 
 
 def test_specify_skips_comment_when_nothing_changed(kanban_home):
@@ -173,6 +181,56 @@ def test_specify_with_only_body_preserves_title(kanban_home):
         t = kb.get_task(conn, tid)
     assert t.title == "keep this title"
     assert t.body == "new body only"
+
+
+def test_specify_empty_body_snapshot_is_auditable(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="empty-body original", body=None)
+        kb.specify_triage_task(conn, tid, body="new body")
+        event = next(e for e in kb.list_events(conn, tid) if e.kind == "specified")
+        comments = kb.list_comments(conn, tid)
+
+    assert event.payload is not None
+    assert event.payload["old_title"] == "empty-body original"
+    assert event.payload["old_body"] is None
+    assert len(comments) == 1
+    assert "empty-body original" in comments[0].body
+    assert "--- ORIGINAL BODY ---\n\n--- END ORIGINAL SPEC ---" in comments[0].body
+
+
+def test_each_specify_keeps_its_own_previous_version(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="version one", body="body one")
+        assert kb.specify_triage_task(
+            conn, tid, title="version two", body="body two"
+        )
+        # Exercise the supported path that can return a specified task to
+        # triage: two same-cause blocks across an unblock trip the loop breaker.
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(conn, tid, reason="need input", kind="needs_input")
+        assert kb.unblock_task(conn, tid)
+        assert kb.block_task(conn, tid, reason="still need input", kind="needs_input")
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "triage"
+        assert kb.specify_triage_task(
+            conn, tid, title="version three", body="body three"
+        )
+        specified = [e for e in kb.list_events(conn, tid) if e.kind == "specified"]
+        comments = kb.list_comments(conn, tid)
+
+    payloads = [e.payload for e in specified]
+    assert all(payload is not None for payload in payloads)
+    assert [payload["old_title"] for payload in payloads if payload is not None] == [
+        "version one",
+        "version two",
+    ]
+    assert [payload["old_body"] for payload in payloads if payload is not None] == [
+        "body one",
+        "body two",
+    ]
+    assert len(comments) == 2
+    assert "version one" in comments[0].body
+    assert "version two" in comments[1].body
 
 
 def test_specify_second_call_noop_false(kanban_home):
