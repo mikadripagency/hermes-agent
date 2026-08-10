@@ -82,6 +82,8 @@ def explicit_delivery_contract_for_kanban_fixtures(monkeypatch):
             kwargs["evidence_contract_na_reason"] = (
                 "test fixture; no terminal delivery gate"
             )
+            if kwargs.get("delivery_gates") is None:
+                kwargs["delivery_gates"] = []
         return original_create_task(conn, *args, **kwargs)
 
     monkeypatch.setattr(kb, "create_task", create_task_with_contract)

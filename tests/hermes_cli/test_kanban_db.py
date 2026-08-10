@@ -35,6 +35,8 @@ def explicit_evidence_contract_for_unrelated_create_tests(monkeypatch):
             and not kwargs.get("evidence_contract_na_reason")
         ):
             kwargs["evidence_contract_na_reason"] = "unrelated DB test fixture"
+            if kwargs.get("delivery_gates") is None:
+                kwargs["delivery_gates"] = []
         return original(conn, **kwargs)
 
     monkeypatch.setattr(kb, "create_task", create_with_contract)

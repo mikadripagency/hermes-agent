@@ -258,6 +258,7 @@ def create_swarm(
         idempotency_key=idempotency_key,
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
+        delivery_gates=[],
         evidence_contract_na_reason="swarm topology anchor; no terminal delivery gate",
     )
 
@@ -332,6 +333,7 @@ def create_swarm(
             idempotency_key=f"kanban-swarm:{root}:worker:{index}",
             workspace_kind=workspace_kind,
             workspace_path=workspace_path,
+            delivery_gates=[],
             skills=spec.skills or None,
             max_runtime_seconds=spec.max_runtime_seconds,
             evidence_contract_na_reason=(
@@ -358,6 +360,7 @@ def create_swarm(
         idempotency_key=f"kanban-swarm:{root}:verifier",
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
+        delivery_gates=[],
         skills=["requesting-code-review"],
         evidence_contract_na_reason="swarm verifier output; no terminal delivery gate",
     )
@@ -379,6 +382,7 @@ def create_swarm(
         idempotency_key=f"kanban-swarm:{root}:synthesizer",
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
+        delivery_gates=[],
         skills=["humanizer"],
         evidence_contract_na_reason="swarm synthesis output; no terminal delivery gate",
     )
