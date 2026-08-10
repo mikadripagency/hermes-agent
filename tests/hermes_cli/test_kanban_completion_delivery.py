@@ -229,6 +229,142 @@ def test_reopen_done_task_keeps_history_and_allows_same_card_recovery(kanban_hom
         assert reopened[0].payload["superseded_completed_event_id"] == first_event
 
 
+def test_unsubscribe_cancels_materialized_pending_route_with_audit_reason(kanban_home):
+    _write_channel_directory(kanban_home)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="cancel orphan route", assignee="developer")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="slack",
+            chat_id="DORIGIN",
+            notifier_profile="developer",
+        )
+        claimed = kb.claim_task(conn, tid, claimer="developer-test")
+        assert claimed is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary=f"{tid}/run {claimed.current_run_id} · done",
+            expected_run_id=claimed.current_run_id,
+        )
+        event_id = _completed_event_id(conn, tid)
+        assert kb.acknowledge_completion_delivery(
+            conn,
+            task_id=tid,
+            event_id=event_id,
+            platform="slack",
+            chat_id=ORCH_CHAT_ID,
+            notifier_profile="developer",
+            receipt_id="orchestration-receipt",
+        )
+
+        assert kb.remove_notify_sub(
+            conn,
+            task_id=tid,
+            platform="slack",
+            chat_id="DORIGIN",
+            reason="permanent delivery failure",
+        )
+
+        routes = conn.execute(
+            "SELECT chat_id, state, receipt_id FROM completion_deliveries "
+            "WHERE event_id = ? ORDER BY chat_id",
+            (event_id,),
+        ).fetchall()
+        cancelled = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "completion_delivery_cancelled"
+        ]
+
+    assert [dict(route) for route in routes] == [
+        {"chat_id": ORCH_CHAT_ID, "state": "acknowledged", "receipt_id": "orchestration-receipt"},
+        {"chat_id": "DORIGIN", "state": "cancelled", "receipt_id": None},
+    ]
+    assert len(cancelled) == 1
+    assert cancelled[0].payload["completed_event_id"] == event_id
+    assert cancelled[0].payload["reason"] == "permanent delivery failure"
+
+
+def test_unsubscribe_repairs_orphan_but_refuses_inflight_delivery(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="orphan route", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="DORIGIN")
+        assert kb.complete_task(conn, tid, summary="done")
+        event_id = _completed_event_id(conn, tid)
+        old_cursor, cursor, events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="slack",
+            chat_id="DORIGIN",
+            kinds=("completed",),
+        )
+        assert [event.id for event in events] == [event_id]
+
+        with pytest.raises(ValueError, match="currently claimed"):
+            kb.remove_notify_sub(
+                conn,
+                task_id=tid,
+                platform="slack",
+                chat_id="DORIGIN",
+                reason="operator cancelled",
+            )
+        assert kb.list_notify_subs(conn, tid)
+        assert conn.execute(
+            "SELECT state FROM completion_deliveries WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()["state"] == "pending"
+
+        kb.rewind_notify_cursor(
+            conn,
+            task_id=tid,
+            platform="slack",
+            chat_id="DORIGIN",
+            claimed_cursor=cursor,
+            old_cursor=old_cursor,
+        )
+        conn.execute(
+            "DELETE FROM kanban_notify_subs WHERE task_id = ? AND chat_id = ?",
+            (tid, "DORIGIN"),
+        )
+        conn.commit()
+
+        assert kb.remove_notify_sub(
+            conn,
+            task_id=tid,
+            platform="slack",
+            chat_id="DORIGIN",
+            reason="historical orphan cleanup",
+        )
+        assert not kb.remove_notify_sub(
+            conn,
+            task_id=tid,
+            platform="slack",
+            chat_id="DORIGIN",
+            reason="duplicate cleanup",
+        )
+        assert not kb.acknowledge_completion_delivery(
+            conn,
+            task_id=tid,
+            event_id=event_id,
+            platform="slack",
+            chat_id="DORIGIN",
+            receipt_id="late-fabricated-receipt",
+        )
+        delivery = conn.execute(
+            "SELECT state, receipt_id FROM completion_deliveries WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        cancelled = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "completion_delivery_cancelled"
+        ]
+
+    assert dict(delivery) == {"state": "cancelled", "receipt_id": None}
+    assert len(cancelled) == 1
+    assert cancelled[0].payload["reason"] == "historical orphan cleanup"
+
+
 def test_init_migrates_legacy_single_event_delivery_key(tmp_path, monkeypatch):
     db_path = tmp_path / "legacy-completion-ledger.db"
     conn = sqlite3.connect(db_path)
