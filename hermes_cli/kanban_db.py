@@ -4886,7 +4886,9 @@ def complete_task(
             )
         elif task is not None:
             try:
-                assert_completion_review_gate(conn, task, metadata)
+                assert_completion_review_gate(
+                    conn, task, metadata, expected_run_id
+                )
             except ReviewGateError as exc:
                 review_error = exc
                 _append_event(
@@ -4937,7 +4939,9 @@ def complete_task(
             _validate_completion_identity(
                 locked_task, summary if summary is not None else result
             )
-            assert_completion_review_gate(conn, locked_task, metadata)
+            assert_completion_review_gate(
+                conn, locked_task, metadata, expected_run_id
+            )
         notifier_profile = _intended_completion_notifier_profile(
             conn, task_id, expected_run_id
         )

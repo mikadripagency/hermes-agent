@@ -174,16 +174,20 @@ def assert_review_gate(
     repository: str,
     final_sha: str,
     require_integration: bool = False,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Fail closed unless the latest review state covers the supplied SHA."""
+    """Fail closed unless the current run's review covers the supplied SHA."""
     from hermes_cli import kanban_db as kb
 
     repository, final_sha = _validate_identity(repository, final_sha)
-    task = kb.get_task(conn, task_id)
-    if task is None:
-        raise ReviewGateError(task_id, "task does not exist")
-    if not review_gate_required(task):
-        raise ReviewGateError(task_id, "task has no pr_merged evidence contract")
+    if expected_run_id is None:
+        task = kb.get_task(conn, task_id)
+        if task is None:
+            raise ReviewGateError(task_id, "task does not exist")
+        if not review_gate_required(task):
+            raise ReviewGateError(task_id, "task has no pr_merged evidence contract")
+    else:
+        _require_current_run(conn, task_id, expected_run_id)
 
     latest_blocking_id = 0
     latest_pass: Optional[tuple[int, dict]] = None
@@ -193,7 +197,11 @@ def assert_review_gate(
         payload = _payload(row)
         if row["kind"] == "changes_requested":
             latest_blocking_id = event_id
-        elif row["kind"] == "review_receipt" and payload.get("repository") == repository:
+        elif (
+            row["kind"] == "review_receipt"
+            and payload.get("repository") == repository
+            and (expected_run_id is None or row["run_id"] == expected_run_id)
+        ):
             if payload.get("verdict") == "changes_requested" or payload.get("open_findings"):
                 latest_blocking_id = event_id
             elif (
@@ -202,11 +210,20 @@ def assert_review_gate(
                 and payload.get("open_findings") == 0
             ):
                 latest_pass = (event_id, payload)
-        elif row["kind"] == "review_integration":
+        elif (
+            row["kind"] == "review_integration"
+            and (expected_run_id is None or row["run_id"] == expected_run_id)
+        ):
             integrations.append((event_id, payload))
 
     if latest_pass is None:
-        reason = "changes requested remain open" if latest_blocking_id else "missing review receipt"
+        reason = (
+            "changes requested remain open"
+            if latest_blocking_id
+            else "missing review receipt for current run"
+            if expected_run_id is not None
+            else "missing review receipt"
+        )
         raise ReviewGateError(task_id, reason)
     pass_id, pass_payload = latest_pass
     if pass_id <= latest_blocking_id:
@@ -249,7 +266,11 @@ def bind_review_integration(
     with kb.write_txn(conn):
         _require_current_run(conn, task_id, expected_run_id)
         assert_review_gate(
-            conn, task_id, repository=repository, final_sha=reviewed_sha
+            conn,
+            task_id,
+            repository=repository,
+            final_sha=reviewed_sha,
+            expected_run_id=expected_run_id,
         )
         kb._append_event(
             conn,
@@ -277,7 +298,11 @@ def assert_deploy_review_gate(
     """Authorize a deploy only for the current run and its bound review."""
     _require_current_run(conn, task_id, expected_run_id)
     assert_review_gate(
-        conn, task_id, repository=repository, final_sha=reviewed_sha
+        conn,
+        task_id,
+        repository=repository,
+        final_sha=reviewed_sha,
+        expected_run_id=expected_run_id,
     )
     assert_review_gate(
         conn,
@@ -285,15 +310,20 @@ def assert_deploy_review_gate(
         repository=repository,
         final_sha=integration_sha,
         require_integration=True,
+        expected_run_id=expected_run_id,
     )
     return True
 
 
 def assert_completion_review_gate(
-    conn: sqlite3.Connection, task, metadata: Optional[dict]
+    conn: sqlite3.Connection,
+    task,
+    metadata: Optional[dict],
+    expected_run_id: Optional[int],
 ) -> None:
     if not review_gate_required(task):
         return
+    _require_current_run(conn, task.id, expected_run_id)
     evidence = metadata.get("evidence") if isinstance(metadata, dict) else None
     merged = evidence.get("pr_merged") if isinstance(evidence, dict) else None
     if not isinstance(merged, dict):
@@ -304,6 +334,7 @@ def assert_completion_review_gate(
             task.id,
             repository=merged.get("repository"),
             final_sha=merged.get("head_sha"),
+            expected_run_id=expected_run_id,
         )
         assert_review_gate(
             conn,
@@ -311,6 +342,7 @@ def assert_completion_review_gate(
             repository=merged.get("repository"),
             final_sha=merged.get("merge_sha"),
             require_integration=True,
+            expected_run_id=expected_run_id,
         )
     except ValueError as exc:
         if isinstance(exc, ReviewGateError):

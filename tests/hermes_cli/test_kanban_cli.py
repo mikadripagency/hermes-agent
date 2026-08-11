@@ -206,6 +206,40 @@ def test_run_slash_deploy_gate_requires_current_review_and_integration(kanban_ho
     assert "DEPLOY_REVIEW_GATE_PASS" in kc.run_slash(command)
 
 
+def test_run_slash_deploy_gate_rejects_malformed_worker_run_id(
+    kanban_home, monkeypatch
+):
+    head_sha = "c" * 40
+    merge_sha = "d" * 40
+    repository = "Pryapus/Drip-Research-Hub"
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="malformed worker run",
+            assignee="developer",
+            required_evidence=["pr_merged"],
+        )
+        assert kb.claim_task(conn, task_id) is not None
+
+    kc.run_slash(
+        f"review-record {task_id} --repository {repository} --head-sha {head_sha} "
+        "--verdict passed --findings-json '[]'"
+    )
+    kc.run_slash(
+        f"review-bind {task_id} --repository {repository} --head-sha {head_sha} "
+        f"--integration-sha {merge_sha}"
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "malformed")
+
+    result = kc.run_slash(
+        f"deploy-gate {task_id} --repository {repository} "
+        f"--reviewed-sha {head_sha} --integration-sha {merge_sha}"
+    )
+    assert "DEPLOY_REVIEW_GATE_PASS" not in result
+    assert "invalid HERMES_KANBAN_RUN_ID" in result
+
+
 def test_run_slash_reopen_recovers_same_completed_card(kanban_home):
     import re
 

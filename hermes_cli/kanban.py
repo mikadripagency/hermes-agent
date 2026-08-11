@@ -2026,11 +2026,14 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
     if not raw:
-        return None
+        raise RuntimeError("missing HERMES_KANBAN_RUN_ID for active worker task")
     try:
-        return int(raw)
+        run_id = int(raw)
     except ValueError:
-        return None
+        raise RuntimeError("invalid HERMES_KANBAN_RUN_ID for active worker task")
+    if run_id <= 0:
+        raise RuntimeError("invalid HERMES_KANBAN_RUN_ID for active worker task")
+    return run_id
 
 
 def _terminal_run_id_for(conn, task_id: str) -> Optional[int]:
@@ -2154,13 +2157,15 @@ def _cmd_contract_amend(args: argparse.Namespace) -> int:
 
 def _cmd_review_gate(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        if _terminal_run_id_for(conn, args.task_id) is None:
+        run_id = _terminal_run_id_for(conn, args.task_id)
+        if run_id is None:
             raise RuntimeError("review gate requires a running delivery task")
         kb.assert_review_gate(
             conn,
             args.task_id,
             repository=args.repository,
             final_sha=args.head_sha,
+            expected_run_id=run_id,
         )
     print(f"REVIEW_GATE_PASS task={args.task_id} head={args.head_sha}")
     return 0
