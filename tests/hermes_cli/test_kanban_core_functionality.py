@@ -882,7 +882,8 @@ def test_cli_notify_subscribe_and_list(kanban_home):
     subs = json.loads(lst)
     assert any(s["task_id"] == tid and s["platform"] == "telegram" for s in subs)
     rm = run_slash(
-        f"notify-unsubscribe {tid} --platform telegram --chat-id 999",
+        f"notify-unsubscribe {tid} --platform telegram --chat-id 999 "
+        "--reason 'operator cleanup'",
     )
     assert "Unsubscribed" in rm
 
