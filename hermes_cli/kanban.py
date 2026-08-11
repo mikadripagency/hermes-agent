@@ -847,6 +847,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_nrm.add_argument("--platform", required=True)
     p_nrm.add_argument("--chat-id", required=True)
     p_nrm.add_argument("--thread-id", default=None)
+    p_nrm.add_argument(
+        "--reason", default="subscription removed",
+        help="Redacted audit reason stored on each cancelled pending event",
+    )
 
     p_nrec = sub.add_parser(
         "notify-reconcile",
@@ -2868,6 +2872,7 @@ def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
             conn, task_id=args.task_id,
             platform=args.platform, chat_id=args.chat_id,
             thread_id=args.thread_id,
+            reason=args.reason,
         )
     if not ok:
         print("(no such subscription)", file=sys.stderr)

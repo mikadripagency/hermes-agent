@@ -10431,7 +10431,7 @@ def remove_notify_sub(
     thread_id: Optional[str] = None,
     reason: str = "subscription removed",
 ) -> bool:
-    """Remove a route and terminally cancel its unsent completion rows.
+    """Remove a route and terminally cancel its unsent terminal-event rows.
 
     A materialized completion row derives its retry/claim path from the
     subscription. Deleting only the subscription therefore strands the row in
@@ -10446,7 +10446,7 @@ def remove_notify_sub(
     reason = str(reason or "").strip()[:200] or "subscription removed"
     with write_txn(conn):
         sub = conn.execute(
-            "SELECT pending_event_id FROM kanban_notify_subs WHERE task_id = ? "
+            "SELECT pending_event_id, last_message_id FROM kanban_notify_subs WHERE task_id = ? "
             "AND platform = ? AND chat_id = ? AND thread_id = ?",
             (task_id, platform, chat_id, thread_id),
         ).fetchone()
@@ -10454,19 +10454,37 @@ def remove_notify_sub(
             raise ValueError("notification route is currently claimed")
 
         pending = conn.execute(
-            "SELECT d.event_id, d.notifier_profile FROM completion_deliveries d "
+            "SELECT d.event_id, d.notifier_profile, e.kind AS event_kind, "
+            "EXISTS (SELECT 1 FROM completion_deliveries acknowledged "
+            "WHERE acknowledged.event_id = d.event_id "
+            "AND acknowledged.task_id = d.task_id "
+            "AND acknowledged.platform = d.platform "
+            "AND acknowledged.chat_id = d.chat_id "
+            "AND acknowledged.thread_id = d.thread_id "
+            "AND acknowledged.state = 'acknowledged' "
+            "AND TRIM(COALESCE(acknowledged.receipt_id, '')) <> '') "
+            "AS has_acknowledged_sibling FROM completion_deliveries d "
             "JOIN task_events e ON e.id = d.event_id AND e.task_id = d.task_id "
             "WHERE d.task_id = ? AND d.platform = ? AND d.chat_id = ? "
             "AND d.thread_id = ? AND d.state = 'pending' "
-            "AND d.receipt_id IS NULL AND e.kind = 'completed'",
+            "AND d.receipt_id IS NULL AND e.kind IN ('completed', 'blocked')",
             (task_id, platform, chat_id, thread_id),
         ).fetchall()
-        deleted = conn.execute(
-            "DELETE FROM kanban_notify_subs WHERE task_id = ? "
-            "AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (task_id, platform, chat_id, thread_id),
+        protected_subscription = bool(
+            (sub is not None and str(sub["last_message_id"] or "").strip())
+            or any(row["has_acknowledged_sibling"] for row in pending)
         )
+        deleted_count = 0
+        if not protected_subscription:
+            deleted_count = conn.execute(
+                "DELETE FROM kanban_notify_subs WHERE task_id = ? "
+                "AND platform = ? AND chat_id = ? AND thread_id = ?",
+                (task_id, platform, chat_id, thread_id),
+            ).rowcount
+        cancelled_count = 0
         for row in pending:
+            if row["has_acknowledged_sibling"] and str(row["notifier_profile"] or ""):
+                continue
             cancelled = conn.execute(
                 "UPDATE completion_deliveries SET state = 'cancelled' "
                 "WHERE event_id = ? AND task_id = ? AND platform = ? "
@@ -10478,12 +10496,15 @@ def remove_notify_sub(
                 ),
             )
             if cancelled.rowcount:
+                cancelled_count += cancelled.rowcount
                 _append_event(
                     conn,
                     task_id,
                     "completion_delivery_cancelled",
                     {
+                        "event_id": int(row["event_id"]),
                         "completed_event_id": int(row["event_id"]),
+                        "event_kind": str(row["event_kind"]),
                         "platform": platform,
                         "chat_id": chat_id,
                         "thread_id": thread_id,
@@ -10491,7 +10512,7 @@ def remove_notify_sub(
                         "reason": reason,
                     },
                 )
-    return deleted.rowcount > 0 or bool(pending)
+    return deleted_count > 0 or cancelled_count > 0
 
 
 def unseen_events_for_sub(

@@ -196,6 +196,139 @@ def test_acknowledge_completion_rejects_blocked_event(kanban_home):
         )
 
 
+def test_unsubscribe_cancels_blocked_orphan_and_is_idempotent(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="DORIGIN")
+        assert kb.block_task(conn, tid, reason="need input", kind="needs_input")
+        event_id = _blocked_event_id(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute(
+                "DELETE FROM kanban_notify_subs WHERE task_id = ? AND chat_id = ?",
+                (tid, "DORIGIN"),
+            )
+
+        assert kb.remove_notify_sub(
+            conn, task_id=tid, platform="slack", chat_id="DORIGIN",
+            reason="historical blocked orphan",
+        )
+        assert not kb.remove_notify_sub(
+            conn, task_id=tid, platform="slack", chat_id="DORIGIN",
+            reason="duplicate cleanup",
+        )
+        delivery = conn.execute(
+            "SELECT state, receipt_id, acknowledged_at FROM completion_deliveries "
+            "WHERE event_id = ? AND chat_id = ?",
+            (event_id, "DORIGIN"),
+        ).fetchone()
+        cancelled = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "completion_delivery_cancelled"
+        ]
+
+        assert dict(delivery) == {
+            "state": "cancelled", "receipt_id": None, "acknowledged_at": None,
+        }
+        assert len(cancelled) == 1
+        assert cancelled[0].payload["completed_event_id"] == event_id
+        assert cancelled[0].payload["reason"] == "historical blocked orphan"
+        assert not kb.acknowledge_blocked_delivery(
+            conn, task_id=tid, event_id=event_id, platform="slack",
+            chat_id="DORIGIN", receipt_id="fabricated-late-receipt",
+        )
+
+
+def test_unsubscribe_refuses_claimed_blocked_route(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.add_notify_sub(conn, task_id=tid, platform="slack", chat_id="DORIGIN")
+        assert kb.block_task(conn, tid, reason="need input", kind="needs_input")
+        event_id = _blocked_event_id(conn, tid)
+        _, _, events = kb.claim_unseen_events_for_sub(
+            conn, task_id=tid, platform="slack", chat_id="DORIGIN",
+            kinds=("blocked",),
+        )
+        assert [event.id for event in events] == [event_id]
+
+        with pytest.raises(ValueError, match="currently claimed"):
+            kb.remove_notify_sub(
+                conn, task_id=tid, platform="slack", chat_id="DORIGIN",
+                reason="must not cancel in flight",
+            )
+
+        assert kb.list_notify_subs(conn, tid)
+        delivery = conn.execute(
+            "SELECT state, receipt_id FROM completion_deliveries "
+            "WHERE event_id = ? AND chat_id = ?",
+            (event_id, "DORIGIN"),
+        ).fetchone()
+        assert dict(delivery) == {"state": "pending", "receipt_id": None}
+
+
+def test_unsubscribe_retires_only_blank_blocked_sibling_of_owned_ack(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, assignee="developer")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="slack", chat_id="DORIGIN",
+            notifier_profile="developer",
+        )
+        assert kb.block_task(conn, tid, reason="need input", kind="needs_input")
+        event_id = _blocked_event_id(conn, tid)
+        assert kb.acknowledge_blocked_delivery(
+            conn, task_id=tid, event_id=event_id, platform="slack",
+            chat_id="DORIGIN", notifier_profile="developer", receipt_id="R1",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_notify_subs SET last_event_id = ?, "
+                "last_message_event_id = ?, last_message_id = ? "
+                "WHERE task_id = ? AND chat_id = ?",
+                (event_id, event_id, "R1", tid, "DORIGIN"),
+            )
+            conn.execute(
+                "INSERT INTO completion_deliveries "
+                "(event_id, task_id, handoff_version, platform, chat_id, "
+                "thread_id, notifier_profile, state, created_at) "
+                "VALUES (?, ?, 1, 'slack', 'DORIGIN', '', '', 'pending', 1)",
+                (event_id, tid),
+            )
+        sub_before = dict(kb.list_notify_subs(conn, tid)[0])
+        acknowledged_before = dict(conn.execute(
+            "SELECT notifier_profile, state, receipt_id, acknowledged_at "
+            "FROM completion_deliveries WHERE event_id = ? "
+            "AND notifier_profile = 'developer'",
+            (event_id,),
+        ).fetchone())
+
+        assert kb.remove_notify_sub(
+            conn, task_id=tid, platform="slack", chat_id="DORIGIN",
+            reason="retire blank historical sibling",
+        )
+        assert not kb.remove_notify_sub(
+            conn, task_id=tid, platform="slack", chat_id="DORIGIN",
+            reason="duplicate cleanup",
+        )
+
+        assert dict(kb.list_notify_subs(conn, tid)[0]) == sub_before
+        deliveries = conn.execute(
+            "SELECT notifier_profile, state, receipt_id, acknowledged_at "
+            "FROM completion_deliveries WHERE event_id = ? ORDER BY notifier_profile",
+            (event_id,),
+        ).fetchall()
+        assert dict(deliveries[0]) == {
+            "notifier_profile": "", "state": "cancelled",
+            "receipt_id": None, "acknowledged_at": None,
+        }
+        assert dict(deliveries[1]) == acknowledged_before
+        assert acknowledged_before["acknowledged_at"] is not None
+        cancelled = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "completion_delivery_cancelled"
+        ]
+        assert len(cancelled) == 1
+        assert cancelled[0].payload["notifier_profile"] == ""
+
+
 # --- non-human-facing blocks are NOT delivered -------------------------------
 
 def test_dependency_block_installs_no_delivery(kanban_home):
