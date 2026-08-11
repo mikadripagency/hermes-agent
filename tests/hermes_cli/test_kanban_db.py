@@ -2455,6 +2455,78 @@ def test_completion_rejects_open_no_go_before_terminal_side_effects(kanban_home)
         assert deliveries == 0
 
 
+def test_completion_rejects_review_receipts_from_reclaimed_run(kanban_home):
+    repository = "Pryapus/Drip-Research-Hub"
+    reviewed_sha = "a" * 40
+    merge_sha = "b" * 40
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="reclaimed repository delivery",
+            assignee="alice",
+            required_evidence=["pr_merged"],
+        )
+        first = kb.claim_task(conn, task_id, claimer="test:first")
+        assert first is not None and first.current_run_id is not None
+        kb.record_review_receipt(
+            conn,
+            task_id,
+            repository=repository,
+            reviewed_sha=reviewed_sha,
+            verdict="passed",
+            findings=[],
+            expected_run_id=first.current_run_id,
+        )
+        kb.bind_review_integration(
+            conn,
+            task_id,
+            repository=repository,
+            reviewed_sha=reviewed_sha,
+            integration_sha=merge_sha,
+            expected_run_id=first.current_run_id,
+        )
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="transient handoff",
+            kind="transient",
+            expected_run_id=first.current_run_id,
+        )
+        assert kb.unblock_task(conn, task_id)
+        current = kb.claim_task(conn, task_id, claimer="test:current")
+        assert current is not None and current.current_run_id != first.current_run_id
+        deliveries_before = conn.execute(
+            "SELECT COUNT(*) FROM completion_deliveries WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+
+        with pytest.raises(kb.ReviewGateError, match="current run"):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary=_claimed_summary(conn, task_id),
+                metadata={
+                    "evidence": {
+                        "pr_merged": {
+                            "status": "passed",
+                            "repository": repository,
+                            "head_sha": reviewed_sha,
+                            "merge_sha": merge_sha,
+                        }
+                    }
+                },
+                expected_run_id=current.current_run_id,
+            )
+
+        assert kb.get_task(conn, task_id).status == "running"
+        assert not [e for e in kb.list_events(conn, task_id) if e.kind == "completed"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM completion_deliveries WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == deliveries_before
+
+
 def test_non_repository_delivery_keeps_explicit_na_path(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(
