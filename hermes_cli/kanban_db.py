@@ -89,6 +89,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli.kanban_delivery_owner import (
+    DeliveryOwnershipError,
+    assert_delivery_ownership,
+    claim_delivery_ownership,
+    delivery_push_allowed,
+    repository_has_active_delivery_owner,
+    supersede_delivery_owner,
+)
 from hermes_cli.kanban_review_gate import (
     ReviewGateError,
     assert_completion_review_gate,
@@ -2650,8 +2658,8 @@ def _detect_registered_project_reference(
 _EVIDENCE_CLASS_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _VALID_DELIVERY_GATES = frozenset({"merge", "deploy"})
 _DELIVERY_GATE_EVIDENCE = {
-    "merge": ("pr_merged",),
-    "deploy": ("pr_merged", "runtime_smoke"),
+    "merge": ("delivery_ownership", "pr_merged"),
+    "deploy": ("delivery_ownership", "pr_merged", "runtime_smoke"),
 }
 
 

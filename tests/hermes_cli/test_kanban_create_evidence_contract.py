@@ -75,7 +75,9 @@ def test_repository_delivery_policy_adds_exact_merge_evidence(kanban_home, tmp_p
         )
 
     assert task is not None
-    assert task.required_evidence == ["self_review", "merge_receipt", "pr_merged"]
+    assert task.required_evidence == [
+        "self_review", "merge_receipt", "delivery_ownership", "pr_merged",
+    ]
     assert created.payload is not None
     assert created.payload["delivery_gates"] == ["merge"]
 
@@ -139,7 +141,9 @@ def test_explicit_deploy_policy_adds_exact_merge_evidence(kanban_home):
         task = kb.get_task(conn, task_id)
 
     assert task is not None
-    assert task.required_evidence == ["merge_receipt", "pr_merged", "runtime_smoke"]
+    assert task.required_evidence == [
+        "merge_receipt", "delivery_ownership", "pr_merged", "runtime_smoke",
+    ]
 
 
 def test_delivery_create_persists_explicit_na_reason_in_readback_and_event(kanban_home):
