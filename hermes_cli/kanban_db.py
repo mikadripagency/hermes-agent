@@ -93,7 +93,6 @@ from hermes_cli.kanban_delivery_owner import (
     DeliveryOwnershipError,
     assert_delivery_ownership,
     claim_delivery_ownership,
-    delivery_push_allowed,
     repository_has_active_delivery_owner,
     supersede_delivery_owner,
 )

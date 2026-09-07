@@ -458,12 +458,3 @@ def supersede_delivery_owner(
                 f"supersession left multiple owners: {','.join(sorted(remaining))}",
             )
         return superseded_event_id
-
-
-def delivery_push_allowed(
-    *, local_ref: str, remote_ref: str, remote_branch: str
-) -> bool:
-    """Protected branches accept PR merges, never direct git pushes."""
-    del local_ref
-    branch = _normalize_branch(remote_branch)
-    return str(remote_ref or "").strip() != f"refs/heads/{branch}"
