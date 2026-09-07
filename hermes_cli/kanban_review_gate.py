@@ -7,6 +7,11 @@ import re
 import sqlite3
 from typing import Optional
 
+from hermes_cli.kanban_delivery_owner import (
+    assert_delivery_ownership,
+    repository_has_active_delivery_owner,
+)
+
 _REVIEW_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
@@ -187,7 +192,22 @@ def assert_review_gate(
         if not review_gate_required(task):
             raise ReviewGateError(task_id, "task has no pr_merged evidence contract")
     else:
-        _require_current_run(conn, task_id, expected_run_id)
+        task = _require_current_run(conn, task_id, expected_run_id)
+
+    if (
+        "delivery_ownership" in (task.required_evidence or [])
+        or repository_has_active_delivery_owner(conn, repository)
+    ):
+        assert_delivery_ownership(
+            conn,
+            task_id,
+            repository=repository,
+            expected_run_id=(
+                expected_run_id
+                if expected_run_id is not None
+                else task.current_run_id
+            ),
+        )
 
     latest_blocking_id = 0
     latest_pass: Optional[tuple[int, dict]] = None

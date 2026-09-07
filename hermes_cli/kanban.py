@@ -19,6 +19,7 @@ import contextlib
 import json
 import os
 import shlex
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -600,6 +601,39 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_contract_amend.add_argument("--reason", required=True)
 
+    def add_delivery_owner_args(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--repository", required=True, metavar="OWNER/REPO")
+        parser.add_argument("--branch", required=True)
+        parser.add_argument("--pr-number", required=True, type=int)
+        seams = parser.add_mutually_exclusive_group(required=True)
+        seams.add_argument("--seam", action="append")
+        seams.add_argument(
+            "--seams-from-diff",
+            nargs=3,
+            metavar=("REPO_PATH", "BASE", "HEAD"),
+        )
+
+    p_delivery_own = sub.add_parser(
+        "delivery-own", help="Claim repository seams for one delivery task"
+    )
+    p_delivery_own.add_argument("task_id")
+    add_delivery_owner_args(p_delivery_own)
+    p_delivery_own.add_argument("--changelog-overlap-reason")
+
+    p_delivery_gate = sub.add_parser(
+        "delivery-gate", help="Fail unless the current task exclusively owns its seams"
+    )
+    p_delivery_gate.add_argument("task_id")
+    add_delivery_owner_args(p_delivery_gate)
+
+    p_delivery_supersede = sub.add_parser(
+        "delivery-supersede", help="Transfer one active delivery owner to another"
+    )
+    p_delivery_supersede.add_argument("source_task_id")
+    p_delivery_supersede.add_argument("--to-task", required=True)
+    add_delivery_owner_args(p_delivery_supersede)
+    p_delivery_supersede.add_argument("--reason", required=True)
+
     p_review_gate = sub.add_parser(
         "review-gate", help="Fail unless the final PR head has a closed review receipt"
     )
@@ -1102,6 +1136,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "comment":  _cmd_comment,
             "complete": _cmd_complete,
             "contract-amend": _cmd_contract_amend,
+            "delivery-own": _cmd_delivery_own,
+            "delivery-gate": _cmd_delivery_gate,
+            "delivery-supersede": _cmd_delivery_supersede,
             "review-record": _cmd_review_record,
             "review-gate": _cmd_review_gate,
             "review-bind": _cmd_review_bind,
@@ -2156,6 +2193,96 @@ def _cmd_contract_amend(args: argparse.Namespace) -> int:
             reason=args.reason,
         )
     print(f"EVIDENCE_CONTRACT_AMENDED event={event_id} task={args.task_id}")
+    return 0
+
+
+def _delivery_seams(args: argparse.Namespace) -> tuple[list[str], str]:
+    if args.seam:
+        return list(args.seam), "declared"
+    repo_path, base, head = args.seams_from_diff
+    proc = subprocess.run(
+        [
+            "git", "-C", repo_path, "diff", "--name-only",
+            "--diff-filter=ACMR", f"{base}...{head}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"cannot derive delivery seams from git diff: {proc.stderr.strip()}"
+        )
+    seams = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if not seams:
+        raise RuntimeError("git diff contains no delivery seams")
+    return seams, "diff"
+
+
+def _cmd_delivery_own(args: argparse.Namespace) -> int:
+    seams, source = _delivery_seams(args)
+    with kb.connect_closing() as conn:
+        run_id = _terminal_run_id_for(conn, args.task_id)
+        if run_id is None:
+            raise RuntimeError("delivery ownership requires a running delivery task")
+        event_id = kb.claim_delivery_ownership(
+            conn,
+            args.task_id,
+            repository=args.repository,
+            branch=args.branch,
+            pr_number=args.pr_number,
+            seams=seams,
+            seam_source=source,
+            changelog_overlap_reason=args.changelog_overlap_reason,
+            expected_run_id=run_id,
+        )
+    print(f"DELIVERY_OWNER_CLAIMED event={event_id} task={args.task_id}")
+    return 0
+
+
+def _cmd_delivery_gate(args: argparse.Namespace) -> int:
+    seams, _source = _delivery_seams(args)
+    with kb.connect_closing() as conn:
+        run_id = _terminal_run_id_for(conn, args.task_id)
+        if run_id is None:
+            raise RuntimeError("delivery gate requires a running delivery task")
+        kb.assert_delivery_ownership(
+            conn,
+            args.task_id,
+            repository=args.repository,
+            branch=args.branch,
+            pr_number=args.pr_number,
+            seams=seams,
+            expected_run_id=run_id,
+        )
+    print(f"DELIVERY_OWNER_GATE_PASS task={args.task_id} pr={args.pr_number}")
+    return 0
+
+
+def _cmd_delivery_supersede(args: argparse.Namespace) -> int:
+    seams, source = _delivery_seams(args)
+    with kb.connect_closing() as conn:
+        run_id = _terminal_run_id_for(conn, args.to_task)
+        if run_id is None:
+            raise RuntimeError("delivery supersession requires a running replacement task")
+        event_id = kb.supersede_delivery_owner(
+            conn,
+            args.source_task_id,
+            args.to_task,
+            repository=args.repository,
+            branch=args.branch,
+            pr_number=args.pr_number,
+            seams=seams,
+            seam_source=source,
+            actor=_profile_author(),
+            reason=args.reason,
+            expected_target_run_id=run_id,
+        )
+    print(
+        f"DELIVERY_OWNER_SUPERSEDED event={event_id} "
+        f"source={args.source_task_id} target={args.to_task}"
+    )
     return 0
 
 
