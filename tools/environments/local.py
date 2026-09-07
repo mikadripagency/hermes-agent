@@ -10,6 +10,8 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
@@ -18,6 +20,45 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 _IS_WINDOWS = platform.system() == "Windows"
 
 logger = logging.getLogger(__name__)
+
+
+_DISPOSABLE_AGENT_ENV_VAR = "_HERMES_DISPOSABLE_AGENT"
+_DISPOSABLE_SUBPROCESS_CONTEXT: ContextVar[bool] = ContextVar(
+    "hermes_disposable_subprocess_context",
+    default=False,
+)
+
+
+@contextmanager
+def disposable_agent_subprocesses():
+    """Deny ambient Kanban authority to subprocesses in this context.
+
+    Delegate/review agents run in worker threads inside the parent process, so
+    mutating ``os.environ`` would race unrelated sessions.  A ContextVar keeps
+    the isolation thread-local; every subprocess builder below applies it at
+    the actual process boundary.  The marker propagates the rule transitively
+    to child Hermes processes.
+    """
+    token = _DISPOSABLE_SUBPROCESS_CONTEXT.set(True)
+    try:
+        yield
+    finally:
+        _DISPOSABLE_SUBPROCESS_CONTEXT.reset(token)
+
+
+def _apply_disposable_kanban_isolation(env: dict[str, str]) -> None:
+    """Strip inherited Kanban ownership from disposable process launches."""
+    disposable = (
+        _DISPOSABLE_SUBPROCESS_CONTEXT.get()
+        or env.get(_DISPOSABLE_AGENT_ENV_VAR) == "1"
+        or env.get("HERMES_SESSION_SOURCE", "").strip().lower() == "webhook"
+    )
+    if not disposable:
+        return
+    for key in list(env):
+        if key.startswith("HERMES_KANBAN_"):
+            env.pop(key, None)
+    env[_DISPOSABLE_AGENT_ENV_VAR] = "1"
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -387,6 +428,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     # Same cross-session leak guard as _make_run_env, for the background/PTY
     # spawn path (process_registry.spawn_local builds env via this function).
     _inject_session_context_env(sanitized)
+    _apply_disposable_kanban_isolation(sanitized)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
@@ -514,6 +556,7 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # session's identity. Strip _UNSET session vars when engaged so that can't
     # happen; single uniform policy across every spawn surface.
     _inject_session_context_env(env)
+    _apply_disposable_kanban_isolation(env)
 
     return env
 
@@ -835,6 +878,7 @@ def _make_run_env(env: dict) -> dict:
     # cross-session leak guard — strips _UNSET vars when a concurrent host is
     # engaged so a sibling session's os.environ mirror can't leak in).
     _inject_session_context_env(run_env)
+    _apply_disposable_kanban_isolation(run_env)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)
