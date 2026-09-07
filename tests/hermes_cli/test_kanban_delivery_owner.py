@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-import sys
 from argparse import Namespace
 from pathlib import Path
 
@@ -280,22 +279,12 @@ def test_new_run_cannot_reuse_stale_ownership(kanban_home):
             )
 
 
-def test_protected_branch_push_is_never_a_supported_delivery_path():
-    assert not kb.delivery_push_allowed(
-        local_ref="refs/heads/main",
-        remote_ref="refs/heads/main",
-        remote_branch="main",
-    )
-    assert not kb.delivery_push_allowed(
-        local_ref="refs/heads/deploy",
-        remote_ref="refs/heads/deploy",
-        remote_branch="deploy",
-    )
-    assert kb.delivery_push_allowed(
-        local_ref="refs/heads/delivery/task",
-        remote_ref="refs/heads/delivery/task",
-        remote_branch="main",
-    )
+def test_repo_wide_push_interceptor_is_not_shipped():
+    """Non-Kanban workflows must never enter ChingLing's ownership gate."""
+    script = Path(__file__).parents[2] / "scripts" / "kanban_delivery_pre_push.py"
+
+    assert not script.exists()
+    assert not hasattr(kb, "delivery_push_allowed")
 
 
 def test_cli_derives_seams_from_the_repository_diff(tmp_path):
@@ -329,28 +318,6 @@ def test_cli_derives_seams_from_the_repository_diff(tmp_path):
 
     assert seams == ["src/feature.py"]
     assert source == "diff"
-
-
-def test_pre_push_hook_rejects_protected_ref_before_git_push():
-    script = Path(__file__).parents[2] / "scripts" / "kanban_delivery_pre_push.py"
-    blocked = subprocess.run(
-        [sys.executable, str(script), "--protected-branch", "main"],
-        input=f"refs/heads/main {'a' * 40} refs/heads/main {'b' * 40}\n",
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    allowed = subprocess.run(
-        [sys.executable, str(script), "--protected-branch", "main"],
-        input=f"refs/heads/delivery/task {'a' * 40} refs/heads/delivery/task {'b' * 40}\n",
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-    assert blocked.returncode == 1
-    assert "requires the reviewed PR merge gate" in blocked.stderr
-    assert allowed.returncode == 0
 
 
 def test_delivery_owner_cli_claims_and_checks_the_current_lane(kanban_home):
