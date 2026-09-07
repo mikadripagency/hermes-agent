@@ -579,6 +579,52 @@ def board_exists(board: Optional[str] = None) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def _assert_disposable_board_isolation(
+    override: str,
+    board: Optional[str],
+) -> None:
+    """Reject ambient/live board resolution in disposable agent processes."""
+    if os.environ.get("_HERMES_DISPOSABLE_AGENT") != "1":
+        return
+
+    explicit_board = (
+        board
+        or (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+        or os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    )
+    if not override or not explicit_board:
+        raise RuntimeError(
+            "disposable Kanban access requires explicit HERMES_KANBAN_DB "
+            "and HERMES_KANBAN_BOARD under its isolated HERMES_HOME"
+        )
+
+    isolated_home_value = os.environ.get("HERMES_HOME", "").strip()
+    if not isolated_home_value:
+        raise RuntimeError(
+            "disposable Kanban access requires an isolated HERMES_HOME"
+        )
+    isolated_home = Path(isolated_home_value).expanduser().resolve()
+    candidate_paths = [Path(override).expanduser()]
+    for name in (
+        "HERMES_KANBAN_HOME",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_LOGS_ROOT",
+        "HERMES_KANBAN_ATTACHMENTS_ROOT",
+    ):
+        value = os.environ.get(name, "").strip()
+        if value:
+            candidate_paths.append(Path(value).expanduser())
+
+    try:
+        for candidate in candidate_paths:
+            candidate.resolve().relative_to(isolated_home)
+    except ValueError as exc:
+        raise RuntimeError(
+            "disposable Kanban access requires every board path to stay "
+            "under its isolated HERMES_HOME"
+        ) from exc
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """Return the path to the ``kanban.db`` for ``board``.
 
@@ -594,6 +640,7 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
        Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
     """
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    _assert_disposable_board_isolation(override, board)
     if override:
         return Path(override).expanduser()
     slug = _normalize_board_slug(board)

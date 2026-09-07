@@ -767,13 +767,15 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     """Remove toolsets that contain only blocked tools.
 
     The strip set is derived from DELEGATE_BLOCKED_TOOLS plus the explicit
-    composite/scenario toolsets (delegation, code_execution) that have no
+    composite/scenario toolsets (delegation, code_execution, kanban) that have no
     one-to-one tool. This keeps the blocklist and the strip set in lockstep
     so new blocked tools can't silently leak through as toolset names.
     """
     # Composite toolsets that should never pass through to children, even
     # though their individual tools aren't all in DELEGATE_BLOCKED_TOOLS.
-    _COMPOSITE_BLOCKED_TOOLSETS = frozenset({"delegation", "code_execution"})
+    _COMPOSITE_BLOCKED_TOOLSETS = frozenset(
+        {"delegation", "code_execution", "kanban"}
+    )
     blocked_toolset_names = {
         name
         for name, defn in TOOLSETS.items()
@@ -1754,6 +1756,8 @@ def _run_single_child(
     Run a pre-built child agent. Called from within a thread.
     Returns a structured result dict.
     """
+    if child is None:
+        raise ValueError("child agent is required")
     child_start = time.monotonic()
 
     # Get the progress callback from the child agent
@@ -1945,11 +1949,14 @@ def _run_single_child(
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
-            return child.run_conversation(
-                user_message=goal,
-                task_id=child_task_id,
-                stream_callback=_relay_child_text,
-            )
+            from tools.environments.local import disposable_agent_subprocesses
+
+            with disposable_agent_subprocesses():
+                return child.run_conversation(
+                    user_message=goal,
+                    task_id=child_task_id,
+                    stream_callback=_relay_child_text,
+                )
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
